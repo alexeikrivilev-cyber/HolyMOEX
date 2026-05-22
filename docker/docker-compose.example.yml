@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  agent_app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file:
+      - ../config/api_keys.local.env
+    depends_on:
+      - postgres_local
+      - redis_local
+    volumes:
+      - ../data:/app/data
+    command: ["python", "-m", "agent_app.main"]
+
+  scheduler_worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file:
+      - ../config/api_keys.local.env
+    depends_on:
+      - postgres_local
+      - redis_local
+    command: ["python", "-m", "agent_app.scheduler"]
+
+  research_worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file:
+      - ../config/api_keys.local.env
+    depends_on:
+      - postgres_local
+      - redis_local
+    command: ["python", "-m", "agent_app.research"]
+
+  postgres_local:
+    image: postgres:16
+    env_file:
+      - ../config/api_keys.local.env
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_local_data:/var/lib/postgresql/data
+
+  redis_local:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_local_data:

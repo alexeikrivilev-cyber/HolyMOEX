@@ -1,0 +1,11 @@
+# Local secrets
+config/api_keys.local.env
+config/*.local.env
+
+# Runtime data
+data/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
