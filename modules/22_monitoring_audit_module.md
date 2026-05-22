@@ -125,6 +125,30 @@
 | `write` | `Monitoring Store` |
 | `write` | `Audit Log Store` |
 
+### Operational DB readiness
+
+`audit.database_readiness_check` is an operator/admin preflight view, not a trading input. It may be queried before assembly or deployment to confirm that schemas, seed governance data, provider configs, schedules, dependency graph, initial portfolio state, risk policy, and paper/analysis weights are present.
+
+Required operator query:
+
+```sql
+SELECT *
+  FROM audit.database_readiness_check
+ ORDER BY check_name;
+```
+
+Every row must have `status = 'pass'` before the system is considered database-ready. This does not mean market, text, macro, feature, order, or research history has been filled by the owner.
+
+Metric weights have a dedicated preflight:
+
+```sql
+SELECT *
+  FROM audit.metric_weights_readiness_check
+ ORDER BY check_name;
+```
+
+Every row must have `status = 'pass'`. This confirms active `product_baseline` profiles, product rule totals, Decision schedule references, deprecated `strict_default` profiles, liquidity component weights, and absence of active live-trading weights.
+
 ## 12. TTL and freshness
 
 Monitoring events постоянные для audit. Health report обновляется continuously.
@@ -141,6 +165,8 @@ Monitoring events постоянные для audit. Health report обновл�
 - `request_costs_tracked`
 - `kill_switch_audited`
 - `health_report_available`
+- `database_readiness_preflight_available`
+- `metric_weights_readiness_preflight_available`
 
 ## 15. Metric formulas / calculation rules
 

@@ -141,6 +141,7 @@
 |---|---|
 | `read` | `Raw Market Data Store` |
 | `read` | `Selected Instruments DB` |
+| `read` | `Metric Weights DB` |
 | `write` | `Feature Store` |
 | `write` | `Execution Constraint Store` |
 
@@ -185,10 +186,13 @@ For every instrument the module must select the latest available `raw_orderbook`
 | `short_term_pressure_score` | `WAvg([order_book_imbalance, trade_imbalance, order_flow_imbalance], active_weights)` |
 | `liquidity_risk_score` | `WAvg([spread_percentile, estimated_slippage_1m, amihud_illiquidity, -order_book_depth_30bps_z], active_weights)` |
 
+Composite liquidity weights are read from active `Metric Weights DB` profile `liquidity_microstructure_component_weights`. The module may not create, update, activate, or deprecate weight profiles. Seeded component weights are allowed only for `analysis_only` and `paper_trading` unless a separate governance process approves a new version.
+
 ## 16. Forbidden actions
 
 - Запрещено симулировать стакан, если orderbook data отсутствует.
 - Запрещено использовать stale orderbook для execution approval.
 - Запрещено отправлять заявки.
 - Запрещено писать price/fundamental/news metrics.
+- Запрещено изменять `Metric Weights DB`.
 - Запрещено скрывать низкую ликвидность через нормализацию без `quality_flags`.

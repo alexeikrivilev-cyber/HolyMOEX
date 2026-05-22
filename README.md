@@ -483,6 +483,16 @@ Feature Store
 
 `Decision Engine Module` использует только версионированные веса. Вес не хранится в коде модуля.
 
+Active paper/analysis baseline profiles:
+
+| Horizon | `weights_profile_id` | Role |
+|---|---|---|
+| `intraday` | `weights:product_baseline:intraday:v1` | tactical price, liquidity pressure, event and risk gating |
+| `swing` | `weights:product_baseline:swing:v1` | price, event, earnings/fundamental, market context and risk |
+| `position` | `weights:product_baseline:position:v1` | fundamental, valuation, dividends, macro/sector context and risk |
+
+The previous `strict_default` profiles are retained for audit/replay but seeded as `deprecated`. Runtime schedules must reference `product_baseline` profiles. Live-trading weights remain inactive until a separate governance process approves a live-specific version.
+
 `weights_profile`:
 
 ```json
@@ -605,6 +615,30 @@ Feature Store
 | `Audit Log Store` | `audit` |
 
 Запрещено хранить ключевые trading state только в памяти контейнера. После рестарта должны восстанавливаться: `portfolio_snapshot`, `position_state`, `decision_record`, `order_intent`, `execution_result`, `external_request`, `external_response`, `external_request_log`, `module_job`, `module_job_result`, `module_run`, `feature_record`.
+
+### 16.1.1 Database readiness contract
+
+Миграции PostgreSQL находятся в `agent_app/storage/postgres/migrations` и применяются строго по имени файла. В `docker/docker-compose.example.yml` этот каталог монтируется в `/docker-entrypoint-initdb.d`, поэтому новая локальная база инициализируется схемой и governance seed-данными автоматически при первом старте volume.
+
+После применения миграций базовый контроль готовности выполняется запросом:
+
+```sql
+SELECT *
+  FROM audit.database_readiness_check
+ ORDER BY check_name;
+```
+
+Все строки должны иметь `status = 'pass'`. Этот view проверяет только инфраструктурную готовность БД: наличие stores, активного universe, стартового portfolio state, paper-trading risk policy, provider/source config, module schedules, dependency graph и product baseline seed-весов. Он не означает, что рыночные/новостные/макро данные уже заполнены владельцем.
+
+Детальная проверка весов выполняется через:
+
+```sql
+SELECT *
+  FROM audit.metric_weights_readiness_check
+ ORDER BY check_name;
+```
+
+Для `Metric Weights DB` действует governance-ограничение: active seed-веса являются product baseline для `analysis_only` и `paper_trading`. Дальнейшая эмпирическая оптимизация весов должна сначала давать draft-предложение и validation report. Отдельный промпт для аналитической модели лежит в `prompts/metric_weights_optimization_prompt.md`; его результат нельзя автоматически активировать без ручного governance approval.
 
 ### 16.2 Docker environment contract
 
@@ -876,3 +910,7 @@ Base notation:
 10. `Risk Control Module` проверяет daily trade limit, cash, exposure, stale portfolio, market session.
 11. `Execution Engine Module` не выполняет заявку без approved `risk_check_result`.
 12. `Portfolio State Module` синхронизирует cash/positions/trades через ArenaGo перед live decision.
+13. Fresh PostgreSQL volume applies all files from `agent_app/storage/postgres/migrations` through the compose init mount.
+14. `audit.database_readiness_check` returns only `status = 'pass'` rows before runtime assembly.
+15. `audit.metric_weights_readiness_check` returns only `status = 'pass'` rows and Decision schedule references `weights:product_baseline:*:v1`.
+16. Any future empirically optimized `Metric Weights DB` proposal starts from `prompts/metric_weights_optimization_prompt.md` and remains `draft` until manual governance approval.

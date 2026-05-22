@@ -115,6 +115,14 @@
 | `write` | `Decision Store` |
 | `write` | `Audit Log Store` |
 
+Active paper/analysis decision schedules must use:
+
+- `weights:product_baseline:intraday:v1`
+- `weights:product_baseline:swing:v1`
+- `weights:product_baseline:position:v1`
+
+The deprecated `strict_default` profiles may be used only for audit/replay comparisons, not as the runtime schedule default. `live_trading` requires a separate active profile approved by governance.
+
 ## 12. TTL and freshness
 
 Decision TTL должен быть меньше или равен TTL входного `feature_vector`. Event-driven decisions могут иметь отдельный short TTL.

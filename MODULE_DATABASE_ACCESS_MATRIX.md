@@ -51,6 +51,8 @@
 | `Provider Config Store` | `request_logs.provider_config` |
 | `Request Cache Store` | `request_logs.request_cache` |
 | `Audit Log Store` | `audit.audit_record` |
+| `DB Readiness View` | `audit.database_readiness_check` |
+| `Metric Weights Readiness View` | `audit.metric_weights_readiness_check` |
 | `Schedule Config Store` | `audit.schedule_config` |
 | `Module Dependency Graph Store` | `audit.module_dependency_graph` |
 | `Module Job Store` | `audit.module_job` |
@@ -93,3 +95,5 @@
 - DDL права выдаются только миграционному/admin-пользователю.
 - Запись в `weights`, `risk`, `registry`, `orders`, `portfolio` выдаётся особенно осторожно.
 - Любое изменение governance/manual-зоны должно оставлять запись в `Audit Log Store`.
+- `DB Readiness View` является read-only операционным представлением для владельца/оператора сборки. Runtime-модули не должны использовать его как источник торговых данных или как основание для изменения governance stores.
+- `Metric Weights Readiness View` является read-only проверкой полноты active `product_baseline` весов и не выдаёт runtime-модулям права изменять `Metric Weights DB`.

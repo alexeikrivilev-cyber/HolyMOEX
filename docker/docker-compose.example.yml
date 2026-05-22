@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   agent_app:
     build:
@@ -44,6 +42,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_local_data:/var/lib/postgresql/data
+      - ../agent_app/storage/postgres/migrations:/docker-entrypoint-initdb.d:ro
 
   redis_local:
     image: redis:7

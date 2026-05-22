@@ -134,11 +134,13 @@
 | `read` | `Order Store` |
 | `read` | `Market State Store` |
 | `write` | `Research Store` |
-| `write` | `Metric Weights DB` |
+| `write` | `Metric Weights DB` draft only |
 
 ## 12. TTL and freshness
 
 Research reports постоянные и версионируемые. Draft weights не становятся active без approval.
+
+Для ручной аналитической подготовки новых весов используется отдельный prompt-файл `prompts/metric_weights_optimization_prompt.md`. Результат такого анализа должен сохраняться только как `draft` `weights_profile` / `metric_weight_rule` и сопровождаться validation report. Автоматическая активация или изменение active-профилей запрещены.
 
 ## 13. Failure policy
 
@@ -169,6 +171,7 @@ Research reports постоянные и версионируемые. Draft wei
 ## 16. Forbidden actions
 
 - Запрещено автоматически активировать new `weights_profile`.
+- Запрещено записывать оптимизированные веса со статусом `active`.
 - Запрещено использовать future data in validation.
 - Запрещено изменять production Feature Store records.
 - Запрещено отправлять заявки или менять portfolio state.
