@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -87,7 +88,8 @@ class UrllibHttpTransport:
         if request.json_payload is not None:
             body_bytes = json.dumps(request.json_payload, ensure_ascii=False).encode("utf-8")
             headers.setdefault("Content-Type", "application/json")
-        headers.setdefault("Accept", "application/json")
+        headers.setdefault("Accept", "application/json, application/rss+xml, application/xml, text/xml, text/html;q=0.8, */*;q=0.5")
+        headers.setdefault("User-Agent", "HolyMOEX/1.0 public-data-gateway")
         http_request = urllib.request.Request(
             request.url,
             data=body_bytes,
@@ -99,7 +101,7 @@ class UrllibHttpTransport:
             with urllib.request.urlopen(http_request, timeout=timeout) as response:
                 raw_body = response.read()
                 response_headers = dict(response.headers.items())
-                parsed_body = _parse_json_body(raw_body)
+                parsed_body = _parse_json_body(raw_body, response_headers)
                 return ProviderHttpResponse(
                     status_code=response.status,
                     body=parsed_body,
@@ -111,7 +113,7 @@ class UrllibHttpTransport:
             response_headers = dict(error.headers.items()) if error.headers else {}
             return ProviderHttpResponse(
                 status_code=error.code,
-                body=_parse_json_body(raw_body),
+                body=_parse_json_body(raw_body, response_headers),
                 headers=response_headers,
                 provider_tracking_id=_tracking_id(response_headers),
             )
@@ -566,14 +568,126 @@ def _extract_polza_content(body: Mapping[str, Any]) -> Any:
     return body if "schema_version" in body else None
 
 
-def _parse_json_body(raw_body: bytes) -> Mapping[str, Any] | list[Any] | str | None:
+def _parse_json_body(
+    raw_body: bytes,
+    headers: Mapping[str, str] | None = None,
+) -> Mapping[str, Any] | list[Any] | str | None:
     if not raw_body:
         return None
-    text = raw_body.decode("utf-8")
+    text = _decode_body(raw_body, headers)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return text
+        feed = _parse_feed_body(text)
+        return feed if feed is not None else text
+
+
+def _decode_body(raw_body: bytes, headers: Mapping[str, str] | None) -> str:
+    charset = _charset_from_headers(headers or {})
+    encodings = [charset] if charset else []
+    encodings.extend(["utf-8-sig", "windows-1251"])
+    for encoding in encodings:
+        try:
+            return raw_body.decode(encoding, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw_body.decode("utf-8-sig", errors="replace")
+
+
+def _charset_from_headers(headers: Mapping[str, str]) -> str:
+    content_type = ""
+    for key, value in headers.items():
+        if key.lower() == "content-type":
+            content_type = str(value)
+            break
+    for part in content_type.split(";"):
+        key, separator, value = part.strip().partition("=")
+        if separator and key.lower() == "charset":
+            return value.strip().strip('"')
+    return ""
+
+
+def _parse_feed_body(text: str) -> Mapping[str, Any] | None:
+    stripped = text.lstrip()
+    if not stripped.startswith("<"):
+        return None
+    try:
+        root = ET.fromstring(stripped)
+    except ET.ParseError:
+        return None
+
+    root_name = _local_xml_name(root.tag)
+    if root_name == "rss":
+        channel = _first_xml_child(root, "channel")
+        if channel is None:
+            return None
+        items = [_rss_item_payload(item) for item in _xml_children(channel, "item")]
+        return {
+            "format": "rss",
+            "title": _xml_text(channel, "title"),
+            "items": [item for item in items if item],
+        }
+    if root_name == "feed":
+        items = [_atom_entry_payload(entry) for entry in _xml_children(root, "entry")]
+        return {
+            "format": "atom",
+            "title": _xml_text(root, "title"),
+            "items": [item for item in items if item],
+        }
+    return None
+
+
+def _rss_item_payload(item: ET.Element) -> Mapping[str, Any]:
+    return {
+        "title": _xml_text(item, "title"),
+        "url": _xml_text(item, "link"),
+        "body": _xml_text(item, "description"),
+        "published_at": _xml_text(item, "pubDate"),
+        "source_ref": _xml_text(item, "guid") or _xml_text(item, "link"),
+        "source": _xml_text(item, "source"),
+    }
+
+
+def _atom_entry_payload(entry: ET.Element) -> Mapping[str, Any]:
+    return {
+        "title": _xml_text(entry, "title"),
+        "url": _atom_link(entry),
+        "body": _xml_text(entry, "summary") or _xml_text(entry, "content"),
+        "published_at": _xml_text(entry, "published") or _xml_text(entry, "updated"),
+        "source_ref": _xml_text(entry, "id") or _atom_link(entry),
+    }
+
+
+def _xml_text(parent: ET.Element, name: str) -> str:
+    child = _first_xml_child(parent, name)
+    if child is None or child.text is None:
+        return ""
+    return " ".join(child.text.split())
+
+
+def _atom_link(entry: ET.Element) -> str:
+    for child in _xml_children(entry, "link"):
+        href = child.attrib.get("href")
+        if href:
+            return str(href)
+        if child.text:
+            return " ".join(child.text.split())
+    return ""
+
+
+def _first_xml_child(parent: ET.Element, name: str) -> ET.Element | None:
+    for child in parent:
+        if _local_xml_name(child.tag) == name:
+            return child
+    return None
+
+
+def _xml_children(parent: ET.Element, name: str) -> list[ET.Element]:
+    return [child for child in parent if _local_xml_name(child.tag) == name]
+
+
+def _local_xml_name(tag: str) -> str:
+    return str(tag).rsplit("}", 1)[-1]
 
 
 def _flatten_query(payload: Mapping[str, Any]) -> dict[str, str]:

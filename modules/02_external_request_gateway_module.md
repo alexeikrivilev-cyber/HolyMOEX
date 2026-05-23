@@ -210,10 +210,14 @@ If provider payload cannot be mapped to the target raw table without inventing v
 
 - `text_search`: normalized HTTP search request; results are written to `raw_text.raw_text_item` when title/body/url fields are available.
 - `text_fetch`: normalized HTTP fetch request; fetched document text is written to `raw_text.raw_text_item`.
+- Concrete public sources are configured through `raw_text.text_source_config.query_template.endpoint`; provider names remain generic (`news_api`, `issuer_disclosure`) to preserve the gateway contract.
+- RSS/Atom responses from public news feeds are normalized into `items` with `title`, `url`, `body`, `published_at` and `source_ref` before raw-store persistence.
+- Ordinary news providers may create event candidates only; official disclosure/issuer/MOEX/CBR sources are required for confirmed corporate events.
 
 ### `macro_api`
 
 - `macro_series`: normalized HTTP series request; points are written to `raw_macro.raw_macro_point` when `series_id`, timestamp and value are available.
+- Public macro/news endpoints for CBR, MOEX ISS and optional public macro sources are configured in `Provider Config Store` and `Text Source Config`; analytical modules must still access them only through Gateway.
 
 ### `arena_go`
 

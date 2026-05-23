@@ -53,6 +53,7 @@
 | `Audit Log Store` | `audit.audit_record` |
 | `DB Readiness View` | `audit.database_readiness_check` |
 | `Metric Weights Readiness View` | `audit.metric_weights_readiness_check` |
+| `Public Data Source Readiness View` | `audit.public_data_source_readiness_check` |
 | `Schedule Config Store` | `audit.schedule_config` |
 | `Module Dependency Graph Store` | `audit.module_dependency_graph` |
 | `Module Job Store` | `audit.module_job` |

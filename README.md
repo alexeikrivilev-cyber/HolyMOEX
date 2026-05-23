@@ -640,6 +640,16 @@ SELECT *
 
 Для `Metric Weights DB` действует governance-ограничение: active seed-веса являются product baseline для `analysis_only` и `paper_trading`. Дальнейшая эмпирическая оптимизация весов должна сначала давать draft-предложение и validation report. Отдельный промпт для аналитической модели лежит в `prompts/metric_weights_optimization_prompt.md`; его результат нельзя автоматически активировать без ручного governance approval.
 
+Публичный контур источников данных проверяется отдельно:
+
+```sql
+SELECT *
+  FROM audit.public_data_source_readiness_check
+ ORDER BY check_name;
+```
+
+Этот view проверяет, что включены gateway providers `news_api`, `issuer_disclosure`, `macro_api`, а конкретные публичные источники новостей, раскрытий и макро заведены в `raw_text.text_source_config`. Конкретные порталы/RSS не становятся новыми provider names: они задаются через `query_template.endpoint`, чтобы сохранить контракт Gateway.
+
 ### 16.2 Docker environment contract
 
 Все конфигурации должны приходить из environment variables или mounted config files. Секреты не хранятся в markdown, коде или git.
@@ -654,6 +664,10 @@ REDIS_URL=redis://redis_local:6379/0
 DEFAULT_TIMEZONE=Europe/Moscow
 INITIAL_CAPITAL_RUB=1000000
 SELECTED_UNIVERSE_ID=moex_top20_manual
+MOEX_ISS_BASE_URL=https://iss.moex.com/iss
+NEWS_API_BASE_URL=https://www.rbc.ru
+ISSUER_DISCLOSURE_BASE_URL=https://www.e-disclosure.ru
+MACRO_API_BASE_URL=https://www.cbr.ru
 ARENA_GO_BASE_URL=https://arenago.ru/api
 ARENA_GO_TOKEN=replace_with_real_token
 ARENA_GO_PORTFOLIO=MyBot

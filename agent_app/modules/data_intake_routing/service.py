@@ -47,13 +47,30 @@ MODULE_NAME = "Data Intake & Routing Module"
 CALCULATION_VERSION = "data_intake_routing_v1"
 
 VALID_CONTOURS = {"intraday_contour", "event_contour", "daily_contour"}
-VALID_SOURCE_TYPES = {
+FAST_NEWS_SOURCE_TYPES = {
     "news_api",
+    "rbc_news",
+    "tass_news",
+    "interfax_news",
+    "prime_news",
+    "finam_news",
+    "smartlab_news",
+}
+OFFICIAL_DISCLOSURE_SOURCE_TYPES = {
     "issuer_disclosure",
-    "macro_text",
-    "regulatory_text",
+    "prime_disclosure",
+    "akm_disclosure",
     "corporate_site",
 }
+MACRO_SOURCE_TYPES = {
+    "macro_text",
+    "cbr_macro",
+    "moex_macro",
+    "fred_eia_macro",
+    "rosstat_macro",
+}
+REGULATORY_SOURCE_TYPES = {"regulatory_text", "cbr_macro", "moex_macro"}
+VALID_SOURCE_TYPES = FAST_NEWS_SOURCE_TYPES | OFFICIAL_DISCLOSURE_SOURCE_TYPES | MACRO_SOURCE_TYPES | REGULATORY_SOURCE_TYPES
 VALID_TEXT_CATEGORIES = {
     "news",
     "earnings",
@@ -80,18 +97,28 @@ CATEGORY_TARGETS = {
     "other": ("Event & News Intelligence Module",),
 }
 SOURCE_PROVIDER_MAP = {
-    "news_api": "news_api",
-    "issuer_disclosure": "issuer_disclosure",
-    "macro_text": "macro_api",
-    "regulatory_text": "macro_api",
-    "corporate_site": "issuer_disclosure",
+    **{source_type: "news_api" for source_type in FAST_NEWS_SOURCE_TYPES},
+    **{source_type: "issuer_disclosure" for source_type in OFFICIAL_DISCLOSURE_SOURCE_TYPES},
+    **{source_type: "macro_api" for source_type in MACRO_SOURCE_TYPES | REGULATORY_SOURCE_TYPES},
 }
 SOURCE_CREDIBILITY_REGISTRY = {
     "issuer_disclosure": 0.95,
+    "prime_disclosure": 0.95,
+    "akm_disclosure": 0.92,
     "corporate_site": 0.80,
     "macro_text": 0.85,
+    "cbr_macro": 0.95,
+    "moex_macro": 0.92,
+    "fred_eia_macro": 0.75,
+    "rosstat_macro": 0.75,
     "regulatory_text": 0.85,
     "news_api": 0.65,
+    "rbc_news": 0.75,
+    "tass_news": 0.75,
+    "interfax_news": 0.75,
+    "prime_news": 0.75,
+    "finam_news": 0.70,
+    "smartlab_news": 0.55,
     "default": 0.50,
 }
 MARKET_WIDE_CATEGORIES = {"macro", "regulation"}
@@ -843,6 +870,7 @@ class DataIntakeRoutingService:
             issuer_name = str(_profile_value(profile, "issuer_name", "") or "")
             ticker = str(_profile_value(profile, "ticker", "") or "")
             sector = str(_profile_value(profile, "sector", "") or "")
+            metadata = _profile_value(profile, "metadata", {}) or {}
             query_terms = tuple(
                 dict.fromkeys(
                     term
@@ -859,6 +887,7 @@ class DataIntakeRoutingService:
                     "aliases": list(dict.fromkeys(alias for alias in aliases if alias)),
                     "related_entities": list(dict.fromkeys(entity for entity in related_entities if entity)),
                     "query_terms": list(query_terms),
+                    "metadata": dict(metadata) if isinstance(metadata, Mapping) else {},
                 }
             )
         return tuple(queries)
@@ -928,9 +957,52 @@ class DataIntakeRoutingService:
                 )
             return schedule, warnings
 
+        per_instrument_source_types: list[str] = []
+        for source_type in intake_request.source_types:
+            config = text_source_configs.get(source_type)
+            if self._market_wide_once_source(config):
+                query = {
+                    "instrument_id": "",
+                    "ticker": "",
+                    "issuer_name": "",
+                    "sector": "",
+                    "aliases": [],
+                    "related_entities": [],
+                    "query_terms": [],
+                    "market_wide": True,
+                }
+                query_payload = self._query_payload_for_source(query, config)
+                if not self._source_enabled(source_type, intake_request.text_source_config, config):
+                    warnings.append(f"source_disabled:{source_type}:market_wide")
+                    schedule.append(
+                        {
+                            "instrument_id": "",
+                            "source_type": source_type,
+                            "config": config,
+                            "query": query_payload,
+                            "query_terms": (),
+                            "status": "skipped",
+                            "skip_reason_code": "source_disabled",
+                        }
+                    )
+                    continue
+                schedule.append(
+                    {
+                        "instrument_id": "",
+                        "source_type": source_type,
+                        "config": config,
+                        "query": query_payload,
+                        "query_terms": (),
+                        "status": "planned",
+                        "skip_reason_code": None,
+                    }
+                )
+                continue
+            per_instrument_source_types.append(source_type)
+
         for profile in active_profiles:
             instrument_id = str(_profile_value(profile, "instrument_id"))
-            for source_type in intake_request.source_types:
+            for source_type in per_instrument_source_types:
                 config = text_source_configs.get(source_type)
                 base_query = queries_by_instrument[instrument_id]
                 query_payload = self._query_payload_for_source(base_query, config)
@@ -946,6 +1018,20 @@ class DataIntakeRoutingService:
                             "query_terms": query_terms,
                             "status": "skipped",
                             "skip_reason_code": "source_disabled",
+                        }
+                    )
+                    continue
+                if not self._source_has_required_endpoint(config, query_payload):
+                    warnings.append(f"source_missing_endpoint:{source_type}:{instrument_id}")
+                    schedule.append(
+                        {
+                            "instrument_id": instrument_id,
+                            "source_type": source_type,
+                            "config": config,
+                            "query": query_payload,
+                            "query_terms": query_terms,
+                            "status": "skipped",
+                            "skip_reason_code": "source_missing_endpoint",
                         }
                     )
                     continue
@@ -1026,6 +1112,21 @@ class DataIntakeRoutingService:
                 )
                 continue
             idempotency_key = f"{job.idempotency_key}:text_search:{instrument_id or 'market_wide'}:{source_type}"
+            request_payload = {
+                "operation": "scheduled_external_news_discovery"
+                if intake_request.discovery_mode == "scheduled"
+                else "text_search",
+                "discovery_run_id": discovery_run_id,
+                "discovery_mode": intake_request.discovery_mode,
+                "per_instrument_discovery": True,
+                "source_type": source_type,
+                "text_source_config_id": text_source_config_id,
+                "time_range": dict(intake_request.time_range),
+                "query_terms": list(query_terms),
+                "query": query_payload,
+                "routing_targets": list(intake_request.routing_targets),
+            }
+            request_payload.update(self._transport_payload_for_source(config, query_payload))
             request = ExternalRequest(
                 request_id=f"request_{_stable_hash({'idempotency_key': idempotency_key})[:24]}",
                 caller_module=self.module_name,
@@ -1033,20 +1134,7 @@ class DataIntakeRoutingService:
                 request_type=request_type,
                 universe_id=intake_request.universe_id,
                 instrument_ids=(instrument_id,) if instrument_id else (),
-                payload={
-                    "operation": "scheduled_external_news_discovery"
-                    if intake_request.discovery_mode == "scheduled"
-                    else "text_search",
-                    "discovery_run_id": discovery_run_id,
-                    "discovery_mode": intake_request.discovery_mode,
-                    "per_instrument_discovery": True,
-                    "source_type": source_type,
-                    "text_source_config_id": text_source_config_id,
-                    "time_range": dict(intake_request.time_range),
-                    "query_terms": list(query_terms),
-                    "query": query_payload,
-                    "routing_targets": list(intake_request.routing_targets),
-                },
+                payload=request_payload,
                 cache_policy=CachePolicy(
                     use_cache=True,
                     max_age_seconds=self._cache_ttl(source_type, config),
@@ -1229,9 +1317,9 @@ class DataIntakeRoutingService:
 
     def classify_text_category(self, raw_item: RawTextItem) -> str:
         source_type = raw_item.source_type
-        if source_type == "macro_text":
+        if source_type in MACRO_SOURCE_TYPES:
             return "macro"
-        if source_type == "regulatory_text":
+        if source_type in REGULATORY_SOURCE_TYPES:
             return "regulation"
         text = normalize_text(f"{raw_item.title} {raw_item.body}")
         if _contains_any(text, DIVIDEND_KEYWORDS):
@@ -1409,7 +1497,7 @@ class DataIntakeRoutingService:
             issuer_sources = tuple(
                 source_type
                 for source_type in requested_source_types
-                if source_type in {"issuer_disclosure", "corporate_site", "regulatory_text"}
+                if source_type in OFFICIAL_DISCLOSURE_SOURCE_TYPES | {"regulatory_text"}
             )
             if len(issuer_sources) == 1:
                 return issuer_sources[0]
@@ -1418,12 +1506,15 @@ class DataIntakeRoutingService:
             macro_sources = tuple(
                 source_type
                 for source_type in requested_source_types
-                if source_type in {"macro_text", "regulatory_text"}
+                if source_type in MACRO_SOURCE_TYPES | REGULATORY_SOURCE_TYPES
             )
             if len(macro_sources) == 1:
                 return macro_sources[0]
             return "macro_text"
         if provider == "news_api":
+            news_sources = tuple(source_type for source_type in requested_source_types if source_type in FAST_NEWS_SOURCE_TYPES)
+            if len(news_sources) == 1:
+                return news_sources[0]
             return "news_api"
         raise DataIntakeRoutingError(f"unsupported text provider for intake routing: {provider}")
 
@@ -1433,9 +1524,9 @@ class DataIntakeRoutingService:
     def _cache_ttl(self, source_type: str, config: Any | None = None) -> int:
         if isinstance(config, TextSourceConfig) and config.max_age_seconds is not None:
             return max(0, int(config.max_age_seconds))
-        if source_type == "news_api":
+        if source_type in FAST_NEWS_SOURCE_TYPES:
             return 300
-        if source_type in {"macro_text", "regulatory_text"}:
+        if source_type in MACRO_SOURCE_TYPES | REGULATORY_SOURCE_TYPES:
             return 1800
         return 3600
 
@@ -1528,7 +1619,57 @@ class DataIntakeRoutingService:
             payload["sector"] = str(query.get("sector") or "")
         if query.get("market_wide"):
             payload["market_wide"] = True
+        if config is not None:
+            source_name = config.source_policy.get("source_name")
+            trust_level = config.source_policy.get("trust_level")
+            source_layer = config.source_policy.get("source_layer")
+            if source_name:
+                payload["source_name"] = str(source_name)
+            if trust_level:
+                payload["trust_level"] = str(trust_level)
+            if source_layer:
+                payload["source_layer"] = str(source_layer)
+            endpoint_key = config.source_policy.get("endpoint_metadata_key")
+            metadata = query.get("metadata")
+            if endpoint_key and isinstance(metadata, Mapping):
+                endpoint = metadata.get(str(endpoint_key))
+                if isinstance(endpoint, str) and endpoint.strip():
+                    payload["endpoint"] = endpoint.strip()
         return payload
+
+    def _transport_payload_for_source(
+        self,
+        config: TextSourceConfig | None,
+        query_payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        transport: dict[str, Any] = {}
+        if config is not None and isinstance(config.query_template, Mapping):
+            for key in ("path", "endpoint", "method", "query_params"):
+                value = config.query_template.get(key)
+                if value not in (None, "", {}):
+                    transport[key] = value
+        endpoint = query_payload.get("endpoint")
+        if isinstance(endpoint, str) and endpoint.strip():
+            transport["endpoint"] = endpoint.strip()
+        return transport
+
+    def _market_wide_once_source(self, config: TextSourceConfig | None) -> bool:
+        if config is None:
+            return False
+        return str(config.source_policy.get("fetch_scope") or "") == "market_wide_once"
+
+    def _source_has_required_endpoint(
+        self,
+        config: TextSourceConfig | None,
+        query_payload: Mapping[str, Any],
+    ) -> bool:
+        if config is None:
+            return False
+        if not _strict_bool(config.source_policy.get("requires_endpoint", False)):
+            return True
+        if query_payload.get("endpoint"):
+            return True
+        return bool(config.query_template.get("endpoint") or config.query_template.get("path"))
 
     def _discovery_run_id(self, job: ModuleJob, intake_request: DataIntakeRequest) -> str:
         payload = {
@@ -1886,7 +2027,7 @@ def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
 
 
 def _is_market_wide_source_set(source_types: tuple[str, ...]) -> bool:
-    return bool(source_types) and set(source_types) <= {"macro_text", "regulatory_text"}
+    return bool(source_types) and set(source_types) <= (MACRO_SOURCE_TYPES | REGULATORY_SOURCE_TYPES)
 
 
 def _strict_bool(value: Any) -> bool:

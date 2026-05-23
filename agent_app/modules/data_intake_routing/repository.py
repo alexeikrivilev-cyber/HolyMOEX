@@ -23,81 +23,156 @@ class AuditRecord:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
 
-DEFAULT_TEXT_SOURCE_CONFIGS: tuple[Mapping[str, Any], ...] = (
-    {
-        "text_source_config_id": "source:news_api:text_search",
-        "source_type": "news_api",
-        "provider": "news_api",
+def _default_source(
+    source_type: str,
+    provider: str,
+    *,
+    endpoint: str | None = None,
+    fields: list[str] | None = None,
+    frequency: str = "15m-60m",
+    max_age_seconds: int = 3600,
+    policy: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    query_template: dict[str, Any] = {
+        "query_fields": fields or ["ticker", "issuer_name", "aliases", "related_entities"],
+        "response_target": "Raw Text Store",
+    }
+    if endpoint:
+        query_template["endpoint"] = endpoint
+    return {
+        "text_source_config_id": f"source:{source_type}:text_search",
+        "source_type": source_type,
+        "provider": provider,
         "request_type": "text_search",
         "enabled": True,
-        "discovery_frequency": "15m-60m",
-        "max_age_seconds": 3600,
-        "query_template": {
-            "query_fields": ["ticker", "issuer_name", "aliases", "related_entities"],
-            "response_target": "Raw Text Store",
-        },
-        "source_policy": {"requires_active_instrument": True, "gateway_only": True},
-    },
-    {
-        "text_source_config_id": "source:issuer_disclosure:text_search",
-        "source_type": "issuer_disclosure",
-        "provider": "issuer_disclosure",
-        "request_type": "text_search",
-        "enabled": True,
-        "discovery_frequency": "15m-60m",
-        "max_age_seconds": 3600,
-        "query_template": {
-            "query_fields": ["ticker", "issuer_name", "aliases"],
-            "response_target": "Raw Text Store",
-        },
-        "source_policy": {"requires_active_instrument": True, "gateway_only": True},
-    },
-    {
-        "text_source_config_id": "source:regulatory_text:text_search",
-        "source_type": "regulatory_text",
-        "provider": "issuer_disclosure",
-        "request_type": "text_search",
-        "enabled": True,
-        "discovery_frequency": "15m-60m",
-        "max_age_seconds": 3600,
-        "query_template": {
-            "query_fields": ["ticker", "issuer_name", "related_entities"],
-            "response_target": "Raw Text Store",
-        },
-        "source_policy": {"requires_active_instrument": True, "gateway_only": True},
-    },
-    {
-        "text_source_config_id": "source:macro_text:text_search",
-        "source_type": "macro_text",
-        "provider": "macro_api",
-        "request_type": "text_search",
-        "enabled": True,
-        "discovery_frequency": "4h-8h",
-        "max_age_seconds": 14400,
-        "query_template": {
-            "query_fields": ["sector", "related_entities"],
-            "response_target": "Raw Text Store",
-        },
+        "discovery_frequency": frequency,
+        "max_age_seconds": max_age_seconds,
+        "query_template": query_template,
         "source_policy": {
-            "requires_active_instrument": False,
+            "requires_active_instrument": True,
             "gateway_only": True,
-            "market_wide_allowed": True,
+            **dict(policy or {}),
         },
-    },
-    {
-        "text_source_config_id": "source:corporate_site:text_search",
-        "source_type": "corporate_site",
-        "provider": "issuer_disclosure",
-        "request_type": "text_search",
-        "enabled": True,
-        "discovery_frequency": "15m-60m",
-        "max_age_seconds": 3600,
-        "query_template": {
-            "query_fields": ["issuer_name", "aliases", "related_entities"],
-            "response_target": "Raw Text Store",
-        },
-        "source_policy": {"requires_active_instrument": True, "gateway_only": True},
-    },
+    }
+
+
+DEFAULT_TEXT_SOURCE_CONFIGS: tuple[Mapping[str, Any], ...] = (
+    _default_source("news_api", "news_api", policy={"source_layer": "fast_news", "trust_level": "normal"}),
+    _default_source(
+        "rbc_news",
+        "news_api",
+        endpoint="https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
+        policy={"source_name": "rbc", "source_layer": "fast_news", "trust_level": "normal_high", "fetch_scope": "market_wide_once"},
+    ),
+    _default_source(
+        "tass_news",
+        "news_api",
+        endpoint="https://tass.ru/rss/v2.xml",
+        policy={"source_name": "tass", "source_layer": "fast_news", "trust_level": "normal_high", "fetch_scope": "market_wide_once"},
+    ),
+    _default_source(
+        "interfax_news",
+        "news_api",
+        endpoint="https://www.interfax.ru/rss.asp",
+        policy={"source_name": "interfax", "source_layer": "fast_news", "trust_level": "normal_high", "fetch_scope": "market_wide_once"},
+    ),
+    _default_source(
+        "prime_news",
+        "news_api",
+        endpoint="https://1prime.ru/export/rss2/index.xml",
+        policy={"source_name": "prime_news", "source_layer": "fast_news", "trust_level": "normal_high", "fetch_scope": "market_wide_once"},
+    ),
+    _default_source(
+        "finam_news",
+        "news_api",
+        endpoint="https://www.finam.ru/analysis/conews/rsspoint/",
+        policy={"source_name": "finam", "source_layer": "fast_news", "trust_level": "normal", "fetch_scope": "market_wide_once"},
+    ),
+    _default_source(
+        "smartlab_news",
+        "news_api",
+        endpoint="https://smart-lab.ru/news/rss/",
+        policy={"source_name": "smartlab", "source_layer": "fast_news", "trust_level": "medium_weak", "fetch_scope": "market_wide_once"},
+    ),
+    _default_source(
+        "issuer_disclosure",
+        "issuer_disclosure",
+        endpoint="https://www.e-disclosure.ru/portal/company.aspx",
+        fields=["ticker", "issuer_name", "aliases"],
+        policy={"source_name": "e_disclosure", "source_layer": "official_disclosure", "trust_level": "high"},
+    ),
+    _default_source(
+        "prime_disclosure",
+        "issuer_disclosure",
+        endpoint="https://disclosure.1prime.ru/",
+        fields=["ticker", "issuer_name", "aliases"],
+        policy={"source_name": "prime_disclosure", "source_layer": "official_disclosure", "trust_level": "high"},
+    ),
+    _default_source(
+        "akm_disclosure",
+        "issuer_disclosure",
+        endpoint="https://www.disclosure.ru/",
+        fields=["ticker", "issuer_name", "aliases"],
+        policy={"source_name": "akm_disclosure", "source_layer": "official_disclosure", "trust_level": "high"},
+    ),
+    _default_source(
+        "regulatory_text",
+        "macro_api",
+        endpoint="https://www.cbr.ru/press/event/",
+        fields=["ticker", "issuer_name", "related_entities"],
+        policy={"source_name": "cbr_regulatory", "source_layer": "official_macro", "trust_level": "high"},
+    ),
+    _default_source(
+        "macro_text",
+        "macro_api",
+        endpoint="https://www.cbr.ru/press/event/",
+        fields=["sector", "related_entities"],
+        frequency="4h-8h",
+        max_age_seconds=14400,
+        policy={"requires_active_instrument": False, "market_wide_allowed": True, "fetch_scope": "market_wide_once", "source_layer": "official_macro", "trust_level": "high"},
+    ),
+    _default_source(
+        "cbr_macro",
+        "macro_api",
+        endpoint="https://www.cbr.ru/press/event/",
+        fields=["sector", "related_entities"],
+        frequency="4h-8h",
+        max_age_seconds=14400,
+        policy={"requires_active_instrument": False, "market_wide_allowed": True, "fetch_scope": "market_wide_once", "source_name": "cbr", "source_layer": "official_macro", "trust_level": "high"},
+    ),
+    _default_source(
+        "moex_macro",
+        "macro_api",
+        endpoint="https://iss.moex.com/iss/statistics/engines/stock/markets/index/analytics.json",
+        fields=["sector", "related_entities"],
+        frequency="4h-8h",
+        max_age_seconds=14400,
+        policy={"requires_active_instrument": False, "market_wide_allowed": True, "fetch_scope": "market_wide_once", "source_name": "moex", "source_layer": "official_market", "trust_level": "high"},
+    ),
+    _default_source(
+        "fred_eia_macro",
+        "macro_api",
+        endpoint="https://fred.stlouisfed.org/",
+        fields=["sector", "related_entities"],
+        frequency="1d",
+        max_age_seconds=86400,
+        policy={"requires_active_instrument": False, "market_wide_allowed": True, "fetch_scope": "market_wide_once", "source_name": "fred_eia", "source_layer": "external_macro", "trust_level": "normal"},
+    ),
+    _default_source(
+        "rosstat_macro",
+        "macro_api",
+        endpoint="https://rosstat.gov.ru/",
+        fields=["sector", "related_entities"],
+        frequency="1d",
+        max_age_seconds=86400,
+        policy={"requires_active_instrument": False, "market_wide_allowed": True, "fetch_scope": "market_wide_once", "source_name": "rosstat", "source_layer": "official_macro_optional", "trust_level": "normal"},
+    ),
+    _default_source(
+        "corporate_site",
+        "issuer_disclosure",
+        fields=["issuer_name", "aliases", "related_entities"],
+        policy={"source_layer": "official_issuer_site", "trust_level": "high", "requires_endpoint": True, "endpoint_metadata_key": "issuer_ir_url"},
+    ),
 )
 
 

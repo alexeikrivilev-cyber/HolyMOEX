@@ -32,9 +32,26 @@
 
 Запускается по расписанию для `scheduled_external_news_discovery` и немедленно при event trigger. Scheduled discovery обязана проходить по каждому `instrument_id` из активной вселенной `Selected Instruments DB` с `is_active=true`.
 
-Для каждого активного инструмента модуль строит поисковые запросы по `ticker`, `issuer_name`, `aliases` и `related_entities`, затем создаёт `external_request` в `External Request Gateway Module` для источников `news_api`, `issuer_disclosure`, `regulatory_text`, `macro_text` и `corporate_site`, если они разрешены `text_source_config`.
+Для каждого активного инструмента модуль строит поисковые запросы по `ticker`, `issuer_name`, `aliases` и `related_entities`, затем создаёт `external_request` в `External Request Gateway Module` для разрешённых источников из `text_source_config`. Базовый рабочий контур источников не является ручным: он сидится миграцией `008_public_data_source_contour.sql`.
 
 Все внешние text requests выполняются через `External Request Gateway Module`.
+
+### Public source contour
+
+`text_source_config` обязан хранить конкретный источник, а не абстрактное намерение "найти новости". Логический provider остаётся одним из контрактных `news_api`, `issuer_disclosure`, `macro_api`, но конкретный URL/RSS/search endpoint задаётся в `query_template.endpoint`.
+
+Обязательный open/public contour:
+
+| Layer | `source_type` | Provider | Trust rule |
+|---|---|---|---|
+| Fast news | `rbc_news`, `tass_news`, `interfax_news`, `prime_news`, `finam_news` | `news_api` | early signal, not confirmed corporate event |
+| Weak/fast news | `smartlab_news` | `news_api` | weak/medium signal, never direct trade trigger |
+| Official disclosure | `issuer_disclosure`, `prime_disclosure`, `akm_disclosure` | `issuer_disclosure` | high-trust confirmation layer |
+| Issuer sites | `corporate_site` | `issuer_disclosure` | high-trust only when `instrument_profile.metadata.issuer_ir_url` exists |
+| Macro/regulatory | `macro_text`, `regulatory_text`, `cbr_macro`, `moex_macro` | `macro_api` | official macro/market context |
+| Optional macro | `fred_eia_macro`, `rosstat_macro` | `macro_api` | optional external/public macro |
+
+RSS/news feeds that cannot search per ticker must use `source_policy.fetch_scope = "market_wide_once"`: the module fetches the feed once per run, then maps items to instruments internally by aliases. Sources with `source_policy.requires_endpoint = true` are skipped with `source_missing_endpoint` until the selected instrument metadata contains the required endpoint.
 
 ## 4. Input classification
 
@@ -55,11 +72,20 @@
       "string"
     ],
     "source_types": [
-      "news_api",
+      "rbc_news",
+      "tass_news",
+      "interfax_news",
+      "prime_news",
+      "finam_news",
+      "smartlab_news",
       "issuer_disclosure",
-      "macro_text",
+      "prime_disclosure",
+      "akm_disclosure",
+      "corporate_site",
       "regulatory_text",
-      "corporate_site"
+      "macro_text",
+      "cbr_macro",
+      "moex_macro"
     ],
     "discovery_mode": "scheduled | event_driven | replay",
     "per_instrument_discovery": true,
@@ -79,7 +105,7 @@
 
 ## 6. External requests
 
-Создаёт `external_request` с `request_type=text_search` или `text_fetch`. Для scheduled discovery создаёт минимум один `text_search` request на каждый активный `instrument_id` и каждый разрешённый source type, если source не отключён политикой. Не обращается к источникам напрямую.
+Создаёт `external_request` с `request_type=text_search` или `text_fetch`. Для scheduled discovery создаёт минимум один `text_search` request на каждый активный `instrument_id` и каждый разрешённый per-instrument source type, если source не отключён политикой. Для `market_wide_once` sources создаёт один request на source type за run и дальше сопоставляет новости с инструментами локально. Не обращается к источникам напрямую.
 
 ## 7. Processing rules
 
@@ -161,6 +187,8 @@
 - `scheduled_discovery_runs_for_each_active_instrument`
 - `scheduled_discovery_uses_alias_issuer_and_related_entity_queries`
 - `all_external_text_requests_via_gateway`
+- `public_sources_configured_as_text_source_config`
+- `rss_feeds_fetched_market_wide_once`
 - `duplicates_detected`
 - `routing_targets_explicit`
 - `raw_text_items_have_source_ref`
