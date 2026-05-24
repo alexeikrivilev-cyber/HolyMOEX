@@ -167,6 +167,10 @@
 }
 ```
 
+ArenaGo sandbox automatic-live universe is fixed at 20 tickers: `LKOH`, `SBER`, `ROSN`, `GAZP`, `VTBR`, `YDEX`, `PLZL`, `T`, `NVTK`, `X5`, `GMKN`, `MGNT`, `ALRS`, `AFLT`, `CHMF`, `NLMK`, `MOEX`, `SNGSP`, `MTSS`, `PIKK`.
+
+All allowed equities must use `board_id=TQBR`, `currency=RUB`, `tradable=true`, `execution_enabled=true`, `arena_go_quantity_mode=shares`, and a non-empty `arena_go_secid`. Missing `issuer_ir_url` is a registry gap reported by `audit.registry_reconciliation_report`; it must not crash public disclosure intake and should produce a controlled `source_missing_endpoint` skip for corporate-site discovery.
+
 ## 17. Forbidden actions
 
 - Запрещено автоматически добавлять инструменты в universe без ручного approval.

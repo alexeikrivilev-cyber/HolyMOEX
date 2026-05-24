@@ -87,7 +87,7 @@ class ExecutionPolicy:
 
     @property
     def bot_name(self) -> str:
-        return self.arena_go_bot_name or os.getenv("ARENA_GO_BOT_NAME", "MyTradingBot")
+        return self.arena_go_bot_name or os.getenv("ARENA_GO_BOT_NAME") or os.getenv("ARENA_GO_PORTFOLIO") or ""
 
 
 @dataclass(frozen=True)
@@ -574,6 +574,48 @@ class ExecutionEngineService:
         instrument_profile: InstrumentProfileRecord | None,
         portfolio_snapshot: PortfolioSnapshotRecord | None,
     ) -> OrderExecutionOutcome:
+        if os.getenv("SAFE_LIVE_SUBMIT", "").lower() not in {"1", "true", "yes"}:
+            return self.persist_blocked_result(
+                job=job,
+                request=request,
+                policy=policy,
+                order_id=order.order_intent_id,
+                order=order,
+                instrument_profile=instrument_profile,
+                portfolio_snapshot=portfolio_snapshot,
+                status="rejected",
+                errors=("safe_live_submit_disabled",),
+                audit_event_type="execution_blocked",
+                audit_message="Live ArenaGo submit_order is disabled until SAFE_LIVE_SUBMIT=true",
+            )
+        if os.getenv("ARENA_GO_SANDBOX", "").lower() not in {"1", "true", "yes"}:
+            return self.persist_blocked_result(
+                job=job,
+                request=request,
+                policy=policy,
+                order_id=order.order_intent_id,
+                order=order,
+                instrument_profile=instrument_profile,
+                portfolio_snapshot=portfolio_snapshot,
+                status="rejected",
+                errors=("arena_go_sandbox_required",),
+                audit_event_type="execution_blocked",
+                audit_message="Live submit_order is allowed only for ArenaGo sandbox/test contour",
+            )
+        if os.getenv("LIVE_READINESS_PASSED", "").lower() not in {"1", "true", "yes"}:
+            return self.persist_blocked_result(
+                job=job,
+                request=request,
+                policy=policy,
+                order_id=order.order_intent_id,
+                order=order,
+                instrument_profile=instrument_profile,
+                portfolio_snapshot=portfolio_snapshot,
+                status="rejected",
+                errors=("live_readiness_not_passed",),
+                audit_event_type="execution_blocked",
+                audit_message="Live submit_order is disabled until readiness checks pass in startup preflight",
+            )
         if instrument_profile is None:
             raise ExecutionEngineError("instrument_profile_missing")
         arena_quantity = arena_go_quantity(
@@ -646,6 +688,11 @@ class ExecutionEngineService:
                 errors=(),
                 payload={
                     "execution_mode": "live_trading",
+                    "system_mode": os.getenv("SYSTEM_MODE", "automatic_live_trading"),
+                    "run_mode": request.run_mode,
+                    "generated_by": "agent",
+                    "decision_set_id": order.decision_set_id,
+                    "risk_check_id": order.risk_check_id,
                     "route": "arena_go_gateway",
                     "external_request": external_request.to_dict(),
                     "external_response_ref": external_response.data_ref,

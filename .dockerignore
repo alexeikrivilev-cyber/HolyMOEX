@@ -1,0 +1,33 @@
+# Git and local metadata
+.git
+.gitignore
+.pytest_cache
+__pycache__
+*.py[cod]
+
+# Local secrets and credentials
+.env
+.env.local
+config/api_keys.local.env
+config/*.local.env
+*.secret.*
+*.secrets.*
+*.secret.env
+*.secrets.env
+*secret*
+*credentials*
+*token*
+
+# Runtime state
+data
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Local/editor noise
+.idea
+.vscode
+*.tmp
+*.bak

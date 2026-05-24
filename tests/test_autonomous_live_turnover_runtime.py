@@ -117,12 +117,173 @@ def test_scheduler_skips_event_driven_risk_without_timer() -> None:
     assert entry is None
 
 
+def test_scheduled_payload_ref_does_not_replace_autonomous_cycle_refs() -> None:
+    from agent_app.modules.orchestration.repository import InMemoryOrchestrationRepository
+    from agent_app.modules.orchestration.service import (
+        IncomingTrigger,
+        OrchestrationInput,
+        OrchestrationService,
+        PipelineContext,
+    )
+
+    service = OrchestrationService(InMemoryOrchestrationRepository())
+    request = OrchestrationInput(
+        schedule_config_ref=None,
+        dependency_graph_ref=None,
+        incoming_trigger=IncomingTrigger(
+            trigger_type="scheduled",
+            source_module="Raw Market Data Store",
+            payload_ref="schedule:derivatives_positioning:daily",
+        ),
+        system_mode="paper_trading",
+    )
+
+    refs = service._input_refs(request, PipelineContext(universe_id="moex_top20_manual"))
+
+    assert "schedule:derivatives_positioning:daily" in refs
+    assert "raw_market.raw_candle:scheduled" in refs
+    assert "features.feature_vector:latest" in refs
+
+
+def test_manual_store_trigger_without_payload_ref_gets_autonomous_cycle_refs() -> None:
+    from agent_app.modules.orchestration.repository import InMemoryOrchestrationRepository
+    from agent_app.modules.orchestration.service import (
+        IncomingTrigger,
+        OrchestrationInput,
+        OrchestrationService,
+        PipelineContext,
+    )
+
+    service = OrchestrationService(InMemoryOrchestrationRepository())
+    request = OrchestrationInput(
+        schedule_config_ref=None,
+        dependency_graph_ref=None,
+        incoming_trigger=IncomingTrigger(
+            trigger_type="manual",
+            source_module="Raw Market Data Store",
+            payload_ref="",
+        ),
+        system_mode="paper_trading",
+    )
+
+    refs = service._input_refs(request, PipelineContext(universe_id="moex_top20_manual"))
+
+    assert "raw_market.raw_candle:scheduled" in refs
+    assert "features.feature_vector:latest" in refs
+
+
+def test_autonomous_default_payloads_cover_text_and_fundamental_modules() -> None:
+    from agent_app.contracts.unified_objects import ModuleJob, TimeRange
+    from agent_app.modules.orchestration.repository import InMemoryOrchestrationRepository
+    from agent_app.modules.orchestration.service import OrchestrationService, PipelineContext
+
+    service = OrchestrationService(InMemoryOrchestrationRepository())
+    context = PipelineContext(universe_id="moex_top20_manual")
+    base = {
+        "contour": "event_contour",
+        "trigger_type": "scheduled",
+        "universe_id": "moex_top20_manual",
+        "instrument_ids": ("moex:SBER",),
+        "horizons": ("swing",),
+        "time_range": TimeRange.instant(),
+        "input_refs": service._autonomous_cycle_refs(context),
+        "config_ref": "runtime_config:paper_trading:v1",
+        "run_mode": "paper_trading",
+        "idempotency_key": "idem",
+    }
+
+    for module_name, expected_key in (
+        ("Data Intake & Routing Module", "intake_request"),
+        ("Event & News Intelligence Module", "event_news_input"),
+        ("Earnings & Dividend Intelligence Module", "earnings_dividend_input"),
+        ("Fundamental & Valuation Module", "fundamental_input"),
+    ):
+        job = ModuleJob(job_id=f"job_{module_name}", module_name=module_name, **base)
+        payload = service._autonomous_default_payload(job, context)
+        assert expected_key in payload
+
+
+def test_postgres_orchestration_dependency_graph_query_handles_default_ref(monkeypatch) -> None:
+    from agent_app.modules.orchestration.repository import PostgresOrchestrationRepository
+
+    executed: dict[str, object] = {}
+
+    class FakeCursor:
+        def __enter__(self) -> "FakeCursor":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, query: str, params: tuple[str, ...]) -> None:
+            executed["query"] = query
+            executed["params"] = params
+
+        def fetchone(self) -> None:
+            return None
+
+    class FakeConnection:
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def cursor(self) -> FakeCursor:
+            return FakeCursor()
+
+    repository = PostgresOrchestrationRepository("postgresql://example")
+    monkeypatch.setattr(repository, "_connect", lambda: FakeConnection())
+
+    repository.load_dependency_graph(None)
+
+    assert executed["params"] == ()
+    assert "%s IS NULL" not in str(executed["query"])
+
+
+def test_postgres_quality_repository_treats_scheduled_raw_refs_as_missing(monkeypatch) -> None:
+    from agent_app.modules.data_quality.repository import PostgresDataQualityRepository
+
+    repository = PostgresDataQualityRepository("postgresql://example")
+    monkeypatch.setattr(repository, "_connect", lambda: (_ for _ in ()).throw(AssertionError("unexpected db call")))
+
+    assert repository.load_quality_object("raw_market.raw_candle:scheduled") is None
+    assert repository.load_quality_object("raw_market.raw_index_value:IMOEX") is None
+    assert repository.load_quality_object("raw_text.raw_text_item:scheduled") is None
+
+
+def test_postgres_data_intake_repository_treats_scheduled_text_ref_as_missing(monkeypatch) -> None:
+    from agent_app.modules.data_intake_routing.repository import PostgresDataIntakeRoutingRepository
+
+    repository = PostgresDataIntakeRoutingRepository("postgresql://example")
+    monkeypatch.setattr(repository, "_connect", lambda: (_ for _ in ()).throw(AssertionError("unexpected db call")))
+
+    assert repository.load_raw_text_item("raw_text.raw_text_item:scheduled") is None
+
+
+def test_data_intake_postgres_timestamp_accepts_rss_pubdate() -> None:
+    from agent_app.modules.data_intake_routing.repository import _optional_timestamp
+
+    parsed = _optional_timestamp("Sun, 24 May 2026 14:06:32 +0300")
+
+    assert parsed is not None
+    assert parsed.isoformat().startswith("2026-05-24T11:06:32")
+
+
 def test_data_intake_migration_allows_source_missing_endpoint_skip_reason() -> None:
     from pathlib import Path
 
     migration = Path("agent_app/storage/postgres/migrations/013_predfinal_runtime_hardening.sql").read_text()
     assert "source_missing_endpoint" in migration
     assert "scheduled_external_news_discovery_item_skip_reason_code_check" in migration
+
+
+def test_database_readiness_accepts_final_metric_weight_check_count() -> None:
+    from pathlib import Path
+
+    migration = Path("agent_app/storage/postgres/migrations/013_predfinal_runtime_hardening.sql").read_text()
+    assert "CREATE OR REPLACE VIEW audit.database_readiness_check" in migration
+    assert "metric_weight_seed.total_checks >= 5" in migration
 
 
 def test_risk_daily_loss_pct_is_converted_to_rub() -> None:
@@ -179,3 +340,524 @@ def test_decision_payload_contains_post_cost_edge_for_risk_gate() -> None:
 
     assert service.expected_edge_after_cost_score({"expected_edge_score": 0.01}, vector) == 0.0085
     assert service.expected_edge_after_cost_score({"expected_edge_score": 0.01, "expected_edge_after_cost_score": 0.02}, vector) == 0.02
+
+
+def test_arena_go_positions_use_exact_bot_name_and_url_encoding() -> None:
+    from agent_app.contracts.unified_objects import CachePolicy, ExternalRequest, RetryPolicy
+    from agent_app.modules.external_request_gateway.providers import ProviderRequestNormalizer
+    from agent_app.modules.external_request_gateway.repository import default_provider_configs
+
+    normalizer = ProviderRequestNormalizer(env={"ARENA_GO_BASE_URL": "https://arenago.ru/api", "ARENA_GO_PORTFOLIO": "arena_go_default", "ARENA_GO_BOT_NAME": "ROMASHKA exact"})
+    request = ExternalRequest(
+        request_id="req",
+        caller_module="Portfolio State Module",
+        provider="arena_go",
+        request_type="get_positions",
+        payload={"portfolio": "arena_go_default", "bot": "ROMASHKA exact"},
+        cache_policy=CachePolicy(use_cache=False),
+        retry_policy=RetryPolicy(),
+        idempotency_key="idem",
+    )
+
+    http_request = normalizer.normalize(request, default_provider_configs()["arena_go"])
+
+    assert http_request.method == "GET"
+    assert http_request.url.endswith("/positions/ROMASHKA%20exact")
+
+
+def test_portfolio_sync_resolves_arena_go_portfolio_from_bots_name() -> None:
+    from agent_app.contracts.unified_objects import ExternalResponse
+    from agent_app.modules.portfolio_state.repository import InMemoryPortfolioStateRepository
+    from agent_app.modules.portfolio_state.service import PortfolioStateService
+
+    seen: list[tuple[str, str]] = []
+
+    class Gateway:
+        def process(self, external_request):
+            seen.append((external_request.request_type, external_request.payload.get("portfolio", "")))
+            data = {
+                "get_bots": {"bots": [{"name": "ROMASHKA_misis_guap_udgu_izhgtu", "cash_balance": 1_000_000}]},
+                "get_positions": {"positions": []},
+                "get_trades": {"trades": []},
+            }[external_request.request_type]
+            return ExternalResponse(
+                request_id=external_request.request_id,
+                    provider="arena_go",
+                    status="success",
+                    data_ref=f"request_logs.external_response:{external_request.request_id}",
+                    received_at="2026-05-24T09:00:00Z",
+                    latency_ms=1,
+                    data=data,
+                )
+
+    service = PortfolioStateService(
+        repository=InMemoryPortfolioStateRepository(),
+        gateway=Gateway(),
+        config={"arena_go_portfolio": "old_placeholder", "arena_go_bot_name": "ROMASHKA_misis_guap_udgu_izhgtu"},
+    )
+    result = service.process(
+        {
+            "portfolio_update_request": {
+                "portfolio_id": "ROMASHKA_misis_guap_udgu_izhgtu",
+                "fill_report_refs": [],
+                "broker_snapshot_ref": "broker:seed",
+                "price_snapshot_ref": "price:seed",
+                "run_mode": "live_trading",
+                "as_of_ts": "2026-05-24T09:00:00Z",
+            }
+        },
+        _job(run_mode="live_trading"),
+    )
+
+    assert result.module_job_result.status == "success"
+    assert ("get_positions", "ROMASHKA_misis_guap_udgu_izhgtu") in seen
+    assert ("get_trades", "ROMASHKA_misis_guap_udgu_izhgtu") in seen
+    assert result.portfolio_snapshot is not None
+    assert result.portfolio_snapshot.cash == 1_000_000
+
+
+def test_polza_models_response_normalizes_when_models_endpoint_exists() -> None:
+    from agent_app.contracts.unified_objects import ExternalRequest
+    from agent_app.modules.external_request_gateway.providers import ProviderHttpResponse, normalize_provider_response
+
+    request = ExternalRequest(
+        request_id="req_models",
+        caller_module="External Request Gateway Module",
+        provider="polza_ai",
+        request_type="models",
+        payload={},
+        idempotency_key="idem_models",
+    )
+
+    status, data, warnings, errors = normalize_provider_response(
+        request,
+        ProviderHttpResponse(status_code=200, body={"data": [{"id": "deepseek/deepseek-v4-pro"}]}),
+    )
+
+    assert status == "success"
+    assert data["models"][0]["id"] == "deepseek/deepseek-v4-pro"
+    assert warnings == ()
+    assert errors == ()
+
+
+def _risk_request_job() -> ModuleJob:
+    return ModuleJob(
+        job_id="job_risk_edge",
+        module_name="Risk Control Module",
+        contour="decision_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T09:00:00Z"),
+        input_refs=(
+            "decisions.decision_set:decision_edge",
+            "portfolio.portfolio_snapshot:snapshot_edge",
+            "risk.risk_policy:live_policy",
+            "features.market_state_record:market",
+            "features.data_quality_record:dq",
+        ),
+        config_ref="live_policy",
+        run_mode="live_trading",
+        idempotency_key="idem_risk_edge",
+    )
+
+
+def _risk_payload(edge_after_cost: float):
+    from agent_app.modules.risk_control.repository import (
+        DecisionSet,
+        FeatureVector,
+        InMemoryRiskControlRepository,
+        InstrumentLimit,
+        PortfolioLimit,
+        PortfolioSnapshot,
+        RiskPolicy,
+    )
+
+    policy_id = "live_policy"
+    repo = InMemoryRiskControlRepository(
+        decision_sets=(
+            DecisionSet(
+                decision_set_id="decision_edge",
+                decision_request_id="request_edge",
+                horizon="intraday",
+                decisions=(
+                    {
+                        "instrument_id": "moex:SBER",
+                        "action": "buy",
+                        "target_quantity": 1,
+                        "expected_edge_score": 0.02,
+                        "expected_edge_after_cost_score": edge_after_cost,
+                        "primary_reason_codes": ["turnover_mandate_urgency"],
+                    },
+                ),
+                calculation_version="test",
+                created_at="2026-05-24T09:00:00Z",
+            ),
+        ),
+        risk_policies=(RiskPolicy(policy_id, "live", "1", "active", ("live_trading",), {"market_session_status": "open", "market_regime": "normal"}),),
+        instrument_limits=(InstrumentLimit(policy_id, "moex:SBER", 1.0, 100_000, 20, {"arena_go_secid": "SBER"}),),
+        portfolio_limits=(
+            PortfolioLimit(policy_id, "min_expected_edge_after_cost_score", 0.01, {}),
+            PortfolioLimit(policy_id, "max_portfolio_exposure_pct", 1.0, {}),
+            PortfolioLimit(policy_id, "max_sector_exposure_pct", 1.0, {}),
+            PortfolioLimit(policy_id, "max_daily_loss_rub", 50_000, {}),
+            PortfolioLimit(policy_id, "max_drawdown_limit", 0.5, {}),
+            PortfolioLimit(policy_id, "max_allowed_slippage_bps", 20, {}),
+            PortfolioLimit(policy_id, "arena_go_daily_trade_limit", 1000, {}),
+            PortfolioLimit(policy_id, "total_risk_budget", 1.0, {}),
+            PortfolioLimit(policy_id, "used_risk_budget", 0.0, {}),
+            PortfolioLimit(policy_id, "min_data_quality_score", 0.5, {}),
+            PortfolioLimit(policy_id, "portfolio_snapshot_ttl_seconds", 300, {}),
+        ),
+        portfolio_snapshots=(
+            PortfolioSnapshot(
+                "snapshot_edge",
+                "arena_go_default",
+                "moex_top20_manual",
+                "2026-05-24T09:00:00Z",
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+                0,
+                0,
+                {"market_session_status": "open", "market_regime": "normal"},
+            ),
+        ),
+        feature_vectors=(
+            FeatureVector(
+                "fv_edge",
+                "moex:SBER",
+                "intraday",
+                "2026-05-24T09:00:00Z",
+                {
+                    "latest_price": {"raw_value": 250, "ttl_status": "fresh"},
+                    "spread_bps": {"raw_value": 4, "ttl_status": "fresh"},
+                    "estimated_slippage_bps": {"raw_value": 3, "ttl_status": "fresh"},
+                    "market_session_status": {"value": "open", "ttl_status": "fresh"},
+                    "market_regime": {"value": "normal", "ttl_status": "fresh"},
+                    "arena_go_secid": {"value": "SBER", "ttl_status": "fresh"},
+                },
+                1.0,
+                1.0,
+                "test",
+            ),
+        ),
+    )
+    payload = {
+        "risk_check_request": {
+            "decision_set_id": "decision_edge",
+            "portfolio_state_ref": "portfolio.portfolio_snapshot:snapshot_edge",
+            "risk_policy_id": policy_id,
+            "market_state_ref": "features.market_state_record:market",
+            "data_quality_report_ref": "features.data_quality_record:dq",
+            "run_mode": "live_trading",
+        }
+    }
+    return repo, payload
+
+
+def test_turnover_behind_negative_edge_is_rejected_by_risk() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(edge_after_cost=-0.01)
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "rejected"
+    assert "expected_edge_after_cost_below_threshold" in result.risk_check_result.risk_flags
+    assert "turnover_trade_without_positive_edge" in result.risk_check_result.risk_flags
+    assert result.order_intents == ()
+
+
+def test_turnover_behind_positive_edge_is_approved_when_risk_ok() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(edge_after_cost=0.02)
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "approved"
+    assert len(result.order_intents) == 1
+    assert result.order_intents[0].payload["risk_metrics"]["expected_edge_after_cost_score"] == 0.02
+    assert result.order_intents[0].payload["generated_by"] == "agent"
+    assert result.order_intents[0].payload["decision_set_id"] == "decision_edge"
+    assert result.order_intents[0].payload["risk_check_id"].startswith("risk_check_")
+    assert result.order_intents[0].payload["run_mode"] == "live_trading"
+
+
+def test_live_execution_requires_explicit_safe_live_submit(monkeypatch) -> None:
+    from agent_app.modules.execution_engine.repository import InMemoryExecutionEngineRepository
+    from agent_app.modules.execution_engine.service import ExecutionEngineService
+
+    monkeypatch.delenv("SAFE_LIVE_SUBMIT", raising=False)
+    repo = InMemoryExecutionEngineRepository(
+        order_intents=(
+            {
+                "order_intent_id": "order_live",
+                "instrument_id": "SBER",
+                "side": "buy",
+                "quantity": 1,
+                "order_type": "limit",
+                "limit_price": 250,
+                "time_in_force": "day",
+                "max_slippage_bps": 10,
+                "execution_ttl_seconds": 300,
+                "decision_set_id": "decision",
+                "risk_check_id": "risk",
+                "run_mode": "live_trading",
+                "created_at": "2026-05-24T09:00:00Z",
+                "payload": {"market_session_status": "open"},
+            },
+        ),
+        risk_check_results=(
+            {
+                "risk_check_id": "risk",
+                "decision_set_id": "decision",
+                "status": "approved",
+                "approved_order_intents": ["orders.order_intent:order_live"],
+                "checked_at": "2026-05-24T09:00:00Z",
+                "payload": {"market_session_status": "open"},
+            },
+        ),
+        instrument_profiles=(
+            {
+                "instrument_id": "SBER",
+                "universe_id": "moex_top20_manual",
+                "ticker": "SBER",
+                "lot_size": 1,
+                "tradable": True,
+                "execution_enabled": True,
+                "arena_go_secid": "SBER",
+                "arena_go_quantity_mode": "shares",
+            },
+        ),
+        portfolio_snapshots=(
+            {
+                "portfolio_snapshot_id": "snap",
+                "portfolio_id": "arena_go_default",
+                "universe_id": "moex_top20_manual",
+                "as_of_ts": "2026-05-24T09:00:00Z",
+                "cash": 1_000_000,
+                "equity": 1_000_000,
+                "payload": {"market_session_status": "open"},
+            },
+        ),
+    )
+    service = ExecutionEngineService(repository=repo)
+    job = ModuleJob(
+        job_id="job_execution_live",
+        module_name="Execution Engine Module",
+        contour="execution_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T09:00:00Z"),
+        input_refs=("orders.order_intent:order_live", "market:open", "execution_policy:default"),
+        config_ref="execution_policy:default",
+        run_mode="live_trading",
+        idempotency_key="idem_execution_live",
+    )
+
+    result = service.process(
+        {
+            "execution_request": {
+                "order_intent_refs": ["orders.order_intent:order_live"],
+                "market_session_status_ref": "market:open",
+                "execution_policy_id": "execution_policy:default",
+                "run_mode": "live_trading",
+                "idempotency_key": "idem_execution_live",
+            }
+        },
+        job,
+    )
+
+    assert result.execution_results[0].status == "rejected"
+    assert "safe_live_submit_disabled" in result.execution_results[0].errors
+
+
+def test_live_execution_requires_sandbox_and_startup_readiness(monkeypatch) -> None:
+    from agent_app.modules.execution_engine.repository import InMemoryExecutionEngineRepository
+    from agent_app.modules.execution_engine.service import ExecutionEngineService
+
+    def _repo() -> InMemoryExecutionEngineRepository:
+        return InMemoryExecutionEngineRepository(
+            order_intents=(
+                {
+                    "order_intent_id": "order_live",
+                    "instrument_id": "SBER",
+                    "side": "buy",
+                    "quantity": 1,
+                    "order_type": "limit",
+                    "limit_price": 250,
+                    "time_in_force": "day",
+                    "max_slippage_bps": 10,
+                    "execution_ttl_seconds": 300,
+                    "decision_set_id": "decision",
+                    "risk_check_id": "risk",
+                    "run_mode": "live_trading",
+                    "created_at": "2026-05-24T09:00:00Z",
+                    "payload": {"market_session_status": "open"},
+                },
+            ),
+            risk_check_results=(
+                {
+                    "risk_check_id": "risk",
+                    "decision_set_id": "decision",
+                    "status": "approved",
+                    "approved_order_intents": ["orders.order_intent:order_live"],
+                    "checked_at": "2026-05-24T09:00:00Z",
+                    "payload": {"market_session_status": "open"},
+                },
+            ),
+            instrument_profiles=(
+                {
+                    "instrument_id": "SBER",
+                    "universe_id": "moex_top20_manual",
+                    "ticker": "SBER",
+                    "lot_size": 1,
+                    "tradable": True,
+                    "execution_enabled": True,
+                    "arena_go_secid": "SBER",
+                    "arena_go_quantity_mode": "shares",
+                },
+            ),
+            portfolio_snapshots=(
+                {
+                    "portfolio_snapshot_id": "snap",
+                    "portfolio_id": "arena_go_default",
+                    "universe_id": "moex_top20_manual",
+                    "as_of_ts": "2026-05-24T09:00:00Z",
+                    "cash": 1_000_000,
+                    "equity": 1_000_000,
+                    "payload": {"market_session_status": "open"},
+                },
+            ),
+        )
+
+    job = ModuleJob(
+        job_id="job_execution_live",
+        module_name="Execution Engine Module",
+        contour="execution_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T09:00:00Z"),
+        input_refs=("orders.order_intent:order_live", "market:open", "execution_policy:default"),
+        config_ref="execution_policy:default",
+        run_mode="live_trading",
+        idempotency_key="idem_execution_live",
+    )
+    payload = {
+        "execution_request": {
+            "order_intent_refs": ["orders.order_intent:order_live"],
+            "market_session_status_ref": "market:open",
+            "execution_policy_id": "execution_policy:default",
+            "run_mode": "live_trading",
+            "idempotency_key": "idem_execution_live",
+        }
+    }
+
+    monkeypatch.setenv("SAFE_LIVE_SUBMIT", "true")
+    monkeypatch.setenv("ARENA_GO_SANDBOX", "false")
+    monkeypatch.setenv("LIVE_READINESS_PASSED", "true")
+    result = ExecutionEngineService(repository=_repo()).process(payload, job)
+    assert result.execution_results[0].status == "rejected"
+    assert "arena_go_sandbox_required" in result.execution_results[0].errors
+
+    monkeypatch.setenv("ARENA_GO_SANDBOX", "true")
+    monkeypatch.setenv("LIVE_READINESS_PASSED", "false")
+    result = ExecutionEngineService(repository=_repo()).process(payload, job)
+    assert result.execution_results[0].status == "rejected"
+    assert "live_readiness_not_passed" in result.execution_results[0].errors
+
+
+def test_arena_go_auth_prefers_sandbox_api_key_and_falls_back_to_local_token(monkeypatch) -> None:
+    from agent_app.contracts.unified_objects import CachePolicy, ExternalRequest, RetryPolicy
+    from agent_app.modules.external_request_gateway.providers import ProviderRequestNormalizer
+    from agent_app.modules.external_request_gateway.repository import default_provider_configs
+
+    config = default_provider_configs()["arena_go"]
+    request = ExternalRequest(
+        request_id="req_auth_test",
+        caller_module="test",
+        provider="arena_go",
+        request_type="get_bots",
+        universe_id="moex_top20_manual",
+        instrument_ids=(),
+        payload={},
+        cache_policy=CachePolicy(use_cache=False, max_age_seconds=0, write_cache=False),
+        timeout_ms=1000,
+        retry_policy=RetryPolicy(max_retries=0, backoff_ms=0),
+        idempotency_key="idem_auth_test",
+    )
+    normalizer = ProviderRequestNormalizer(env={"SANDBOX_API_KEY": "sandbox-token", "ARENA_GO_TOKEN": "fallback-token"})
+    assert normalizer.normalize(request, config).headers["Authorization"] == "sandbox-token"
+
+    normalizer = ProviderRequestNormalizer(env={"ARENA_GO_TOKEN": "fallback-token"})
+    assert normalizer.normalize(request, config).headers["Authorization"] == "fallback-token"
+
+
+def test_startup_resolves_exact_arena_go_bot_from_env(monkeypatch) -> None:
+    from agent_app.server_startup import _resolve_bot
+
+    monkeypatch.setenv("ARENA_GO_BOT_NAME", "Real Bot")
+    exact = _resolve_bot(({"name": "Real Bot", "cash_balance": 1000}, {"name": "Other", "cash_balance": 1}))
+    assert exact.name == "Real Bot"
+    assert exact.cash_balance == 1000
+
+
+def test_startup_resolves_single_arena_go_bot_when_env_absent(monkeypatch) -> None:
+    from agent_app.server_startup import _resolve_bot
+
+    monkeypatch.delenv("ARENA_GO_BOT_NAME", raising=False)
+    monkeypatch.delenv("ARENA_GO_PORTFOLIO", raising=False)
+    identity = _resolve_bot(({"name": "ROMASHKA_misis_guap_udgu_izhgtu", "cash_balance": 1_000_000},))
+    assert identity.name == "ROMASHKA_misis_guap_udgu_izhgtu"
+    assert identity.cash_balance == 1_000_000
+
+
+def test_automatic_live_allowed_universe_migration_contains_all_sandbox_tickers() -> None:
+    from pathlib import Path
+
+    migration = Path("agent_app/storage/postgres/migrations/014_automatic_live_sandbox_runtime.sql").read_text(encoding="utf-8")
+    for ticker in ("LKOH", "SBER", "ROSN", "GAZP", "VTBR", "YDEX", "PLZL", "T", "NVTK", "X5", "GMKN", "MGNT", "ALRS", "AFLT", "CHMF", "NLMK", "MOEX", "SNGSP", "MTSS", "PIKK"):
+        assert f"'{ticker}'" in migration
+    assert "arena_go_quantity_mode = 'shares'" in migration
+    assert "auth_value_source = 'SANDBOX_API_KEY'" in migration
+
+
+def test_root_dockerfile_uses_autonomous_startup_and_data_volume() -> None:
+    from pathlib import Path
+
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    startup = Path("scripts/start_autonomous.sh").read_text(encoding="utf-8")
+    assert "SYSTEM_MODE=automatic_live_trading" in dockerfile
+    assert "VOLUME [\"/data\"]" in dockerfile
+    assert "scripts/start_autonomous.sh" in dockerfile
+    assert "agent_app.storage.postgres.apply_migrations" in startup
+    assert "agent_app.server_startup" in startup
+    assert "agent_app.scheduler" in startup
+
+
+def test_scheduler_refuses_without_redis_or_single_leader(monkeypatch) -> None:
+    from agent_app.scheduler import AutonomousScheduler, SchedulerConfig
+
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    scheduler = AutonomousScheduler(SchedulerConfig(once=True, single_scheduler_instance=False))
+
+    assert scheduler.run_once() == 2
+
+
+def test_staging_runner_parser_defaults_are_capped() -> None:
+    from agent_app.staging_runner import build_parser
+
+    args = build_parser().parse_args(["--database-url", "postgresql://example", "--instrument-cap", "100", "--max-news-items", "1"])
+
+    assert args.instrument_cap == 100
+    assert args.max_news_items == 1

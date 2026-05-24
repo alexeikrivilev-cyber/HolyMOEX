@@ -4,6 +4,8 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from typing import Any, Mapping, Protocol
 
 from agent_app.contracts.unified_objects import ExternalResponse
@@ -660,6 +662,8 @@ class PostgresDataIntakeRoutingRepository:
 
     def load_raw_text_item(self, ref: str) -> Any | None:
         raw_text_item_id = ref.rsplit(":", 1)[-1]
+        if not _optional_uuid_text(raw_text_item_id):
+            return None
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -818,7 +822,13 @@ def _optional_timestamp(value: Any) -> Any | None:
     if value in (None, ""):
         return None
     if isinstance(value, str):
-        return parse_utc_iso(value)
+        try:
+            return parse_utc_iso(value)
+        except ValueError:
+            parsed = parsedate_to_datetime(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC)
     return value
 
 

@@ -590,10 +590,10 @@ The previous `strict_default` profiles are retained for audit/replay but seeded 
 | `agent_app` | основной backend-контейнер с модулями системы |
 | `postgres_local` | локальная БД в Docker для всех stores |
 | `redis_local` | optional queue/cache для orchestration, locks, short cache |
-| `scheduler_worker` | optional worker для scheduled jobs |
+| `scheduler_worker` | primary long-running daemon для scheduled jobs |
 | `research_worker` | optional worker для research/backtest jobs |
 
-Для строгой первой сборки допустимо держать `agent_app`, `scheduler_worker` и `research_worker` как один image с разными entrypoint. БД должна быть отдельным Docker service.
+Для строгой первой сборки допустимо держать `agent_app`, `scheduler_worker` и `research_worker` как один image с разными entrypoint. БД должна быть отдельным Docker service. `agent_app` и `research_worker` являются one-shot/manual профилями; основным long-running процессом является `scheduler_worker`.
 
 ### 16.1 Database policy
 
@@ -686,10 +686,12 @@ SELECT *
 Required env variables:
 
 ```env
-APP_ENV=local
-RUN_MODE=paper_trading
+APP_ENV=production
+SYSTEM_MODE=automatic_live_trading
+RUN_MODE=live_trading
 DATABASE_URL=postgresql://moex_agent:moex_agent_password@postgres_local:5432/moex_agent
 REDIS_URL=redis://redis_local:6379/0
+SINGLE_SCHEDULER_INSTANCE=true
 DEFAULT_TIMEZONE=Europe/Moscow
 INITIAL_CAPITAL_RUB=1000000
 SELECTED_UNIVERSE_ID=moex_top20_manual
@@ -698,10 +700,14 @@ NEWS_API_BASE_URL=https://www.rbc.ru
 ISSUER_DISCLOSURE_BASE_URL=https://www.e-disclosure.ru
 MACRO_API_BASE_URL=https://www.cbr.ru
 ARENA_GO_BASE_URL=https://arenago.ru/api
-ARENA_GO_TOKEN=replace_with_real_token
-ARENA_GO_PORTFOLIO=MyBot
-ARENA_GO_BOT_NAME=MyTradingBot
+ARENA_GO_SANDBOX=true
+SANDBOX_API_KEY=replace_with_arena_go_sandbox_token
+ARENA_GO_TOKEN=
+ARENA_GO_PORTFOLIO=
+ARENA_GO_BOT_NAME=
 ARENA_GO_DAILY_TRADE_LIMIT=1000
+SAFE_LIVE_SUBMIT=false
+LIVE_READINESS_PASSED=false
 POLZA_BASE_URL=https://polza.ai/api/v1
 POLZA_API_KEY=replace_with_real_key
 POLZA_LLM_MODEL=deepseek/deepseek-v4-pro
@@ -724,7 +730,8 @@ LLM_DEFAULT_RESPONSE_FORMAT=json_object
   "provider": "arena_go",
   "base_url_env": "ARENA_GO_BASE_URL",
   "auth_header": "Authorization",
-  "auth_value_source": "ARENA_GO_TOKEN",
+  "auth_value_source": "SANDBOX_API_KEY",
+  "auth_fallback_value_sources": ["ARENA_GO_TOKEN"],
   "portfolio_env": "ARENA_GO_PORTFOLIO",
   "bot_name_env": "ARENA_GO_BOT_NAME"
 }
@@ -757,7 +764,7 @@ ArenaGo HTTP request:
 ```http
 POST /submit_order
 Content-Type: application/json
-Authorization: ${ARENA_GO_TOKEN}
+Authorization: ${SANDBOX_API_KEY}
 ```
 
 ```json
@@ -765,7 +772,7 @@ Authorization: ${ARENA_GO_TOKEN}
   "direction": "B",
   "secid": "SBER",
   "quantity": 10,
-  "bot": "MyTradingBot"
+  "bot": "exact bots[].name from /api/bots"
 }
 ```
 
@@ -845,7 +852,7 @@ Normalized `arena_go_bot`:
 
 ## 18. PolzaAI LLM integration
 
-LLM-провайдер: `PolzaAI`. Основная модель: `deepseek-v4-pro`. Точный `model_id` должен быть проверен через `GET /models` перед production-запуском и храниться в `POLZA_LLM_MODEL`. По умолчанию в конфигурации используется `deepseek/deepseek-v4-pro`.
+LLM-провайдер: `PolzaAI`. Основная модель задаётся через `POLZA_LLM_MODEL`; по умолчанию в конфигурации используется `deepseek/deepseek-v4-pro`. Текущий gateway реализует strict JSON `llm_completion` smoke. Отдельный `GET /models`/model availability endpoint в runtime ещё не реализован и должен быть добавлен перед production live-money запуском, если PolzaAI требует явной проверки каталога моделей.
 
 PolzaAI вызывается только через `External Request Gateway Module`. LLM-модули не имеют права напрямую создавать HTTP-клиент к PolzaAI.
 
@@ -1107,6 +1114,8 @@ Audit Log Store
 
 The worker remains outside analytical modules and does not bypass module boundaries. Its job is to keep the data/decision/risk/execution/portfolio/monitoring contours active on a server. Source-level locks/Redis queues may be added later, but the worker must never become a direct execution shortcut.
 
+Current implementation uses in-process due checks per worker instance and does not yet implement Redis locks/queues. Running more than one scheduler replica is therefore a production blocker until distributed locking or a single-leader deployment policy is added. A single `scheduler_worker` instance is acceptable for controlled paper/staging runtime.
+
 ## 29. Runtime reference chain
 
 Orchestration must carry `output_refs` from each executed module into subsequent `module_job.input_refs` in the same cycle. The intended current-cycle chain is:
@@ -1213,7 +1222,7 @@ fresh PostgreSQL volume
   -> MOEX ISS request
   -> CBR request
   -> public news/disclosure fetch
-  -> PolzaAI GET /models and JSON completion smoke
+  -> PolzaAI JSON completion smoke; GET /models remains a provider enhancement unless implemented in gateway
   -> ArenaGo get_bots/get_positions/get_trades
   -> mock or minimal safe submit_order path
   -> scheduler tick
@@ -1221,3 +1230,163 @@ fresh PostgreSQL volume
 ```
 
 Production-readiness считается недоказанной, пока этот сценарий не пройден в Docker с PostgreSQL-backed stores.
+
+---
+
+# Addendum v6 - Product-ready Docker/server runtime
+
+Version: `6.0-product-ready-server-runtime`
+
+## Docker commands
+
+Use `docker/docker-compose.prod.yml` for server deployment. The production compose file does not publish PostgreSQL or Redis ports by default; services communicate on the internal compose network. Publish ports only through a server-specific override when an operator needs direct DB access.
+
+```bash
+cp config/api_keys.example.env config/api_keys.local.env
+docker compose -f docker/docker-compose.prod.yml up --build -d postgres_local
+docker compose -f docker/docker-compose.prod.yml run --rm migration_runner
+docker compose -f docker/docker-compose.prod.yml up -d scheduler_worker
+```
+
+Controlled staging run:
+
+```bash
+docker compose -f docker/docker-compose.prod.yml --profile staging run --rm staging_runner
+```
+
+Shutdown/restart:
+
+```bash
+docker compose -f docker/docker-compose.prod.yml down
+docker compose -f docker/docker-compose.prod.yml up -d scheduler_worker
+```
+
+## Runtime roles
+
+`scheduler_worker` is the primary long-running process. `agent_app`, `research_worker` and `staging_runner` are optional/manual profiles and must not be used as restart-loop daemons.
+
+`migration_runner` applies migrations `001..014` and repeated runs must skip already applied migrations. Readiness is checked through:
+
+```sql
+SELECT * FROM audit.database_readiness_check ORDER BY check_name;
+SELECT * FROM audit.metric_weights_readiness_check ORDER BY check_name;
+SELECT * FROM audit.live_trading_readiness_check ORDER BY check_name;
+SELECT * FROM audit.allowed_universe_readiness_check ORDER BY check_name;
+```
+
+## Scheduler locking
+
+The scheduler uses PostgreSQL-backed tick locks in `audit.scheduler_tick_lock` and still requires one active `scheduler_worker` replica unless a separate Redis/queue leader election layer is added. If Redis is unavailable, `SINGLE_SCHEDULER_INSTANCE=true` is required. The scheduler writes an audit warning for single-leader/no-Redis mode and refuses to start when neither Redis nor explicit single-leader mode is configured.
+
+For controlled server smoke tests, the scheduler can be bounded without changing production behavior:
+
+```env
+SCHEDULER_ONCE=true
+SCHEDULER_SCHEDULE_IDS=schedule:live_autonomous:portfolio_sync:1m
+SCHEDULER_MAX_ENTRIES_PER_TICK=1
+```
+
+Each schedule emits JSON stdout events `scheduler_entry_started` and `scheduler_entry_finished` with duration and exit code.
+
+## ArenaGo
+
+ArenaGo token priority is `SANDBOX_API_KEY` first. `ARENA_GO_TOKEN` is only a local/dev fallback: production server startup treats missing `SANDBOX_API_KEY` as fatal unless `ALLOW_ARENA_GO_TOKEN_FALLBACK=true` is explicitly set. Logs and audit may show only a masked token source. Portfolio identity is resolved from `/api/bots` using exact `bots[].name`. `ARENA_GO_PORTFOLIO` and `ARENA_GO_BOT_NAME` may be empty; startup resolves and exports both from `/api/bots` when exactly one bot exists or when env matches a bot. `get_positions` and `get_trades` use the same exact, URL-encoded bot/portfolio name. Empty positions/trades are valid when the bot exists and `cash_balance` is available.
+
+`submit_order.quantity` is shares, not lots, for the seeded registry (`arena_go_quantity_mode=shares`). Sandbox live `submit_order` is allowed only when `SAFE_LIVE_SUBMIT=true`, `ARENA_GO_SANDBOX=true`, startup set `LIVE_READINESS_PASSED=true`, the portfolio and market data are fresh, the market is open, the instrument is valid, the order intent is from the current cycle, Risk approved it, and kill switches are off. `ERROR: MARKET CLOSED` is normalized as `market_closed`; the agent keeps syncing/monitoring and waits instead of crashing.
+
+Allowed ArenaGo sandbox universe: `LKOH`, `SBER`, `ROSN`, `GAZP`, `VTBR`, `YDEX`, `PLZL`, `T`, `NVTK`, `X5`, `GMKN`, `MGNT`, `ALRS`, `AFLT`, `CHMF`, `NLMK`, `MOEX`, `SNGSP`, `MTSS`, `PIKK`. The agent must not trade outside this list.
+
+## Single-container server deployment
+
+Root `Dockerfile` is the autonomous server entrypoint. It starts local PostgreSQL inside the container, stores state in `/data`, applies migrations idempotently, resolves ArenaGo bot identity, syncs positions/trades, runs readiness checks, then starts `scheduler_worker` as the long-running loop.
+
+Local/dev:
+
+```bash
+docker build -t holymoex:server .
+docker run -d --name holymoex \
+  --env-file config/api_keys.local.env \
+  -v holymoex_data:/data \
+  holymoex:server
+```
+
+Server:
+
+```bash
+docker build -t holymoex:server .
+docker run -d --name holymoex \
+  -e SANDBOX_API_KEY="$SANDBOX_API_KEY" \
+  -e POLZA_API_KEY="$POLZA_API_KEY" \
+  -e SYSTEM_MODE=automatic_live_trading \
+  -e RUN_MODE=live_trading \
+  -e ARENA_GO_SANDBOX=true \
+  -e SINGLE_SCHEDULER_INSTANCE=true \
+  -e SAFE_LIVE_SUBMIT=true \
+  -v holymoex_data:/data \
+  holymoex:server
+```
+
+Monitoring and lifecycle:
+
+```bash
+docker logs -f holymoex
+docker stop holymoex
+docker start holymoex
+```
+
+Pre-deploy check:
+
+```bash
+bash scripts/deploy_check.sh
+```
+
+`SAFE_LIVE_SUBMIT` defaults to `false` for dry-run/staging safety. Set it to `true` only for the ArenaGo sandbox/test contour after `SANDBOX_API_KEY`, readiness, portfolio sync and risk gates are verified.
+
+Startup sequence:
+
+```text
+load env
+  -> ensure /data directories
+  -> start persistent local PostgreSQL
+  -> apply migrations 001..014
+  -> validate ArenaGo token through SANDBOX_API_KEY/ARENA_GO_TOKEN
+  -> resolve exact bot/portfolio from /api/bots
+  -> sync positions/trades
+  -> run readiness views
+  -> export LIVE_READINESS_PASSED
+  -> start autonomous scheduler
+```
+
+Restart keeps `/data`, so migrations skip already applied SQL, turnover progress is preserved, stale orders are not replayed, and the first live step is always ArenaGo portfolio/trades sync before execution.
+
+In standalone root-container mode the launcher uses its own `/data/postgres` database even if a compose-style `DATABASE_URL=postgres_local` is present in the env file. Set `HOLYMOEX_USE_EXTERNAL_DATABASE=true` only when the single container should deliberately connect to an external PostgreSQL instance.
+
+## PolzaAI
+
+Gateway supports `polza_ai/models` through `GET ${POLZA_BASE_URL}/models`. If an environment/provider later disables that endpoint, the supported fallback healthcheck is a strict JSON `llm_completion` smoke with `response_format={"type":"json_object"}` and schema fields `schema_version`, `model_id`, `model_version`, `task_type`, `items`.
+
+## Disclosure and issuer IR
+
+`e-disclosure.ru` may be blocked by anti-bot controls. This is treated as blocked/unhealthy source status, not as module failure. Official disclosure fallback sources are `disclosure.1prime`, `disclosure.ru/AK&M`, issuer corporate/IR sites when `instrument_profile.metadata.issuer_ir_url` is populated, and public news confirmation. Missing issuer IR URLs are reported through `audit.registry_reconciliation_report` with `missing_issuer_ir_url`; corporate-site discovery may controlled-skip with `source_missing_endpoint`.
+
+## Controlled staging pipeline
+
+`agent_app.staging_runner` performs a bounded end-to-end staging cycle:
+
+```text
+limited instruments/news
+  -> raw_text / source refs
+  -> feature_record / feature_vector
+  -> decision_set
+  -> risk_check_result
+  -> current-cycle order_intent
+  -> mock execution_result / fill_report
+  -> portfolio_snapshot turnover metrics
+  -> monitoring_record / audit_record
+```
+
+The runner caps instruments to 1-3, caps news items, never submits live orders, and records refs in Audit/Monitoring stores.
+
+## Live sandbox policy
+
+The primary server runtime is autonomous automatic live trading in the ArenaGo sandbox/test contour: `SYSTEM_MODE=automatic_live_trading`, `RUN_MODE=live_trading`, `ARENA_GO_SANDBOX=true`. The turnover target above `10_000_000 RUB` is a mandatory constraint, not the alpha objective. The primary objective remains portfolio value and positive post-cost expected return. Turnover urgency can increase activity, but it cannot bypass stale data checks, portfolio sync, daily loss/drawdown limits, liquidity/spread/slippage limits, current-cycle order refs, or the post-cost edge gate.

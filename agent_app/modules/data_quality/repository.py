@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
@@ -89,6 +90,10 @@ class PostgresDataQualityRepository:
 
     def load_quality_object(self, ref: str) -> Mapping[str, Any] | None:
         table, object_id = _parse_ref(ref)
+        if _is_placeholder_ref(object_id):
+            return None
+        if table.startswith(("raw_market.", "raw_text.")) and not _is_uuid_text(object_id):
+            return None
         if table == "raw_market.raw_candle":
             return self._fetch_one(
                 """
@@ -398,6 +403,18 @@ def _parse_ref(ref: str) -> tuple[str, str]:
         return "", ref
     table, object_id = ref.split(":", 1)
     return table, object_id
+
+
+def _is_placeholder_ref(value: str) -> bool:
+    return value in {"scheduled", "latest", "peer_group", "expectations", "dividend_gap_history", ""}
+
+
+def _is_uuid_text(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except ValueError:
+        return False
 
 
 def _serialize_value(value: Any) -> Any:

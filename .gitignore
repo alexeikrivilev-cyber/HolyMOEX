@@ -1,9 +1,21 @@
 # Local secrets
+config/api_keys.env
 config/api_keys.local.env
 config/*.local.env
+.env
+.env.local
+*.secret.*
+*.secrets.*
+*secret*
+*credentials*
+*token*
 
 # Runtime data
 data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
 
 # Python caches
 __pycache__/

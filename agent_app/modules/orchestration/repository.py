@@ -124,17 +124,28 @@ class PostgresOrchestrationRepository:
         return psycopg.connect(self.database_url)
 
     def load_dependency_graph(self, graph_ref: str | None = None) -> DependencyGraph:
-        query = """
-            SELECT graph_payload
-              FROM audit.module_dependency_graph
-             WHERE (%s IS NULL OR graph_id = %s)
-               AND status = 'active'
-             ORDER BY created_at DESC
-             LIMIT 1
-        """
+        if graph_ref:
+            query = """
+                SELECT graph_payload
+                  FROM audit.module_dependency_graph
+                 WHERE graph_id = %s
+                   AND status = 'active'
+                 ORDER BY created_at DESC
+                 LIMIT 1
+            """
+            params: tuple[str, ...] = (graph_ref,)
+        else:
+            query = """
+                SELECT graph_payload
+                  FROM audit.module_dependency_graph
+                 WHERE status = 'active'
+                 ORDER BY created_at DESC
+                 LIMIT 1
+            """
+            params = ()
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (graph_ref, graph_ref))
+                cur.execute(query, params)
                 row = cur.fetchone()
         if row is None:
             return DependencyGraph.default()

@@ -833,10 +833,19 @@ class RiskControlService:
             run_mode=request.run_mode,
             payload={
                 "source_module": self.module_name,
+                "generated_by": "agent",
                 "calculation_version": f"{CALCULATION_VERSION}:{job.config_ref}",
                 "timestamp": to_utc_iso(utc_now()),
                 "confidence_score": feature_vector.data_quality_score,
                 "arena_go_secid": arena_go_secid,
+                "decision_set_id": decision_set.decision_set_id,
+                "risk_check_id": risk_check_id,
+                "run_mode": request.run_mode,
+                "system_mode": __import__("os").getenv("SYSTEM_MODE", "automatic_live_trading"),
+                "source_feature_refs": (
+                    f"features.feature_vector:{feature_vector.feature_vector_id}",
+                    *_string_tuple(feature_vector.features.get("_meta", {}).get("source_refs") if isinstance(feature_vector.features.get("_meta"), Mapping) else ()),
+                ),
                 "risk_metrics": metrics,
             },
         )
@@ -1331,6 +1340,14 @@ def _rule_text(payload: Mapping[str, Any], key: str) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple, set)):
+        return tuple(str(item) for item in value if str(item or ""))
+    if value is None or value == "":
+        return ()
+    return (str(value),)
 
 
 def _feature_numeric(features: Mapping[str, Mapping[str, Any]], metric_name: str) -> float | None:

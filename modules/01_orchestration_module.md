@@ -206,3 +206,5 @@ The autonomous server worker is persistent and repeatedly triggers orchestration
 `scheduler_worker` is schedule-aware in PostgreSQL runtime. It reads enabled `audit.schedule_config` rows, derives intervals from `interval_seconds` or `frequency`, and triggers Orchestration by source. Pure event-driven schedules such as `on_decision_set` and `on_approved_order` are not launched blindly by timer; they are handled by current-cycle refs produced by upstream modules.
 
 Docker/server runtime must treat `scheduler_worker` as the primary long-running process. `agent_app` is a manual one-shot control entrypoint, and `research_worker` is an optional batch profile. Restart-loops around one-shot entrypoints are forbidden.
+
+Current scheduler locking is PostgreSQL-backed through `audit.scheduler_tick_lock`, with process-local due checks as a secondary guard. Production still runs one `scheduler_worker` replica unless an external Redis/queue leader-election layer is added. If Redis is unavailable, `SINGLE_SCHEDULER_INSTANCE=true` is required and the worker writes a warning to `audit.audit_record`.

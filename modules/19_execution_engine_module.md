@@ -57,7 +57,7 @@
 
 ## 6. External requests
 
-В live mode отправляет broker orders только через Gateway с `request_type=orders`. В paper mode не обращается к broker order endpoint.
+В live mode отправляет broker orders только через Gateway с provider `arena_go` и `request_type=submit_order`. В paper mode не обращается к broker order endpoint.
 
 ## 7. Processing rules
 
@@ -215,3 +215,9 @@ ArenaGo success response must be mapped into `execution_result` and `portfolio_u
 The execution input may contain an empty `order_intent_refs` list. This means the current autonomous cycle produced no risk-approved orders and the correct result is `skipped` with no broker call. The module must not resolve `orders.order_intent:latest` and submit stale orders just to stay active.
 
 Execution remains a pure executor: it does not create turnover, does not decide direction, and does not bypass `Risk Control Module`.
+
+## Runtime hardening note v6
+
+Live ArenaGo sandbox `submit_order` is blocked unless `SAFE_LIVE_SUBMIT=true`, `ARENA_GO_SANDBOX=true`, and startup readiness exported `LIVE_READINESS_PASSED=true`. These gates are in addition to portfolio freshness, market session, valid instrument mapping, risk approval, kill switches, stale-order protection and current-cycle `order_intent_refs`.
+
+`SAFE_LIVE_SUBMIT=true` is not a manual approval workflow in the ArenaGo test contour; it enables autonomous submit only after readiness and risk gates have passed. When the market is closed, execution records `market_closed`/blocked status and the agent continues data refresh, portfolio sync and monitoring.

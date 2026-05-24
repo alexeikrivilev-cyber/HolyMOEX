@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from html import unescape
 from html.parser import HTMLParser
 from typing import Any, Mapping, Protocol
-from urllib.parse import urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin
 
 from agent_app.contracts.unified_objects import ExternalRequest
 
@@ -155,11 +155,7 @@ class ProviderRequestNormalizer:
         payload = dict(request.payload)
         if request.request_type == "submit_order":
             payload = self._arena_go_submit_order_payload(payload, config)
-        path = path_template.format(
-            portfolio=payload.get("portfolio")
-            or self._env_config_value(config, "portfolio_env")
-            or "arena_go_default"
-        )
+        path = path_template.format(portfolio=quote(self._arena_go_portfolio_name(payload, config), safe=""))
         return ProviderHttpRequest(
             provider=request.provider,
             request_type=request.request_type,
@@ -171,6 +167,16 @@ class ProviderRequestNormalizer:
         )
 
     def _polza_ai_request(self, request: ExternalRequest, config: ProviderConfig) -> ProviderHttpRequest:
+        if request.request_type == "models":
+            return ProviderHttpRequest(
+                provider=request.provider,
+                request_type=request.request_type,
+                method="GET",
+                url=self._url(config, "/models"),
+                headers=self._auth_headers(config),
+                json_payload=None,
+                timeout_ms=request.timeout_ms,
+            )
         if request.request_type != "llm_completion":
             raise ProviderNormalizationError(f"unsupported polza_ai request_type: {request.request_type}")
         payload = dict(request.payload)
@@ -264,6 +270,24 @@ class ProviderRequestNormalizer:
             raise ProviderNormalizationError("arena_go submit_order.quantity must be positive")
         return payload
 
+    def _arena_go_portfolio_name(self, payload: Mapping[str, Any], config: ProviderConfig) -> str:
+        candidates = (
+            payload.get("portfolio"),
+            payload.get("bot"),
+            self._env_config_value(config, "portfolio_env"),
+            self._env_config_value(config, "bot_name_env"),
+        )
+        placeholders = {"", "arena_go_default", "mybot", "mytradingbot", "portfolio"}
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text and text.lower() not in placeholders:
+                return text
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text:
+                return text
+        return "arena_go_default"
+
     def _url(self, config: ProviderConfig, path: str) -> str:
         base_url = ""
         if config.base_url_env:
@@ -276,7 +300,15 @@ class ProviderRequestNormalizer:
     def _auth_headers(self, config: ProviderConfig) -> dict[str, str]:
         if not config.auth_header or not config.auth_value_source:
             return {}
-        auth_value = self.env.get(config.auth_value_source, "")
+        auth_sources = [str(config.auth_value_source)]
+        fallback_sources = config.config_payload.get("auth_fallback_value_sources")
+        if isinstance(fallback_sources, (list, tuple)):
+            auth_sources.extend(str(item) for item in fallback_sources if str(item or ""))
+        auth_value = ""
+        for source in auth_sources:
+            auth_value = self.env.get(source, "")
+            if auth_value:
+                break
         if not auth_value:
             return {}
         auth_scheme = str(config.config_payload.get("auth_scheme", "")).strip()
@@ -433,7 +465,7 @@ def normalize_provider_response(
     if request.provider == "arena_go":
         return _normalize_arena_go_response(request, provider_response)
     if request.provider == "polza_ai":
-        return _normalize_polza_ai_response(provider_response)
+        return _normalize_polza_ai_response(request, provider_response)
     if request.provider in GENERIC_HTTP_PROVIDERS:
         return _normalize_generic_http_response(request, provider_response)
     return _generic_status(provider_response.status_code), _mapping_body(provider_response.body), (), ()
@@ -476,12 +508,18 @@ def _normalize_arena_go_response(
 
 
 def _normalize_polza_ai_response(
+    request: ExternalRequest,
     provider_response: ProviderHttpResponse,
 ) -> tuple[str, Mapping[str, Any], tuple[str, ...], tuple[str, ...]]:
     status = _generic_status(provider_response.status_code)
     body = _mapping_body(provider_response.body)
     if status != "success":
         return status, body, (), tuple(_response_errors(body))
+    if request.request_type == "models":
+        models = body.get("data") or body.get("models") or body.get("items")
+        if not isinstance(models, list):
+            return "failed", body, (), ("models_output_missing",)
+        return "success", {"provider": "polza_ai", "request_type": "models", "models": models}, (), ()
     content = _extract_polza_content(body)
     if content is None:
         return "failed", body, (), ("llm_json_output_missing",)

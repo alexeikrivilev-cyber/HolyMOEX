@@ -98,7 +98,7 @@ class PortfolioConfig:
 
     @property
     def bot_name(self) -> str:
-        return self.arena_go_bot_name or os.getenv("ARENA_GO_BOT_NAME", "MyTradingBot")
+        return self.arena_go_bot_name or os.getenv("ARENA_GO_BOT_NAME") or os.getenv("ARENA_GO_PORTFOLIO") or ""
 
     @property
     def provider_portfolio(self) -> str:
@@ -334,8 +334,38 @@ class PortfolioStateService:
         responses = []
         request_refs: list[str] = []
         errors: list[str] = []
-        for request_type in ("get_bots", "get_positions", "get_trades"):
-            external_request = self.broker_external_request(request_type, request, job)
+        bots_request = self.broker_external_request("get_bots", request, job)
+        try:
+            bots_response = request_via_gateway(self.gateway, bots_request)
+            request_refs.append(f"request_logs.external_response:{bots_response.request_id}")
+            responses.append(("get_bots", bots_response))
+            if bots_response.status not in {"success", "partial_success"}:
+                errors.extend(bots_response.errors or ("get_bots_failed",))
+        except PortfolioGatewayError as error:
+            errors.append(str(error))
+        if errors:
+            return BrokerSyncResult(
+                status="failed",
+                cash_balance=None,
+                positions=(),
+                trades=(),
+                errors=tuple(dict.fromkeys(errors)),
+                request_refs=tuple(request_refs),
+            )
+
+        bots_payload = self.response_items(self.response_data(responses, "get_bots"))
+        portfolio_name = self.resolve_arena_go_portfolio(bots_payload)
+        if not portfolio_name:
+            return BrokerSyncResult(
+                status="failed",
+                cash_balance=None,
+                positions=(),
+                trades=(),
+                errors=("arena_go_bot_not_found",),
+                request_refs=tuple(request_refs),
+            )
+        for request_type in ("get_positions", "get_trades"):
+            external_request = self.broker_external_request(request_type, request, job, portfolio_name=portfolio_name)
             try:
                 response = request_via_gateway(self.gateway, external_request)
                 request_refs.append(f"request_logs.external_response:{response.request_id}")
@@ -353,11 +383,9 @@ class PortfolioStateService:
                 errors=tuple(dict.fromkeys(errors)),
                 request_refs=tuple(request_refs),
             )
-
-        bots_payload = self.response_items(self.response_data(responses, "get_bots"))
         positions_payload = self.response_items(self.response_data(responses, "get_positions"))
         trades_payload = self.response_items(self.response_data(responses, "get_trades"))
-        cash_balance = self.bot_cash_balance(bots_payload)
+        cash_balance = self.bot_cash_balance(bots_payload, portfolio_name=portfolio_name)
         return BrokerSyncResult(
             status="success",
             cash_balance=cash_balance,
@@ -800,6 +828,8 @@ class PortfolioStateService:
         request_type: str,
         request: PortfolioUpdateRequest,
         job: ModuleJob,
+        *,
+        portfolio_name: str | None = None,
     ) -> ExternalRequest:
         request_id = stable_record_id(
             f"arena_go_{request_type}",
@@ -817,8 +847,8 @@ class PortfolioStateService:
             universe_id=job.universe_id,
             instrument_ids=job.instrument_ids,
             payload={
-                "portfolio": self.config.provider_portfolio,
-                "bot": self.config.bot_name,
+                "portfolio": portfolio_name or self.config.provider_portfolio,
+                "bot": portfolio_name or self.config.bot_name,
             },
             cache_policy=CachePolicy(use_cache=False, max_age_seconds=0, write_cache=False),
             timeout_ms=self.config.gateway_timeout_ms,
@@ -900,8 +930,25 @@ class PortfolioStateService:
             return (dict(payload),)
         return ()
 
-    def bot_cash_balance(self, bots: tuple[Mapping[str, Any], ...]) -> float | None:
-        configured_bot = self.config.bot_name
+    def resolve_arena_go_portfolio(self, bots: tuple[Mapping[str, Any], ...]) -> str:
+        names = [str(bot.get("name") or bot.get("bot") or "").strip() for bot in bots]
+        names = [name for name in names if name]
+        preferred = (self.config.provider_portfolio, self.config.bot_name)
+        placeholders = {"", DEFAULT_PORTFOLIO_ID.lower(), "mybot", "mytradingbot", "portfolio"}
+        for candidate in preferred:
+            text = str(candidate or "").strip()
+            if text and text in names:
+                return text
+        for candidate in preferred:
+            text = str(candidate or "").strip().lower()
+            if text and text not in placeholders:
+                for name in names:
+                    if name.lower() == text:
+                        return name
+        return names[0] if len(names) == 1 else ""
+
+    def bot_cash_balance(self, bots: tuple[Mapping[str, Any], ...], *, portfolio_name: str | None = None) -> float | None:
+        configured_bot = portfolio_name or self.config.bot_name
         for bot in bots:
             if str(bot.get("name") or bot.get("bot") or "") == configured_bot:
                 value = _float(bot.get("cash_balance") or bot.get("cash"))

@@ -30,6 +30,7 @@ VALID_REQUEST_TYPES = {
     "text_search",
     "text_fetch",
     "llm_completion",
+    "models",
     "macro_series",
     "submit_order",
     "get_trades",

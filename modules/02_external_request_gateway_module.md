@@ -50,7 +50,7 @@
     "request_id": "string",
     "caller_module": "string",
     "provider": "moex_iss | moex_fast | arena_go | polza_ai | broker_api | news_api | issuer_disclosure | macro_api | internal_cache",
-    "request_type": "market_data | orderbook | trades | instruments | orders | portfolio | text_search | text_fetch | llm_completion | macro_series | submit_order | get_trades | get_positions | get_bots",
+    "request_type": "market_data | orderbook | trades | instruments | orders | portfolio | text_search | text_fetch | llm_completion | models | macro_series | submit_order | get_trades | get_positions | get_bots",
     "universe_id": "string",
     "instrument_ids": [
       "string"
@@ -234,11 +234,16 @@ If provider payload cannot be mapped to the target raw table without inventing v
 - `get_trades`: `GET ${ARENA_GO_BASE_URL}/trades/{portfolio}`.
 - `get_positions`: `GET ${ARENA_GO_BASE_URL}/positions/{portfolio}`.
 - `get_bots`: `GET ${ARENA_GO_BASE_URL}/bots`.
-- `Authorization` header value: `${ARENA_GO_TOKEN}`.
+- `Authorization` header value: `${SANDBOX_API_KEY}` first; `${ARENA_GO_TOKEN}` is local/dev fallback only.
+- Token values must never be written to request/audit logs; only masked token source metadata is allowed.
+- Portfolio path value must be the exact URL-encoded `bots[].name` returned by `get_bots`. `ARENA_GO_PORTFOLIO` and `ARENA_GO_BOT_NAME` may be empty at startup and are resolved from `/api/bots` when possible.
+- Empty `positions`/`trades` responses are valid initial state when the bot exists and `cash_balance` is present.
+- `submit_order.quantity` is shares, not lots; registry must keep `arena_go_quantity_mode=shares`.
 
 ### `polza_ai`
 
 - `llm_completion`: `POST ${POLZA_BASE_URL}/chat/completions`.
+- `models`: `GET ${POLZA_BASE_URL}/models`; if unavailable, healthcheck falls back to strict JSON `llm_completion`.
 - `Authorization` header value: `Bearer ${POLZA_API_KEY}`.
 - default `model`: `${POLZA_LLM_MODEL}`.
 - required `response_format`: `{"type":"json_object"}` unless explicitly overridden by schema-based task.

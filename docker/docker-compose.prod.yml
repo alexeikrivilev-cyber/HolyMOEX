@@ -3,22 +3,20 @@ services:
     image: postgres:16
     env_file:
       - ../config/api_keys.local.env
-    ports:
-      - "5432:5432"
     volumes:
-      - postgres_local_data:/var/lib/postgresql/data
+      - postgres_prod_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-moex_agent} -d $${POSTGRES_DB:-moex_agent}"]
       interval: 5s
       timeout: 5s
-      retries: 20
+      retries: 30
     restart: unless-stopped
 
   redis_local:
-    image: redis:7
+    image: redis:7.2-alpine
     profiles: ["redis"]
-    ports:
-      - "6379:6379"
+    volumes:
+      - redis_prod_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -38,25 +36,6 @@ services:
     command: ["python", "-m", "agent_app.storage.postgres.apply_migrations"]
     restart: "no"
 
-  # Optional one-shot control/smoke entrypoint. The autonomous runtime is
-  # scheduler_worker; do not run this service with an automatic restart loop.
-  agent_app:
-    profiles: ["manual"]
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    env_file:
-      - ../config/api_keys.local.env
-    depends_on:
-      postgres_local:
-        condition: service_healthy
-      migration_runner:
-        condition: service_completed_successfully
-    volumes:
-      - ../data:/app/data
-    command: ["python", "-m", "agent_app.main", "--use-postgres"]
-    restart: "no"
-
   scheduler_worker:
     build:
       context: ..
@@ -70,8 +49,38 @@ services:
         condition: service_completed_successfully
     command: ["python", "-m", "agent_app.scheduler", "--interval-seconds", "60"]
     restart: unless-stopped
+    stop_grace_period: 30s
 
-  # Optional batch research worker. Enable explicitly with --profile research.
+  staging_runner:
+    profiles: ["staging"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file:
+      - ../config/api_keys.local.env
+    depends_on:
+      postgres_local:
+        condition: service_healthy
+      migration_runner:
+        condition: service_completed_successfully
+    command: ["python", "-m", "agent_app.staging_runner", "--instrument-cap", "2", "--max-news-items", "2"]
+    restart: "no"
+
+  agent_app:
+    profiles: ["manual"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file:
+      - ../config/api_keys.local.env
+    depends_on:
+      postgres_local:
+        condition: service_healthy
+      migration_runner:
+        condition: service_completed_successfully
+    command: ["python", "-m", "agent_app.main", "--use-postgres"]
+    restart: "no"
+
   research_worker:
     profiles: ["research"]
     build:
@@ -88,4 +97,5 @@ services:
     restart: "no"
 
 volumes:
-  postgres_local_data:
+  postgres_prod_data:
+  redis_prod_data:

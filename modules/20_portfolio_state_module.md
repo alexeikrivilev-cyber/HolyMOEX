@@ -205,3 +205,7 @@ Turnover mandate metrics are calculated from realized fills/trades, not order in
 ## Runtime hardening note v5
 
 Turnover progress is a realized KPI, not an order-intent KPI. The module must calculate turnover from fills, execution results and normalized ArenaGo trades after timestamp normalization. These realized turnover fields are used by Decision Engine and Monitoring, and they are also required for `expected_edge_after_cost` / churn-quality analysis.
+
+## Runtime hardening note v6
+
+ArenaGo sync resolves the provider portfolio from exact `bots[].name`. `get_bots` is called first; `get_positions` and `get_trades` then use the same exact bot/portfolio name. Empty positions/trades are valid initial state when the bot exists and `cash_balance` is available. If broker sync fails and the previous live snapshot is missing or stale, the module must fail rather than fabricate a fresh portfolio state.

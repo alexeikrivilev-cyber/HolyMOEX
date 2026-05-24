@@ -5,6 +5,7 @@ import json
 import os
 import re
 import signal
+import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -76,6 +77,10 @@ class SchedulerConfig:
     universe_id: str = "moex_top20_manual"
     trigger_type: str = "scheduled"
     use_db_schedules: bool = True
+    lock_ttl_seconds: float = 120.0
+    single_scheduler_instance: bool = False
+    schedule_id_filter: tuple[str, ...] = ()
+    max_entries_per_tick: int = 0
 
 
 class AutonomousScheduler:
@@ -95,6 +100,9 @@ class AutonomousScheduler:
         self.config = config
         self._stop_requested = False
         self._last_run_by_schedule: dict[str, float] = {}
+        self._runtime_checked = False
+        self._runtime_ready = True
+        self._owner_id = os.getenv("SCHEDULER_OWNER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 
     def run(self) -> int:
         self._install_signal_handlers()
@@ -107,6 +115,8 @@ class AutonomousScheduler:
         return exit_code
 
     def run_once(self) -> int:
+        if not self._ensure_runtime_mode():
+            return 2
         entries = self._scheduled_entries()
         if entries:
             return self._run_due_entries(entries)
@@ -115,13 +125,22 @@ class AutonomousScheduler:
     def _run_due_entries(self, entries: tuple[ScheduleEntry, ...]) -> int:
         now = time.monotonic()
         exit_code = 0
+        executed_count = 0
         for entry in entries:
             if self._stop_requested:
                 break
+            if self.config.max_entries_per_tick > 0 and executed_count >= self.config.max_entries_per_tick:
+                break
             last_run = self._last_run_by_schedule.get(entry.schedule_config_id)
             if last_run is not None and now - last_run < entry.interval_seconds and not self.config.once:
+                self._log_tick_event(entry, "scheduler_tick_skipped", "interval_not_due")
                 continue
+            if not self._acquire_tick_lock(entry):
+                self._log_tick_event(entry, "scheduler_tick_skipped", "lock_not_acquired")
+                continue
+            self._log_tick_event(entry, "scheduler_tick_locked", "lock_acquired")
             current = self._run_entry(entry)
+            executed_count += 1
             self._last_run_by_schedule[entry.schedule_config_id] = time.monotonic()
             if current != 0:
                 exit_code = current
@@ -140,12 +159,46 @@ class AutonomousScheduler:
                 run_mode=self.config.system_mode,
                 trigger_type=self.config.trigger_type,
             )
+            if not self._acquire_tick_lock(entry):
+                self._log_tick_event(entry, "scheduler_tick_skipped", "lock_not_acquired")
+                continue
+            self._log_tick_event(entry, "scheduler_tick_locked", "lock_acquired")
             current = self._run_entry(entry)
             if current != 0:
                 exit_code = current
         return exit_code
 
+    def _log_tick_event(self, entry: ScheduleEntry, event: str, reason: str) -> None:
+        print(
+            json.dumps(
+                {
+                    "event": event,
+                    "schedule_config_id": entry.schedule_config_id,
+                    "source": entry.source,
+                    "run_mode": entry.run_mode,
+                    "reason": reason,
+                    "owner_id": self._owner_id,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
     def _run_entry(self, entry: ScheduleEntry) -> int:
+        started = time.monotonic()
+        print(
+            json.dumps(
+                {
+                    "event": "scheduler_entry_started",
+                    "schedule_config_id": entry.schedule_config_id,
+                    "source": entry.source,
+                    "run_mode": entry.run_mode,
+                    "owner_id": self._owner_id,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         argv = [
             "--trigger-type",
             entry.trigger_type,
@@ -160,7 +213,112 @@ class AutonomousScheduler:
         ]
         if os.getenv("DATABASE_URL"):
             argv.append("--use-postgres")
-        return run_orchestration_once(argv)
+        exit_code = run_orchestration_once(argv)
+        print(
+            json.dumps(
+                {
+                    "event": "scheduler_entry_finished",
+                    "schedule_config_id": entry.schedule_config_id,
+                    "source": entry.source,
+                    "run_mode": entry.run_mode,
+                    "exit_code": exit_code,
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "owner_id": self._owner_id,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return exit_code
+
+    def _ensure_runtime_mode(self) -> bool:
+        if self._runtime_checked:
+            return self._runtime_ready
+        self._runtime_checked = True
+        database_url = os.getenv("DATABASE_URL", "")
+        redis_url = os.getenv("REDIS_URL", "")
+        if redis_url:
+            self._audit_scheduler_warning(
+                database_url,
+                "scheduler_redis_not_used",
+                "Redis URL is configured, but this runtime uses PostgreSQL advisory tick locks plus single-leader deployment policy.",
+                ("redis_optional", "postgres_tick_lock_enabled"),
+            )
+        if not redis_url and not self.config.single_scheduler_instance:
+            self._runtime_ready = False
+            self._audit_scheduler_warning(
+                database_url,
+                "scheduler_single_leader_required",
+                "Redis is unavailable and SINGLE_SCHEDULER_INSTANCE is not true; scheduler refused to start to avoid duplicate jobs.",
+                ("redis_unavailable", "single_leader_required"),
+                severity="error",
+            )
+            return False
+        if not redis_url and self.config.single_scheduler_instance:
+            self._audit_scheduler_warning(
+                database_url,
+                "scheduler_single_leader_mode",
+                "Redis is unavailable; scheduler is running in explicit single-leader mode with PostgreSQL tick locks.",
+                ("redis_unavailable", "single_leader_mode", "postgres_tick_lock_enabled"),
+            )
+        return True
+
+    def _acquire_tick_lock(self, entry: ScheduleEntry) -> bool:
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            return True
+        try:
+            return acquire_scheduler_tick_lock(
+                database_url,
+                schedule_config_id=entry.schedule_config_id,
+                owner_id=self._owner_id,
+                ttl_seconds=self.config.lock_ttl_seconds,
+            )
+        except Exception as error:  # pragma: no cover - defensive runtime fallback
+            print(
+                json.dumps(
+                    {
+                        "event": "scheduler_tick_lock_failed",
+                        "schedule_config_id": entry.schedule_config_id,
+                        "error": str(error),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return bool(self.config.single_scheduler_instance)
+
+    def _audit_scheduler_warning(
+        self,
+        database_url: str,
+        event_type: str,
+        message: str,
+        reason_codes: tuple[str, ...],
+        *,
+        severity: str = "warning",
+    ) -> None:
+        payload = {
+            "owner_id": self._owner_id,
+            "single_scheduler_instance": self.config.single_scheduler_instance,
+            "lock_ttl_seconds": self.config.lock_ttl_seconds,
+        }
+        if database_url:
+            try:
+                write_scheduler_audit(database_url, event_type, message, reason_codes, severity=severity, payload=payload)
+                return
+            except Exception:
+                pass
+        print(
+            json.dumps(
+                {
+                    "event": event_type,
+                    "severity": severity,
+                    "message": message,
+                    "reason_codes": list(reason_codes),
+                    "payload": payload,
+                },
+                ensure_ascii=False,
+            )
+        )
 
     def _scheduled_entries(self) -> tuple[ScheduleEntry, ...]:
         if not self.config.use_db_schedules:
@@ -169,7 +327,11 @@ class AutonomousScheduler:
         if not database_url:
             return ()
         try:
-            return load_schedule_entries_from_postgres(database_url, default_run_mode=self.config.system_mode)
+            entries = load_schedule_entries_from_postgres(database_url, default_run_mode=self.config.system_mode)
+            if self.config.schedule_id_filter:
+                wanted = set(self.config.schedule_id_filter)
+                entries = tuple(entry for entry in entries if entry.schedule_config_id in wanted)
+            return entries
         except Exception as error:  # pragma: no cover - defensive runtime fallback
             print(
                 json.dumps(
@@ -225,6 +387,71 @@ def load_schedule_entries_from_postgres(database_url: str, *, default_run_mode: 
         if entry is not None:
             entries.append(entry)
     return tuple(entries)
+
+
+def acquire_scheduler_tick_lock(
+    database_url: str,
+    *,
+    schedule_config_id: str,
+    owner_id: str,
+    ttl_seconds: float,
+) -> bool:
+    import psycopg
+
+    query = """
+        INSERT INTO audit.scheduler_tick_lock (
+            schedule_config_id, owner_id, locked_until, last_tick_at, tick_count
+        ) VALUES (
+            %s, %s, now() + (%s::text || ' seconds')::interval, now(), 1
+        )
+        ON CONFLICT (schedule_config_id) DO UPDATE SET
+            owner_id = EXCLUDED.owner_id,
+            locked_until = EXCLUDED.locked_until,
+            last_tick_at = now(),
+            tick_count = audit.scheduler_tick_lock.tick_count + 1
+        WHERE audit.scheduler_tick_lock.locked_until <= now()
+           OR audit.scheduler_tick_lock.owner_id = EXCLUDED.owner_id
+        RETURNING schedule_config_id
+    """
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (schedule_config_id, owner_id, max(1, int(ttl_seconds))))
+            row = cur.fetchone()
+    return row is not None
+
+
+def write_scheduler_audit(
+    database_url: str,
+    event_type: str,
+    message: str,
+    reason_codes: tuple[str, ...],
+    *,
+    severity: str,
+    payload: Mapping[str, Any],
+) -> None:
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO audit.audit_record (
+                    module_name, severity, event_type, message,
+                    object_type, object_ref, reason_codes, payload
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    "Orchestration Module",
+                    severity,
+                    event_type,
+                    message,
+                    "scheduler_worker",
+                    "agent_app.scheduler",
+                    list(reason_codes),
+                    Jsonb(dict(payload)),
+                ),
+            )
 
 
 def schedule_entry_from_payload(
@@ -294,6 +521,11 @@ def _env_sources() -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip()) or DEFAULT_AUTONOMOUS_SOURCES
 
 
+def _env_schedule_ids() -> tuple[str, ...]:
+    value = os.getenv("SCHEDULER_SCHEDULE_IDS", "")
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Persistent autonomous scheduler for MOEX trading agent")
     parser.add_argument("--interval-seconds", type=float, default=float(os.getenv("SCHEDULER_INTERVAL_SECONDS", "60")))
@@ -303,6 +535,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--universe-id", default=os.getenv("SELECTED_UNIVERSE_ID", "moex_top20_manual"))
     parser.add_argument("--trigger-type", default="scheduled")
     parser.add_argument("--no-db-schedules", action="store_true", help="Ignore audit.schedule_config and use fallback source loop")
+    parser.add_argument("--lock-ttl-seconds", type=float, default=float(os.getenv("SCHEDULER_LOCK_TTL_SECONDS", "120")))
+    parser.add_argument("--schedule-id", action="append", default=[], help="Only run matching audit.schedule_config id; repeatable")
+    parser.add_argument("--max-entries-per-tick", type=int, default=int(os.getenv("SCHEDULER_MAX_ENTRIES_PER_TICK", "0")))
     return parser
 
 
@@ -317,6 +552,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         universe_id=args.universe_id,
         trigger_type=args.trigger_type,
         use_db_schedules=not bool(args.no_db_schedules),
+        lock_ttl_seconds=args.lock_ttl_seconds,
+        single_scheduler_instance=os.getenv("SINGLE_SCHEDULER_INSTANCE", "").lower() in {"1", "true", "yes"},
+        schedule_id_filter=tuple(args.schedule_id) if args.schedule_id else _env_schedule_ids(),
+        max_entries_per_tick=max(0, int(args.max_entries_per_tick)),
     )
     return AutonomousScheduler(config).run()
 

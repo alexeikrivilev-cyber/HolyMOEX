@@ -678,7 +678,9 @@ class OrchestrationService:
         payload_ref = request.incoming_trigger.payload_ref
         if payload_ref and not payload_ref.startswith("module:") and payload_ref not in refs:
             refs.append(payload_ref)
-        if request.incoming_trigger.trigger_type == "scheduled" and not refs:
+        if request.incoming_trigger.trigger_type == "scheduled":
+            refs.extend(self._autonomous_cycle_refs(context))
+        elif not refs and request.incoming_trigger.source_module.endswith(" Store"):
             refs.extend(self._autonomous_cycle_refs(context))
         return tuple(dict.fromkeys(refs))
 
@@ -823,6 +825,9 @@ class OrchestrationService:
         decision_set_ref = self._current_input_ref(job.input_refs, "decisions.decision_set")
         market_state_ref = self._latest_input_ref(job.input_refs, "features.market_state_record", "features.market_state_record:latest")
         data_quality_report_ref = self._latest_input_ref(job.input_refs, "features.data_quality_report", "features.data_quality_report:latest")
+        raw_text_refs = self._input_refs_by_prefix(job.input_refs, "raw_text.raw_text_item", ("raw_text.raw_text_item:scheduled",))
+        routing_message_refs = self._input_refs_by_prefix(job.input_refs, "raw_text.event_routing_message", ("raw_text.event_routing_message:scheduled",))
+        structured_event_refs = self._input_refs_by_prefix(job.input_refs, "events.structured_event", ("events.structured_event:scheduled",))
         order_intent_refs = self._input_refs_by_prefix(job.input_refs, "orders.order_intent", ())
         fill_report_refs = self._input_refs_by_prefix(job.input_refs, "orders.fill_report", ())
         quality_input_refs = tuple(
@@ -841,6 +846,23 @@ class OrchestrationService:
         ) or ("raw_market.raw_candle:scheduled",)
         monitoring_payload_ref = self._latest_input_ref(job.input_refs, "portfolio.portfolio_snapshot", self._latest_input_ref(job.input_refs, "orders.execution_result", "audit.module_run:scheduled"))
         payload_by_module: dict[str, Mapping[str, Any]] = {
+            "Data Intake & Routing Module": {
+                "intake_request": {
+                    "universe_id": job.universe_id,
+                    "instrument_ids": list(instrument_ids),
+                    "source_types": ["rbc_news", "finam_news", "smartlab_news"],
+                    "discovery_mode": "scheduled",
+                    "per_instrument_discovery": True,
+                    "time_range": job.time_range.to_dict(),
+                    "routing_targets": [
+                        "Event & News Intelligence Module",
+                        "Earnings & Dividend Intelligence Module",
+                        "Corporate Actions Adjustment Module",
+                        "Market Context Module",
+                    ],
+                    "routing_ttl_seconds": 3600,
+                }
+            },
             "Data Quality Module": {
                 "quality_check_request": {
                     "input_refs": list(quality_input_refs),
@@ -903,6 +925,36 @@ class OrchestrationService:
                     "sector_refs": ["raw_market.raw_index_value:sector"],
                     "event_refs": ["events.structured_event:scheduled"],
                     "windows": [5, 20, 60],
+                }
+            },
+            "Fundamental & Valuation Module": {
+                "fundamental_input": {
+                    "instrument_ids": list(instrument_ids),
+                    "financial_statement_refs": list(raw_text_refs),
+                    "market_cap_ref": "raw_market.raw_candle:scheduled",
+                    "peer_group_ref": "features.fundamental_snapshot:peer_group",
+                    "reporting_standard": "unknown",
+                    "period": "latest",
+                }
+            },
+            "Event & News Intelligence Module": {
+                "event_news_input": {
+                    "routing_message_refs": list(routing_message_refs),
+                    "raw_text_refs": list(raw_text_refs),
+                    "instrument_ids": list(instrument_ids),
+                    "event_ontology_version": "event_ontology:moex:v1",
+                    "llm_prompt_version": "event_news_extraction:v1",
+                    "market_reaction_window": ["5m", "1h", "1d"],
+                }
+            },
+            "Earnings & Dividend Intelligence Module": {
+                "earnings_dividend_input": {
+                    "instrument_ids": list(instrument_ids),
+                    "report_refs": list(raw_text_refs),
+                    "dividend_event_refs": list(structured_event_refs),
+                    "financial_expectation_ref": "features.fundamental_snapshot:expectations",
+                    "historical_gap_ref": "raw_market.raw_candle:dividend_gap_history",
+                    "llm_prompt_version": "earnings_dividend_extraction:v1",
                 }
             },
             "Normalization & Feature Vector Module": {
