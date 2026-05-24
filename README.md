@@ -1,6 +1,6 @@
 # MOEX Hybrid AI Trading Agent — Technical Documentation
 
-Версия: `1.0-strict`  
+Версия: `1.3 pivo edition  
 Назначение: единая техническая документация для сборки модульного гибридного AI/quant-агента для анализа и автономной торговли выбранной вселенной ликвидных акций MOEX.
 
 Документация написана на русском языке. Все программные сущности фиксируются на английском: `module_name`, `object_type`, `field_name`, `metric_name`, `contour`, `status`, `horizon`, `storage_name`, `request_type`, `decision_action`.
