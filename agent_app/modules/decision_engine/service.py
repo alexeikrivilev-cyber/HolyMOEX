@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -643,8 +644,8 @@ class DecisionEngineService:
         payload = portfolio_snapshot.payload
         status = str(payload.get("turnover_target_status") or "unknown")
         progress = clip(_payload_float(payload, "turnover_progress_ratio"))
-        remaining = max(0.0, _payload_float(payload, "remaining_turnover_rub_14d"))
-        target = max(0.0, _payload_float(payload, "target_gross_turnover_rub_14d"))
+        remaining = max(0.0, _payload_float(payload, "remaining_turnover_rub_14d") or 0.0)
+        target = max(0.0, _payload_float(payload, "target_gross_turnover_rub_14d") or 0.0)
         if status == "achieved" or target <= 0:
             urgency = 0.0
         elif status == "critically_behind":
@@ -933,10 +934,54 @@ class DecisionEngineService:
 
 
 def _feature_value(features: Mapping[str, Mapping[str, Any]], metric_name: str) -> float | None:
-    payload = features.get(metric_name)
-    if not isinstance(payload, Mapping):
+    return _feature_numeric(features, metric_name, default=None, value_field="normalized_value")
+
+
+def _feature_numeric(
+    features: Any,
+    metric_name: str,
+    default: float | None = 0.0,
+    *,
+    value_field: str = "auto",
+) -> float | None:
+    """Read a finite numeric feature value from dict or object-like payloads."""
+    payload = _feature_payload(features, metric_name)
+    if payload is None:
+        return default
+    if value_field == "auto":
+        field_names = ("normalized_value", "raw_value")
+    elif value_field in {"normalized_value", "raw_value"}:
+        field_names = (value_field,)
+    else:
+        field_names = ("normalized_value", "raw_value")
+    for field_name in field_names:
+        parsed = _finite_float(_field_value(payload, field_name))
+        if parsed is not None:
+            return parsed
+    return default
+
+
+def _feature_payload(features: Any, metric_name: str) -> Any:
+    feature_map = getattr(features, "features", features)
+    if isinstance(feature_map, Mapping):
+        return feature_map.get(metric_name)
+    return getattr(feature_map, metric_name, None)
+
+
+def _field_value(payload: Any, key: str) -> Any:
+    if isinstance(payload, Mapping):
+        return payload.get(key)
+    return getattr(payload, key, None)
+
+
+def _finite_float(value: Any) -> float | None:
+    if value is None or value == "" or isinstance(value, bool):
         return None
-    return _payload_float(payload, "normalized_value")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _payload_float(payload: Mapping[str, Any], key: str) -> float | None:

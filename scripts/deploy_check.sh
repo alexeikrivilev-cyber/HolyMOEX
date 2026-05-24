@@ -73,17 +73,32 @@ secret_scan() {
   fi
 }
 
+ensure_dev_deps() {
+  local py_cmd="$1"
+  if ! "$py_cmd" -m pytest --version >/dev/null 2>&1; then
+    log "pytest not found; installing requirements-dev.txt"
+    "$py_cmd" -m pip install --no-cache-dir -r requirements-dev.txt >/tmp/holy_dev_deps_install.log || {
+      echo "failed to install dev/test dependencies from requirements-dev.txt; see /tmp/holy_dev_deps_install.log" >&2
+      exit 1
+    }
+  fi
+}
+
 python_checks() {
-  log "compileall and pytest"
+  log "compileall, unittest and pytest"
   if command -v python3 >/dev/null 2>&1; then
+    ensure_dev_deps python3
     python3 -m compileall -q agent_app tests
+    PYTHONPATH=. python3 -m unittest discover -s tests -p "test*.py" -v
     PYTHONPATH=. python3 -m pytest -q
   elif command -v python >/dev/null 2>&1; then
+    ensure_dev_deps python
     python -m compileall -q agent_app tests
+    PYTHONPATH=. python -m unittest discover -s tests -p "test*.py" -v
     PYTHONPATH=. python -m pytest -q
   else
     docker run --rm -v "$ROOT_DIR:/work" -w /work -e PYTHONPATH=/work "$PY_IMAGE" \
-      sh -lc "pip install --no-cache-dir -r requirements.txt pytest >/tmp/holy_pytest_install.log && python -m compileall -q agent_app tests && python -m pytest -q"
+      sh -lc "pip install --no-cache-dir -r requirements-dev.txt >/tmp/holy_dev_deps_install.log && python -m compileall -q agent_app tests && python -m unittest discover -s tests -p 'test*.py' -v && python -m pytest -q"
   fi
 }
 

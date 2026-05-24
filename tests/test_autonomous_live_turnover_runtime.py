@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from agent_app.contracts.unified_objects import ModuleJob, TimeRange
 from agent_app.modules.orchestration.executor import LocalModuleExecutor
 from agent_app.modules.portfolio_state.repository import InMemoryPortfolioStateRepository
@@ -77,6 +79,144 @@ def test_in_memory_executor_does_not_inject_real_gateway() -> None:
     executor = LocalModuleExecutor(use_postgres=False)
     service = executor._service_for("Market Data Metrics Module")
     assert getattr(service, "gateway", None) is None
+
+
+def test_decision_feature_numeric_prefers_normalized_value() -> None:
+    from agent_app.modules.decision_engine.service import _feature_numeric
+
+    features = {"expected_edge_score": {"normalized_value": 0.75, "raw_value": 0.12}}
+
+    assert _feature_numeric(features, "expected_edge_score") == 0.75
+
+
+def test_decision_feature_numeric_falls_back_to_raw_value() -> None:
+    from agent_app.modules.decision_engine.service import _feature_numeric
+
+    features = {"spread_bps": {"raw_value": 4.5}}
+
+    assert _feature_numeric(features, "spread_bps") == 4.5
+    assert _feature_numeric(features, "spread_bps", value_field="raw_value") == 4.5
+
+
+def test_decision_feature_numeric_missing_metric_returns_default() -> None:
+    from agent_app.modules.decision_engine.service import _feature_numeric
+
+    assert _feature_numeric({}, "missing_metric", default=-1.0) == -1.0
+
+
+def test_decision_feature_numeric_supports_object_like_entries() -> None:
+    from agent_app.modules.decision_engine.service import _feature_numeric
+
+    features = SimpleNamespace(
+        features={
+            "expected_edge_score": SimpleNamespace(normalized_value=0.61, raw_value=0.20),
+            "spread_bps": SimpleNamespace(raw_value=3.0),
+        }
+    )
+
+    assert _feature_numeric(features, "expected_edge_score") == 0.61
+    assert _feature_numeric(features, "spread_bps") == 3.0
+
+
+def test_decision_feature_numeric_rejects_non_finite_and_non_numeric_values() -> None:
+    from agent_app.modules.decision_engine.service import _feature_numeric
+
+    features = {
+        "nan_metric": {"normalized_value": float("nan"), "raw_value": "bad"},
+        "inf_metric": {"normalized_value": float("inf")},
+        "text_metric": {"normalized_value": "not-a-number"},
+        "bool_metric": {"normalized_value": True},
+    }
+
+    assert _feature_numeric(features, "nan_metric", default=9.0) == 9.0
+    assert _feature_numeric(features, "inf_metric", default=9.0) == 9.0
+    assert _feature_numeric(features, "text_metric", default=9.0) == 9.0
+    assert _feature_numeric(features, "bool_metric", default=9.0) == 9.0
+
+
+def test_decision_engine_minimal_feature_vector_does_not_raise_name_error() -> None:
+    from agent_app.modules.decision_engine.repository import (
+        FeatureVector,
+        InMemoryDecisionEngineRepository,
+        MetricWeightRule,
+        PortfolioSnapshot,
+        WeightsProfile,
+    )
+    from agent_app.modules.decision_engine.service import DecisionEngineService
+
+    repository = InMemoryDecisionEngineRepository(
+        feature_vectors=(
+            FeatureVector(
+                "fv_decision_smoke",
+                "moex:SBER",
+                "intraday",
+                "2026-05-24T09:00:00Z",
+                {
+                    "expected_edge_score": {"raw_value": 0.02, "confidence_score": 1.0, "ttl_status": "fresh"},
+                    "spread_bps": {"normalized_value": 0.1, "raw_value": 5, "ttl_status": "fresh"},
+                },
+                1.0,
+                1.0,
+                "test",
+            ),
+        ),
+        weights_profiles=(
+            WeightsProfile("weights_test", "test", "1", "active", "intraday", ("analysis_only", "paper_trading", "live_trading")),
+        ),
+        metric_weight_rules=(
+            MetricWeightRule("rule_edge", "weights_test", "expected_edge_score", "price", "intraday", "all", (), None, 1.0, "positive", "identity", 0.0, "downweight", "test"),
+        ),
+        portfolio_snapshots=(
+            PortfolioSnapshot(
+                "snapshot_decision_smoke",
+                "arena_go_default",
+                "moex_top20_manual",
+                "2026-05-24T09:00:00Z",
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+                0,
+                0,
+                {"market_session_status": "open"},
+            ),
+        ),
+    )
+    job = ModuleJob(
+        job_id="job_decision_smoke",
+        module_name="Decision Engine Module",
+        contour="decision_contour",
+        trigger_type="manual",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T09:00:00Z"),
+        input_refs=("features.feature_vector:fv_decision_smoke", "portfolio.portfolio_snapshot:snapshot_decision_smoke"),
+        config_ref="weights_test",
+        run_mode="analysis_only",
+        idempotency_key="idem_decision_smoke",
+    )
+    payload = {
+        "decision_request": {
+            "decision_request_id": "decision_request_smoke",
+            "universe_id": "moex_top20_manual",
+            "instrument_ids": ["moex:SBER"],
+            "horizon": "intraday",
+            "as_of_ts": "2026-05-24T09:00:00Z",
+            "feature_vector_refs": ["features.feature_vector:fv_decision_smoke"],
+            "portfolio_state_ref": "portfolio.portfolio_snapshot:snapshot_decision_smoke",
+            "weights_profile_id": "weights_test",
+            "run_mode": "analysis_only",
+            "decision_mode": "normal",
+        }
+    }
+
+    result = DecisionEngineService(repository=repository).process(payload, job)
+
+    assert result.module_job_result.status in {"success", "partial_success"}
+    assert not any("NameError" in error or "_feature_numeric" in error for error in result.module_job_result.errors)
+    assert result.decision_records
 
 
 def test_turnover_migration_contains_calculation_version_for_weight_rules() -> None:
@@ -170,6 +310,39 @@ def test_manual_store_trigger_without_payload_ref_gets_autonomous_cycle_refs() -
 
     assert "raw_market.raw_candle:scheduled" in refs
     assert "features.feature_vector:latest" in refs
+
+
+def test_analysis_only_pipeline_skips_execution_engine() -> None:
+    from agent_app.modules.orchestration.repository import InMemoryOrchestrationRepository
+    from agent_app.modules.orchestration.service import (
+        IncomingTrigger,
+        OrchestrationInput,
+        OrchestrationService,
+        PipelineContext,
+    )
+
+    service = OrchestrationService(InMemoryOrchestrationRepository(), execute_jobs=False)
+    request = OrchestrationInput(
+        schedule_config_ref=None,
+        dependency_graph_ref=None,
+        incoming_trigger=IncomingTrigger(
+            trigger_type="manual",
+            source_module="Raw Market Data Store",
+            payload_ref="",
+        ),
+        system_mode="analysis_only",
+    )
+    context = PipelineContext(
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+    )
+
+    run = service.run_pipeline(request, context)
+
+    assert "Execution Engine Module" in run.skipped_modules
+    assert "Execution Engine Module" not in run.critical_path
+    assert all(job.module_name != "Execution Engine Module" for job in run.created_jobs)
 
 
 def test_autonomous_default_payloads_cover_text_and_fundamental_modules() -> None:
@@ -842,6 +1015,18 @@ def test_root_dockerfile_uses_autonomous_startup_and_data_volume() -> None:
     assert "agent_app.storage.postgres.apply_migrations" in startup
     assert "agent_app.server_startup" in startup
     assert "agent_app.scheduler" in startup
+
+
+def test_deploy_check_uses_dev_requirements_for_pytest() -> None:
+    from pathlib import Path
+
+    dev_requirements = Path("requirements-dev.txt").read_text(encoding="utf-8")
+    deploy_check = Path("scripts/deploy_check.sh").read_text(encoding="utf-8")
+
+    assert "pytest" in dev_requirements
+    assert "requirements-dev.txt" in deploy_check
+    assert "pytest not found" in deploy_check
+    assert "python -m unittest discover" in deploy_check
 
 
 def test_scheduler_refuses_without_redis_or_single_leader(monkeypatch) -> None:

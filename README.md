@@ -717,6 +717,17 @@ LLM_DEFAULT_RESPONSE_FORMAT=json_object
 
 Файл с ключами должен быть отдельным локальным файлом: `config/api_keys.local.env`. В репозитории хранится только шаблон: `config/api_keys.example.env`.
 
+### 16.3 Local test commands
+
+Dev/test dependencies are isolated in `requirements-dev.txt`:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m compileall -q agent_app tests
+python -m unittest discover -s tests -p "test*.py" -v
+python -m pytest -q
+```
+
 ## 17. ArenaGo execution integration
 
 Торговая платформа: `ArenaGo`. Начальный капитал системы: `1000000 RUB`. Целевой продуктовый режим: автономный `live_trading` с отдельным live risk policy, live weights и turnover mandate. `paper_trading` остаётся обязательным проверочным контуром, но не является финальным режимом продукта.
@@ -852,7 +863,7 @@ Normalized `arena_go_bot`:
 
 ## 18. PolzaAI LLM integration
 
-LLM-провайдер: `PolzaAI`. Основная модель задаётся через `POLZA_LLM_MODEL`; по умолчанию в конфигурации используется `deepseek/deepseek-v4-pro`. Текущий gateway реализует strict JSON `llm_completion` smoke. Отдельный `GET /models`/model availability endpoint в runtime ещё не реализован и должен быть добавлен перед production live-money запуском, если PolzaAI требует явной проверки каталога моделей.
+LLM-провайдер: `PolzaAI`. Основная модель задаётся через `POLZA_LLM_MODEL`; по умолчанию в конфигурации используется `deepseek/deepseek-v4-pro`. Текущий gateway реализует strict JSON `llm_completion` smoke и `GET /models` availability-check через `provider=polza_ai`, `request_type=models`. В deploy-check `GET /models` используется как основной healthcheck, а strict JSON completion остаётся fallback-проверкой провайдера.
 
 PolzaAI вызывается только через `External Request Gateway Module`. LLM-модули не имеют права напрямую создавать HTTP-клиент к PolzaAI.
 
@@ -1222,7 +1233,7 @@ fresh PostgreSQL volume
   -> MOEX ISS request
   -> CBR request
   -> public news/disclosure fetch
-  -> PolzaAI JSON completion smoke; GET /models remains a provider enhancement unless implemented in gateway
+  -> PolzaAI GET /models healthcheck; strict JSON completion fallback
   -> ArenaGo get_bots/get_positions/get_trades
   -> mock or minimal safe submit_order path
   -> scheduler tick

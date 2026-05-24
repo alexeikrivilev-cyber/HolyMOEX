@@ -15,6 +15,7 @@ from .repository import AuditRecord, OrchestrationRepository
 
 
 VALID_SYSTEM_MODES = {"analysis_only", "paper_trading", "live_trading", "maintenance"}
+ANALYSIS_ONLY_SKIPPED_MODULES = {"Execution Engine Module"}
 
 
 class OrchestrationError(ValueError):
@@ -167,6 +168,9 @@ class OrchestrationService:
         if request.system_mode == "maintenance":
             skipped = tuple(target for target in targets if not MODULE_SPECS[target].service_only)
             targets = tuple(target for target in targets if MODULE_SPECS[target].service_only)
+        elif request.system_mode == "analysis_only":
+            skipped = tuple(target for target in targets if target in ANALYSIS_ONLY_SKIPPED_MODULES)
+            targets = tuple(target for target in targets if target not in ANALYSIS_ONLY_SKIPPED_MODULES)
         else:
             skipped = ()
 

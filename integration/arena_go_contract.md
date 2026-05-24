@@ -17,9 +17,15 @@
 
 ## Auth
 
+Primary token source: `SANDBOX_API_KEY`.
+
+Local/dev fallback: `ARENA_GO_TOKEN`.
+
 ```http
-Authorization: ${ARENA_GO_TOKEN}
+Authorization: ${resolved_arena_go_token}
 ```
+
+`resolved_arena_go_token` is selected by runtime from `SANDBOX_API_KEY` first, then `ARENA_GO_TOKEN` only as a local/dev fallback. The raw token must not be logged; logs and audit may contain only the token source or a masked value.
 
 ## Submit order payload
 
