@@ -60,6 +60,12 @@
 
 Через Gateway запрашивает issuer disclosures, MOEX instrument metadata, trading status, historical data.
 
+MOEX ISS corporate-action market requests:
+
+- Historical candles and trading-status support requests must be generated per instrument profile.
+- Each MOEX `market_data` request must carry one `instrument_id`, `payload.secid`, `payload.board_id`, `payload.timeframe=1d` and `time_range`.
+- Instrument metadata requests may also be per instrument, but must not be used to write market rows for another instrument.
+
 ## 7. Processing rules
 
 - `classify_corporate_action`
@@ -125,6 +131,8 @@ Corporate action records постоянные. Adjustment factors версион
 
 Если corporate action подтверждён, но adjustment factor не рассчитан, модуль блокирует affected historical-return features до разрешения.
 
+Модуль обрабатывает только подтверждённые corporate/dividend events. `events.structured_event.payload.confirmation_status = candidate_requires_official_confirmation` означает ранний новостной сигнал и не является основанием для corporate action adjustment до подтверждения через `issuer_disclosure`, `prime_disclosure`, `akm_disclosure`, `corporate_site`, MOEX/CBR или другой официальный слой.
+
 ## 14. Acceptance criteria
 
 - `effective_date_required`
@@ -132,6 +140,7 @@ Corporate action records постоянные. Adjustment factors версион
 - `affected_features_recompute_triggered`
 - `instrument_mapping_versioned`
 - `halt_and_tradability_flags_propagated`
+- `candidate_news_events_are_not_adjusted`
 
 ## 15. Metric formulas / calculation rules
 

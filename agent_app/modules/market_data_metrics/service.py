@@ -247,6 +247,32 @@ class MarketDataMetricsService:
                 if self.gateway is not None:
                     self.gateway.process(request)
             warnings.extend(f"external_request_created:{request.request_id}" for request in external_requests)
+            if external_requests and self.gateway is not None:
+                candles = self.repository.list_candles(
+                    candles_ref=metrics_input.candles_ref,
+                    universe_id=job.universe_id,
+                    instrument_ids=active_ids,
+                    timeframes=metrics_input.timeframes,
+                    from_ts=job.time_range.from_ts,
+                    to_ts=job.time_range.to_ts,
+                )
+                trades = self.repository.list_trades(
+                    trades_ref=metrics_input.trades_ref,
+                    universe_id=job.universe_id,
+                    instrument_ids=active_ids,
+                    from_ts=job.time_range.from_ts,
+                    to_ts=job.time_range.to_ts,
+                )
+                market_index_values = self.repository.list_index_values(
+                    metrics_input.market_index_ref,
+                    job.time_range.from_ts,
+                    job.time_range.to_ts,
+                )
+                sector_index_values = self.repository.list_index_values(
+                    metrics_input.sector_index_ref,
+                    job.time_range.from_ts,
+                    job.time_range.to_ts,
+                )
 
             if not profiles or not candles:
                 return self._empty_result(
@@ -641,21 +667,27 @@ class MarketDataMetricsService:
     ) -> tuple[ExternalRequest, ...]:
         requests: list[ExternalRequest] = []
         if len(profiles) < len(metrics_input.instrument_ids):
-            requests.append(self._external_request(job, metrics_input, "instruments"))
-        if (
-            not candles
-            or not market_index_values
-            or not sector_index_values
-            or _candles_stale(candles, job)
-            or _index_values_stale(market_index_values, job)
-            or _index_values_stale(sector_index_values, job)
-        ):
-            requests.append(self._external_request(job, metrics_input, "market_data"))
+            active_set = {profile.instrument_id for profile in profiles}
+            for instrument_id in metrics_input.instrument_ids:
+                if instrument_id not in active_set:
+                    requests.append(self._instrument_metadata_request(job, instrument_id))
+        for profile in profiles:
+            for timeframe in metrics_input.timeframes:
+                instrument_candles = _candles_for(candles, profile.instrument_id, timeframe)
+                if not instrument_candles or _candles_stale(instrument_candles, job):
+                    requests.append(self._instrument_market_request(job, profile, timeframe))
+        if metrics_input.market_index_ref and (not market_index_values or _index_values_stale(market_index_values, job)):
+            requests.append(self._index_market_request(job, metrics_input.market_index_ref))
+        if metrics_input.sector_index_ref and (not sector_index_values or _index_values_stale(sector_index_values, job)):
+            requests.append(self._index_market_request(job, metrics_input.sector_index_ref))
         if (
             any(timeframe in metrics_input.timeframes for timeframe in INTRADAY_TIMEFRAME_PRIORITY)
             and (not trades or _trades_stale(trades, job))
         ):
-            requests.append(self._external_request(job, metrics_input, "trades"))
+            for profile in profiles:
+                instrument_trades = tuple(trade for trade in trades if trade.instrument_id == profile.instrument_id)
+                if not instrument_trades or _trades_stale(instrument_trades, job):
+                    requests.append(self._instrument_trades_request(job, profile))
         return tuple(requests)
 
     def write_feature_record(self, record: FeatureRecord) -> str:
@@ -711,30 +743,96 @@ class MarketDataMetricsService:
             return None
         return float(same_session[0].open_price)
 
-    def _external_request(
-        self,
-        job: ModuleJob,
-        metrics_input: MarketDataMetricsInput,
-        request_type: str,
-    ) -> ExternalRequest:
+    def _instrument_market_request(self, job: ModuleJob, profile: InstrumentProfile, timeframe: str) -> ExternalRequest:
+        board_id = profile.board_id or "TQBR"
+        secid = profile.ticker or _strip_moex_prefix(profile.instrument_id)
         payload = {
-            "candles_ref": metrics_input.candles_ref,
-            "trades_ref": metrics_input.trades_ref,
-            "market_index_ref": metrics_input.market_index_ref,
-            "sector_index_ref": metrics_input.sector_index_ref,
-            "timeframes": list(metrics_input.timeframes),
+            "secid": secid,
+            "board_id": board_id,
+            "timeframe": timeframe,
+            "timeframes": [timeframe],
             "time_range": job.time_range.to_dict(),
         }
-        idempotency_key = f"{job.idempotency_key}:{request_type}"
+        idempotency_key = f"{job.idempotency_key}:market_data:{profile.instrument_id}:{board_id}:{timeframe}"
         return ExternalRequest(
             request_id=f"request_{_stable_hash({'idempotency_key': idempotency_key})[:24]}",
             caller_module=self.module_name,
             provider="moex_iss",
-            request_type=request_type,
+            request_type="market_data",
             universe_id=job.universe_id,
-            instrument_ids=metrics_input.instrument_ids,
+            instrument_ids=(profile.instrument_id,),
             payload=payload,
             cache_policy=CachePolicy(use_cache=True, max_age_seconds=60, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _instrument_trades_request(self, job: ModuleJob, profile: InstrumentProfile) -> ExternalRequest:
+        board_id = profile.board_id or "TQBR"
+        secid = profile.ticker or _strip_moex_prefix(profile.instrument_id)
+        payload = {
+            "secid": secid,
+            "board_id": board_id,
+            "time_range": job.time_range.to_dict(),
+        }
+        idempotency_key = f"{job.idempotency_key}:trades:{profile.instrument_id}:{board_id}"
+        return ExternalRequest(
+            request_id=f"request_{_stable_hash({'idempotency_key': idempotency_key})[:24]}",
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="trades",
+            universe_id=job.universe_id,
+            instrument_ids=(profile.instrument_id,),
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=60, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _index_market_request(self, job: ModuleJob, index_ref: str) -> ExternalRequest:
+        index_id = _ref_tail(index_ref).upper()
+        payload = {
+            "index_id": index_id,
+            "secid": index_id,
+            "board_id": "SNDX",
+            "timeframe": "1d",
+            "timeframes": ["1d"],
+            "endpoint": "/engines/stock/markets/index/boards/SNDX/securities/{secid}/candles.json",
+            "time_range": job.time_range.to_dict(),
+        }
+        idempotency_key = f"{job.idempotency_key}:market_data:{index_id}:SNDX:1d"
+        return ExternalRequest(
+            request_id=f"request_{_stable_hash({'idempotency_key': idempotency_key})[:24]}",
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="market_data",
+            universe_id=job.universe_id,
+            instrument_ids=(f"moex:{index_id}",),
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=300, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _instrument_metadata_request(self, job: ModuleJob, instrument_id: str) -> ExternalRequest:
+        secid = _strip_moex_prefix(instrument_id)
+        payload = {
+            "secid": secid,
+            "board_id": "TQBR",
+        }
+        idempotency_key = f"{job.idempotency_key}:instruments:{instrument_id}:TQBR"
+        return ExternalRequest(
+            request_id=f"request_{_stable_hash({'idempotency_key': idempotency_key})[:24]}",
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="instruments",
+            universe_id=job.universe_id,
+            instrument_ids=(instrument_id,),
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=86400, write_cache=True),
             timeout_ms=5000,
             retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
             idempotency_key=idempotency_key,
@@ -906,3 +1004,12 @@ def _required_float(value: float | None) -> float:
 def _stable_hash(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _ref_tail(ref: str) -> str:
+    return str(ref).rsplit(":", 1)[-1] if ":" in str(ref) else str(ref)
+
+
+def _strip_moex_prefix(value: str) -> str:
+    text = str(value or "")
+    return text.split(":", 1)[1] if text.startswith("moex:") else text

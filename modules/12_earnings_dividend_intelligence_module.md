@@ -66,6 +66,12 @@
 
 Через Gateway запрашивает issuer disclosures, reports, dividend data, market data for gap history, LLM extraction.
 
+MOEX ISS dividend-gap market requests:
+
+- Historical gap candles must be requested separately for every instrument.
+- Each request must include exactly one `instrument_id`, explicit `payload.secid`, `payload.board_id`, `payload.timeframe=1d` and `time_range`.
+- The module must not create one MOEX `market_data` request for all dividend instruments.
+
 ## 7. Processing rules
 
 - `extract_financial_facts`

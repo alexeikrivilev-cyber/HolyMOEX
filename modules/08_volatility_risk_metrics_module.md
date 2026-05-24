@@ -71,6 +71,13 @@ Intraday-часть запускается при обновлении candles. 
 
 Запрашивает market/index/macro series через Gateway только при отсутствии свежих raw data.
 
+MOEX ISS raw-market requests:
+
+- Instrument candles must be requested separately for every `instrument_id` and timeframe.
+- Every request must include exactly one `instrument_id`, explicit `payload.secid`, `payload.board_id`, `payload.timeframe` and `time_range`.
+- Market and sector index candles must be requested as separate single-secid index requests.
+- The module must not create a single MOEX `market_data` request for the whole `instrument_ids` list.
+
 ## 7. Processing rules
 
 - `compute_realized_volatility`

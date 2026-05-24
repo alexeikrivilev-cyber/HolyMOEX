@@ -836,13 +836,16 @@ class DerivativesPositioningService:
         futures_expected = bool(derivatives_input.futures_refs) or not derivatives_input.options_refs
         options_expected = bool(derivatives_input.options_refs) or not derivatives_input.futures_refs
         if futures_expected and (not futures or _futures_stale(futures, job, self._alignment_seconds(job))):
-            requests.append(self._external_request(job, derivatives_input, "market_data", "futures_open_interest"))
+            for profile in profiles:
+                requests.append(self._external_request(job, derivatives_input, "market_data", "futures_open_interest", profile))
         if options_expected and (not options or _options_stale(options, job, self._alignment_seconds(job))):
-            requests.append(self._external_request(job, derivatives_input, "market_data", "options_chain"))
+            for profile in profiles:
+                requests.append(self._external_request(job, derivatives_input, "market_data", "options_chain", profile))
         if (derivatives_input.spot_refs or futures_expected or options_expected) and (
             not spots or _spots_stale(spots, job, self._alignment_seconds(job))
         ):
-            requests.append(self._external_request(job, derivatives_input, "market_data", "spot_reference"))
+            for profile in profiles:
+                requests.append(self._external_request(job, derivatives_input, "market_data", "spot_reference", profile))
         return tuple(requests)
 
     def output_horizons(self, job: ModuleJob) -> tuple[str, ...]:
@@ -1012,17 +1015,26 @@ class DerivativesPositioningService:
         derivatives_input: DerivativesPositioningInput,
         request_type: str,
         data_kind: str = "",
+        profile: InstrumentProfile | None = None,
     ) -> ExternalRequest:
         suffix = data_kind or request_type
-        idempotency_key = f"{job.idempotency_key}:{suffix}"
+        instrument_ids = (profile.instrument_id,) if profile is not None else derivatives_input.instrument_ids
+        instrument_suffix = f":{profile.instrument_id}" if profile is not None else ""
+        board_id = str((profile.metadata.get("board_id") if profile is not None else "") or "TQBR")
+        secid = (profile.ticker if profile is not None and profile.ticker else _strip_moex_prefix(instrument_ids[0])) if instrument_ids else ""
+        idempotency_key = f"{job.idempotency_key}:{suffix}{instrument_suffix}:{board_id}"
         return ExternalRequest(
             request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
             caller_module=self.module_name,
             provider="moex_iss",
             request_type=request_type,
             universe_id=job.universe_id,
-            instrument_ids=derivatives_input.instrument_ids,
+            instrument_ids=instrument_ids,
             payload={
+                "secid": secid,
+                "board_id": board_id,
+                "timeframe": "1d",
+                "timeframes": ["1d"],
                 "futures_refs": list(derivatives_input.futures_refs),
                 "options_refs": list(derivatives_input.options_refs),
                 "spot_refs": list(derivatives_input.spot_refs),
@@ -1335,6 +1347,11 @@ def _required_non_negative_float(value: Any, field_name: str) -> float:
     if parsed < 0:
         raise DerivativesPositioningError(f"{field_name} must be non-negative")
     return parsed
+
+
+def _strip_moex_prefix(value: str) -> str:
+    text = str(value or "")
+    return text.split(":", 1)[1] if text.startswith("moex:") else text
 
 
 def _scale_positive_to_unit(value: float | None, upper_reference: float) -> float | None:

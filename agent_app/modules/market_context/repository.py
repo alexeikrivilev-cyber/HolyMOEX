@@ -14,8 +14,12 @@ class RawMacroPoint:
     series_id: str
     point_ts: str
     value: float | None
+    series_name: str | None = None
     unit: str | None = None
     provider: str = ""
+    source_url: str | None = None
+    confidence_score: float = 1.0
+    quality_flags: tuple[str, ...] = ()
     source_payload: Mapping[str, Any] = field(default_factory=dict)
     received_at: str | None = None
 
@@ -25,10 +29,14 @@ class RawMacroPoint:
         return cls(
             raw_macro_point_id=str(payload.get("raw_macro_point_id") or payload.get("id") or ""),
             series_id=str(payload.get("series_id") or ""),
+            series_name=_optional_text(payload.get("series_name")),
             point_ts=str(payload.get("point_ts") or payload.get("value_ts") or ""),
             value=_optional_float(payload.get("value")),
             unit=_optional_text(payload.get("unit")),
             provider=str(payload.get("provider") or ""),
+            source_url=_optional_text(payload.get("source_url")),
+            confidence_score=_optional_float(payload.get("confidence_score")) or 1.0,
+            quality_flags=_string_tuple(payload.get("quality_flags")),
             source_payload=source_payload if isinstance(source_payload, Mapping) else {},
             received_at=_optional_text(payload.get("received_at")),
         )
@@ -429,8 +437,8 @@ class PostgresMarketContextRepository:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT raw_macro_point_id, series_id, point_ts, value, unit,
-                           provider, source_payload, received_at
+                    SELECT raw_macro_point_id, series_id, series_name, point_ts, value, unit,
+                           provider, source_url, confidence_score, quality_flags, source_payload, received_at
                       FROM raw_macro.raw_macro_point
                      WHERE series_id = ANY(%s)
                        AND point_ts BETWEEN %s AND %s
@@ -443,12 +451,16 @@ class PostgresMarketContextRepository:
             RawMacroPoint(
                 raw_macro_point_id=str(row[0]),
                 series_id=row[1] or "",
-                point_ts=_iso(row[2]),
-                value=_optional_float(row[3]),
-                unit=_optional_text(row[4]),
-                provider=row[5] or "",
-                source_payload=row[6] or {},
-                received_at=_iso(row[7]) if row[7] else None,
+                series_name=_optional_text(row[2]),
+                point_ts=_iso(row[3]),
+                value=_optional_float(row[4]),
+                unit=_optional_text(row[5]),
+                provider=row[6] or "",
+                source_url=_optional_text(row[7]),
+                confidence_score=_optional_float(row[8]) or 1.0,
+                quality_flags=tuple(row[9] or ()),
+                source_payload=row[10] or {},
+                received_at=_iso(row[11]) if row[11] else None,
             )
             for row in rows
         )
@@ -771,6 +783,16 @@ def _optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple, set)):
+        return tuple(str(item) for item in value if str(item or "").strip())
+    return (str(value),)
 
 
 def _iso(value: Any) -> str:

@@ -533,11 +533,16 @@ class CorporateActionsAdjustmentService:
         if not events:
             requests.append(self._external_request(job, module_input, "issuer_disclosure", "text_fetch", "corporate_action_disclosures"))
         if len(profiles) < len(module_input.instrument_ids):
-            requests.append(self._external_request(job, module_input, "moex_iss", "instruments", "instrument_metadata"))
+            known = {profile.instrument_id for profile in profiles}
+            for instrument_id in module_input.instrument_ids:
+                if instrument_id not in known:
+                    requests.append(self._moex_instrument_request(job, instrument_id, "instrument_metadata"))
         if not candles:
-            requests.append(self._external_request(job, module_input, "moex_iss", "market_data", "historical_prices"))
+            for profile in profiles:
+                requests.append(self._moex_market_data_request(job, profile, "historical_prices"))
         if any(self.classify_corporate_action(event) in {"halt", "delisting", "ticker_change"} for event in events):
-            requests.append(self._external_request(job, module_input, "moex_iss", "instruments", "trading_status"))
+            for profile in profiles:
+                requests.append(self._moex_instrument_request(job, profile.instrument_id, "trading_status"))
         return tuple(requests)
 
     def classify_corporate_action(self, event: StructuredEvent) -> str:
@@ -1068,6 +1073,48 @@ class CorporateActionsAdjustmentService:
             idempotency_key=idempotency_key,
         )
 
+    def _moex_market_data_request(self, job: ModuleJob, profile: InstrumentProfile, suffix: str) -> ExternalRequest:
+        board_id = profile.board_id or "TQBR"
+        secid = profile.ticker or _strip_moex_prefix(profile.instrument_id)
+        idempotency_key = f"{job.idempotency_key}:{suffix}:{profile.instrument_id}:{board_id}:1d"
+        return ExternalRequest(
+            request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="market_data",
+            universe_id=job.universe_id,
+            instrument_ids=(profile.instrument_id,),
+            payload={
+                "secid": secid,
+                "board_id": board_id,
+                "timeframe": "1d",
+                "timeframes": ["1d"],
+                "time_range": job.time_range.to_dict(),
+                "gateway_only": True,
+            },
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=24 * 60 * 60, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _moex_instrument_request(self, job: ModuleJob, instrument_id: str, suffix: str) -> ExternalRequest:
+        secid = _strip_moex_prefix(instrument_id)
+        idempotency_key = f"{job.idempotency_key}:{suffix}:{instrument_id}:TQBR"
+        return ExternalRequest(
+            request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="instruments",
+            universe_id=job.universe_id,
+            instrument_ids=(instrument_id,),
+            payload={"secid": secid, "board_id": "TQBR", "gateway_only": True},
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=24 * 60 * 60, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
     def _gateway_process(self, request: ExternalRequest) -> Any:
         if hasattr(self.gateway, "process"):
             return self.gateway.process(request)
@@ -1273,6 +1320,11 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _strip_moex_prefix(value: str) -> str:
+    text = str(value or "")
+    return text.split(":", 1)[1] if text.startswith("moex:") else text
 
 
 def _metric_confidence(base: float, quality_flags: tuple[str, ...]) -> float:

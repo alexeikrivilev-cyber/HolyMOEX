@@ -799,9 +799,11 @@ class FundamentalValuationService:
         if not statements:
             requests.append(self._external_request(job, fundamental_input, "issuer_disclosure", "text_fetch"))
         if not market_data or any(_market_cap_stale(record, job) for record in market_data):
-            requests.append(self._external_request(job, fundamental_input, "moex_iss", "market_data"))
+            for instrument_id in fundamental_input.instrument_ids:
+                requests.append(self._moex_market_data_request(job, instrument_id, "market_data"))
         if not peer_groups and fundamental_input.peer_group_ref:
-            requests.append(self._external_request(job, fundamental_input, "moex_iss", "market_data", suffix="peer_group"))
+            for instrument_id in fundamental_input.instrument_ids:
+                requests.append(self._moex_market_data_request(job, instrument_id, "peer_group"))
         return tuple(requests)
 
     def write_feature_record(self, record: FeatureRecord) -> str:
@@ -874,6 +876,31 @@ class FundamentalValuationService:
             request_type=request_type,
             universe_id=job.universe_id,
             instrument_ids=fundamental_input.instrument_ids,
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=MARKET_DEPENDENT_TTL_SECONDS, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _moex_market_data_request(self, job: ModuleJob, instrument_id: str, suffix: str) -> ExternalRequest:
+        secid = _strip_moex_prefix(instrument_id)
+        payload = {
+            "secid": secid,
+            "board_id": "TQBR",
+            "timeframe": "1d",
+            "timeframes": ["1d"],
+            "time_range": job.time_range.to_dict(),
+            "gateway_only": True,
+        }
+        idempotency_key = f"{job.idempotency_key}:{suffix}:{instrument_id}:TQBR:1d"
+        return ExternalRequest(
+            request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="market_data",
+            universe_id=job.universe_id,
+            instrument_ids=(instrument_id,),
             payload=payload,
             cache_policy=CachePolicy(use_cache=True, max_age_seconds=MARKET_DEPENDENT_TTL_SECONDS, write_cache=True),
             timeout_ms=5000,
@@ -1055,3 +1082,8 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _strip_moex_prefix(value: str) -> str:
+    text = str(value or "")
+    return text.split(":", 1)[1] if text.startswith("moex:") else text

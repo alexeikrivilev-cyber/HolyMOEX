@@ -69,6 +69,13 @@
 
 ## 7. Processing rules
 
+MOEX ISS intake contract:
+
+- `orderbook` and `trades` requests are generated separately for every active `Selected Instruments DB` profile.
+- Each request carries exactly one `instrument_id`, explicit `secid`, `board_id`, `time_range.from_ts` and `time_range.to_ts`.
+- The module must re-read `raw_market.raw_orderbook` and `raw_market.raw_trade` after Gateway processing before computing liquidity metrics.
+- Missing profiles may trigger per-instrument `instruments` metadata requests only; multi-instrument `market_data`, `orderbook` or `trades` requests are forbidden.
+
 - `compute_bid_ask_spread`
 - `select_latest_orderbook_candidate`
 - `classify_orderbook_freshness`

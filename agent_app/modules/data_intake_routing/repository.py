@@ -575,11 +575,12 @@ class PostgresDataIntakeRoutingRepository:
                 cur.execute(
                     """
                     SELECT raw_text_item_id, universe_id, instrument_ids,
-                           COALESCE(source_type, source) AS source_type,
+                           COALESCE(source_type, source) AS source_type, source,
                            source_url, title, body, language, published_at,
                            fetched_at, content_hash, source_payload,
                            discovery_run_id, discovery_item_id, discovery_mode,
-                           external_request_id
+                           external_request_id, trust_level, confidence_score,
+                           instrument_candidates, issuer_candidates, quality_flags
                       FROM raw_text.raw_text_item
                      WHERE content_hash = %s
                     """,
@@ -594,11 +595,12 @@ class PostgresDataIntakeRoutingRepository:
                 cur.execute(
                     """
                     SELECT raw_text_item_id, universe_id, instrument_ids,
-                           COALESCE(source_type, source) AS source_type,
+                           COALESCE(source_type, source) AS source_type, source,
                            source_url, title, body, language, published_at,
                            fetched_at, content_hash, source_payload,
                            discovery_run_id, discovery_item_id, discovery_mode,
-                           external_request_id
+                           external_request_id, trust_level, confidence_score,
+                           instrument_candidates, issuer_candidates, quality_flags
                       FROM raw_text.raw_text_item
                      WHERE universe_id = %s
                      ORDER BY fetched_at DESC
@@ -624,14 +626,15 @@ class PostgresDataIntakeRoutingRepository:
                     INSERT INTO raw_text.raw_text_item (
                         universe_id, instrument_ids, source, source_type, source_url, title, body,
                         language, published_at, fetched_at, content_hash, source_payload,
-                        discovery_run_id, discovery_item_id, discovery_mode, external_request_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now()), %s, %s, %s, %s, %s, %s)
+                        discovery_run_id, discovery_item_id, discovery_mode, external_request_id,
+                        trust_level, confidence_score, instrument_candidates, issuer_candidates, quality_flags
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now()), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING raw_text_item_id
                     """,
                     (
                         _value(item, "universe_id"),
                         list(_value(item, "instrument_ids", ())),
-                        _value(item, "source_type"),
+                        _value(item, "source", None) or _value(item, "source_type"),
                         _value(item, "source_type"),
                         _value(item, "source_url"),
                         _value(item, "title"),
@@ -645,6 +648,11 @@ class PostgresDataIntakeRoutingRepository:
                         _optional_uuid_text(_value(item, "discovery_item_id")),
                         _value(item, "discovery_mode"),
                         _value(item, "external_request_id"),
+                        _value(item, "trust_level"),
+                        _value(item, "confidence_score"),
+                        Jsonb(list(_value(item, "instrument_candidates", ()) or ())),
+                        Jsonb(list(_value(item, "issuer_candidates", ()) or ())),
+                        list(_value(item, "quality_flags", ()) or ()),
                     ),
                 )
                 row = cur.fetchone()
@@ -657,11 +665,12 @@ class PostgresDataIntakeRoutingRepository:
                 cur.execute(
                     """
                     SELECT raw_text_item_id, universe_id, instrument_ids,
-                           COALESCE(source_type, source) AS source_type,
+                           COALESCE(source_type, source) AS source_type, source,
                            source_url, title, body, language, published_at,
                            fetched_at, content_hash, source_payload,
                            discovery_run_id, discovery_item_id, discovery_mode,
-                           external_request_id
+                           external_request_id, trust_level, confidence_score,
+                           instrument_candidates, issuer_candidates, quality_flags
                       FROM raw_text.raw_text_item
                      WHERE raw_text_item_id = %s
                     """,
@@ -774,7 +783,7 @@ def _raw_text_item_from_row(row: Any | None) -> Any | None:
         return None
     from .service import RawTextItem
 
-    source_payload = row[11] or {}
+    source_payload = row[12] or {}
     source_type = row[3] or source_payload.get("source_type") or "unknown"
     if source_type == "macro_api":
         source_type = "macro_text"
@@ -783,19 +792,25 @@ def _raw_text_item_from_row(row: Any | None) -> Any | None:
         universe_id=row[1] or "",
         instrument_ids=tuple(row[2] or ()),
         source_type=source_type,
-        source_ref=str(source_payload.get("source_ref") or row[4] or row[0]),
-        source_url=row[4],
-        title=row[5] or "",
-        body=row[6] or "",
-        language=row[7] or "unknown",
-        published_at=row[8].isoformat().replace("+00:00", "Z") if row[8] else None,
-        fetched_at=row[9].isoformat().replace("+00:00", "Z") if row[9] else None,
-        content_hash=row[10] or "",
+        source=row[4] or source_payload.get("source") or source_type,
+        source_ref=str(source_payload.get("source_ref") or row[5] or row[0]),
+        source_url=row[5],
+        title=row[6] or "",
+        body=row[7] or "",
+        language=row[8] or "unknown",
+        published_at=row[9].isoformat().replace("+00:00", "Z") if row[9] else None,
+        fetched_at=row[10].isoformat().replace("+00:00", "Z") if row[10] else None,
+        content_hash=row[11] or "",
         source_payload=source_payload,
-        discovery_run_id=row[12],
-        discovery_item_id=str(row[13]) if row[13] else None,
-        discovery_mode=row[14],
-        external_request_id=row[15],
+        discovery_run_id=row[13],
+        discovery_item_id=str(row[14]) if row[14] else None,
+        discovery_mode=row[15],
+        external_request_id=row[16],
+        trust_level=row[17],
+        confidence_score=float(row[18] or 0.0),
+        instrument_candidates=tuple(dict(item) for item in (row[19] or ()) if isinstance(item, Mapping)),
+        issuer_candidates=tuple(dict(item) for item in (row[20] or ()) if isinstance(item, Mapping)),
+        quality_flags=tuple(row[21] or ()),
     )
 
 

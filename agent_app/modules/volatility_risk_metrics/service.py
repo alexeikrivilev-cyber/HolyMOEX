@@ -852,7 +852,14 @@ class VolatilityRiskMetricsService:
             or _index_values_stale(market_index_values, job)
             or _index_values_stale(sector_index_values, job)
         ):
-            requests.append(self._external_request(job, metrics_input, "moex_iss", "market_data"))
+            for instrument_id in metrics_input.instrument_ids:
+                instrument_candles = tuple(candle for candle in candles if candle.instrument_id == instrument_id)
+                if not instrument_candles or _candles_stale(instrument_candles, job):
+                    requests.append(self._moex_market_data_request(job, instrument_id, "1d"))
+            if metrics_input.market_index_ref and (not market_index_values or _index_values_stale(market_index_values, job)):
+                requests.append(self._moex_index_request(job, metrics_input.market_index_ref))
+            if metrics_input.sector_index_ref and (not sector_index_values or _index_values_stale(sector_index_values, job)):
+                requests.append(self._moex_index_request(job, metrics_input.sector_index_ref))
         if metrics_input.macro_refs and (not macro_points or _macro_points_stale(macro_points, job)):
             requests.append(self._external_request(job, metrics_input, "macro_api", "macro_series"))
         return tuple(requests)
@@ -918,6 +925,56 @@ class VolatilityRiskMetricsService:
             instrument_ids=metrics_input.instrument_ids,
             payload=payload,
             cache_policy=CachePolicy(use_cache=True, max_age_seconds=60, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _moex_market_data_request(self, job: ModuleJob, instrument_id: str, timeframe: str) -> ExternalRequest:
+        secid = _strip_moex_prefix(instrument_id)
+        payload = {
+            "secid": secid,
+            "board_id": "TQBR",
+            "timeframe": timeframe,
+            "timeframes": [timeframe],
+            "time_range": job.time_range.to_dict(),
+        }
+        idempotency_key = f"{job.idempotency_key}:market_data:{instrument_id}:TQBR:{timeframe}"
+        return ExternalRequest(
+            request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="market_data",
+            universe_id=job.universe_id,
+            instrument_ids=(instrument_id,),
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=60, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _moex_index_request(self, job: ModuleJob, index_ref: str) -> ExternalRequest:
+        index_id = _ref_tail(index_ref).upper()
+        payload = {
+            "index_id": index_id,
+            "secid": index_id,
+            "board_id": "SNDX",
+            "timeframe": "1d",
+            "timeframes": ["1d"],
+            "endpoint": "/engines/stock/markets/index/boards/SNDX/securities/{secid}/candles.json",
+            "time_range": job.time_range.to_dict(),
+        }
+        idempotency_key = f"{job.idempotency_key}:market_data:{index_id}:SNDX:1d"
+        return ExternalRequest(
+            request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="market_data",
+            universe_id=job.universe_id,
+            instrument_ids=(f"moex:{index_id}",),
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=300, write_cache=True),
             timeout_ms=5000,
             retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
             idempotency_key=idempotency_key,
@@ -1218,3 +1275,12 @@ def _macro_points_stale(points: tuple[RawMacroPoint, ...], job: ModuleJob) -> bo
 
 def _date_key(timestamp: str) -> str:
     return parse_utc_iso(timestamp).date().isoformat()
+
+
+def _ref_tail(ref: str) -> str:
+    return str(ref).rsplit(":", 1)[-1] if ":" in str(ref) else str(ref)
+
+
+def _strip_moex_prefix(value: str) -> str:
+    text = str(value or "")
+    return text.split(":", 1)[1] if text.startswith("moex:") else text

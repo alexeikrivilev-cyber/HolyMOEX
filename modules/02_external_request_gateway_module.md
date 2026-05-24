@@ -205,6 +205,10 @@ If provider payload cannot be mapped to the target raw table without inventing v
 - `trades`: normalized HTTP request to trades endpoint.
 - `orderbook`: normalized HTTP request to orderbook/depth endpoint.
 - Gateway may use provider default paths from `Provider Config Store`; caller-provided `payload.path` is allowed only as transport routing metadata.
+- `market_data`, `trades` and `orderbook` requests must be per instrument/per board. Gateway rejects MOEX market/trade/orderbook requests with zero or more than one `instrument_id`.
+- Callers must pass explicit `payload.secid`, `payload.board_id`; `market_data` must also pass `payload.timeframe`, and `market_data`/`trades` must pass `time_range.from_ts/to_ts`; Gateway maps `1m/5m/10m/15m/1h/1d` to MOEX ISS `interval`.
+- Raw market persistence must not fallback to the first request instrument. If provider `secid` conflicts with the single requested instrument, the row is skipped.
+- Raw market persistence is idempotent by natural keys: candles use `provider + instrument_id + universe_id + board_id + timeframe + open_ts`; trades use `provider + instrument_id + universe_id + trade_ts + price + quantity + side`; orderbook uses `provider + instrument_id + universe_id + snapshot_ts`; index values use `provider + index_id + value_ts`.
 
 ### `news_api` / `issuer_disclosure`
 
@@ -212,12 +216,17 @@ If provider payload cannot be mapped to the target raw table without inventing v
 - `text_fetch`: normalized HTTP fetch request; fetched document text is written to `raw_text.raw_text_item`.
 - Concrete public sources are configured through `raw_text.text_source_config.query_template.endpoint`; provider names remain generic (`news_api`, `issuer_disclosure`) to preserve the gateway contract.
 - RSS/Atom responses from public news feeds are normalized into `items` with `title`, `url`, `body`, `published_at` and `source_ref` before raw-store persistence.
+- HTML public pages are normalized into title/body snippets when a source has no JSON/RSS response.
+- Raw text persistence keeps source-specific metadata (`source`, `source_type`, `trust_level`, `confidence_score`, `instrument_candidates`, `issuer_candidates`, `quality_flags`) alongside provider payload.
 - Ordinary news providers may create event candidates only; official disclosure/issuer/MOEX/CBR sources are required for confirmed corporate events.
 
 ### `macro_api`
 
 - `macro_series`: normalized HTTP series request; points are written to `raw_macro.raw_macro_point` when `series_id`, timestamp and value are available.
 - Public macro/news endpoints for CBR, MOEX ISS and optional public macro sources are configured in `Provider Config Store` and `Text Source Config`; analytical modules must still access them only through Gateway.
+- Source-specific public parsers are supported for CBR XML dynamic FX rates, CBR public HTML tables, FRED/EIA CSV daily oil series and MOEX ISS JSON tables.
+- Every persisted `macro_series` point must carry `provider`, `series_name`, `point_ts`, `value`, `unit`, `source_url`, `confidence_score` and `quality_flags`.
+- CBR official rows are high-trust macro inputs; FRED/EIA public commodity rows are external public macro inputs; generic HTML table extraction must be flagged through `quality_flags` and never silently upgraded to an unflagged source.
 
 ### `arena_go`
 

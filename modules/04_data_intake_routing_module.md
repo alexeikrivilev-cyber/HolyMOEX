@@ -53,6 +53,23 @@
 
 RSS/news feeds that cannot search per ticker must use `source_policy.fetch_scope = "market_wide_once"`: the module fetches the feed once per run, then maps items to instruments internally by aliases. Sources with `source_policy.requires_endpoint = true` are skipped with `source_missing_endpoint` until the selected instrument metadata contains the required endpoint.
 
+Every stored `raw_text_item` must carry normalized product-intake metadata:
+
+- `source` / `source_type`
+- `source_url`
+- `published_at`
+- `fetched_at`
+- `title`
+- `body` or snippet
+- `language`
+- `trust_level`
+- `confidence_score`
+- `instrument_candidates`
+- `issuer_candidates`
+- `quality_flags`
+
+Fast news sources are saved as `candidate_early_signal`. Official disclosure, CBR/MOEX regulatory text, and issuer corporate sites are the confirmation layer. A fast-news item about dividend, earnings, or corporate action must receive `requires_official_confirmation` until an official source confirms it.
+
 ## 4. Input classification
 
 - `instrument_profile`
@@ -192,6 +209,8 @@ RSS/news feeds that cannot search per ticker must use `source_policy.fetch_scope
 - `duplicates_detected`
 - `routing_targets_explicit`
 - `raw_text_items_have_source_ref`
+- `raw_text_items_have_trust_candidates_confidence_and_quality_flags`
+- `ordinary_news_is_candidate_until_official_confirmation`
 - `no_trading_features_written_by_intake_module`
 
 ## 15. Metric formulas / calculation rules

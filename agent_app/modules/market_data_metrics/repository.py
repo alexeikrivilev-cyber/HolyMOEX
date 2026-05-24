@@ -13,6 +13,7 @@ class InstrumentProfile:
     ticker: str
     sector: str | None = None
     is_active: bool = True
+    board_id: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "InstrumentProfile":
@@ -20,6 +21,7 @@ class InstrumentProfile:
             instrument_id=str(payload.get("instrument_id") or ""),
             universe_id=str(payload.get("universe_id") or ""),
             ticker=str(payload.get("ticker") or ""),
+            board_id=_optional_text(payload.get("board_id")),
             sector=_optional_text(payload.get("sector")),
             is_active=bool(payload.get("is_active", True)),
         )
@@ -350,7 +352,7 @@ class PostgresMarketDataMetricsRepository:
     ) -> tuple[InstrumentProfile, ...]:
         requested = list(instrument_ids)
         query = """
-            SELECT instrument_id, universe_id, ticker, sector, is_active
+            SELECT instrument_id, universe_id, ticker, board_id, sector, is_active
               FROM registry.instrument_profile
              WHERE universe_id = %s
                AND is_active = true
@@ -369,8 +371,9 @@ class PostgresMarketDataMetricsRepository:
                 instrument_id=row[0],
                 universe_id=row[1],
                 ticker=row[2],
-                sector=row[3],
-                is_active=bool(row[4]),
+                board_id=row[3],
+                sector=row[4],
+                is_active=bool(row[5]),
             )
             for row in rows
         )

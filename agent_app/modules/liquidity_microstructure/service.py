@@ -249,6 +249,21 @@ class LiquidityMicrostructureService:
                 if self.gateway is not None:
                     self.gateway.process(request)
             warnings.extend(f"external_request_created:{request.request_id}" for request in external_requests)
+            if external_requests and self.gateway is not None:
+                orderbooks = self.repository.list_orderbooks(
+                    orderbook_ref=liquidity_input.orderbook_ref,
+                    universe_id=job.universe_id,
+                    instrument_ids=active_ids,
+                    from_ts=job.time_range.from_ts,
+                    to_ts=job.time_range.to_ts,
+                )
+                trades = self.repository.list_trades(
+                    trades_ref=liquidity_input.trades_ref,
+                    universe_id=job.universe_id,
+                    instrument_ids=active_ids,
+                    from_ts=job.time_range.from_ts,
+                    to_ts=job.time_range.to_ts,
+                )
 
             feature_records, hints, compute_warnings = self.compute_outputs(
                 liquidity_input=liquidity_input,
@@ -706,11 +721,18 @@ class LiquidityMicrostructureService:
     ) -> tuple[ExternalRequest, ...]:
         requests: list[ExternalRequest] = []
         if len(profiles) < len(liquidity_input.instrument_ids):
-            requests.append(self._external_request(job, liquidity_input, "market_data"))
-        if not orderbooks or any(_orderbook_stale(orderbook, job) for orderbook in _latest_orderbooks(orderbooks)):
-            requests.append(self._external_request(job, liquidity_input, "orderbook"))
-        if not trades or _trades_stale(trades, job):
-            requests.append(self._external_request(job, liquidity_input, "trades"))
+            active_set = {profile.instrument_id for profile in profiles}
+            for instrument_id in liquidity_input.instrument_ids:
+                if instrument_id not in active_set:
+                    requests.append(self._instrument_metadata_request(job, instrument_id))
+        latest_by_instrument = {orderbook.instrument_id: orderbook for orderbook in _latest_orderbooks(orderbooks)}
+        for profile in profiles:
+            latest_orderbook = latest_by_instrument.get(profile.instrument_id)
+            if latest_orderbook is None or _orderbook_stale(latest_orderbook, job):
+                requests.append(self._instrument_orderbook_request(job, profile))
+            instrument_trades = tuple(trade for trade in trades if trade.instrument_id == profile.instrument_id)
+            if not instrument_trades or _trades_stale(instrument_trades, job):
+                requests.append(self._instrument_trades_request(job, profile))
         return tuple(requests)
 
     def write_feature_record(self, record: FeatureRecord) -> str:
@@ -780,30 +802,68 @@ class LiquidityMicrostructureService:
             return None
         return weighted_average(component_values, active_weights)
 
-    def _external_request(
-        self,
-        job: ModuleJob,
-        liquidity_input: LiquidityMicrostructureInput,
-        request_type: str,
-    ) -> ExternalRequest:
+    def _instrument_orderbook_request(self, job: ModuleJob, profile: InstrumentProfile) -> ExternalRequest:
+        board_id = profile.board_id or "TQBR"
+        secid = profile.ticker or _strip_moex_prefix(profile.instrument_id)
         payload = {
-            "orderbook_ref": liquidity_input.orderbook_ref,
-            "trades_ref": liquidity_input.trades_ref,
-            "quotes_ref": liquidity_input.quotes_ref,
-            "depth_levels": list(liquidity_input.depth_levels),
-            "notional_scenarios": list(liquidity_input.notional_scenarios),
+            "secid": secid,
+            "board_id": board_id,
             "time_range": job.time_range.to_dict(),
         }
-        idempotency_key = f"{job.idempotency_key}:{request_type}"
+        idempotency_key = f"{job.idempotency_key}:orderbook:{profile.instrument_id}:{board_id}"
         return ExternalRequest(
             request_id=f"request_{_stable_hash({'idempotency_key': idempotency_key})[:24]}",
             caller_module=self.module_name,
             provider="moex_iss",
-            request_type=request_type,
+            request_type="orderbook",
             universe_id=job.universe_id,
-            instrument_ids=liquidity_input.instrument_ids,
+            instrument_ids=(profile.instrument_id,),
             payload=payload,
-            cache_policy=CachePolicy(use_cache=True, max_age_seconds=30 if request_type == "orderbook" else 60, write_cache=True),
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=30, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _instrument_trades_request(self, job: ModuleJob, profile: InstrumentProfile) -> ExternalRequest:
+        board_id = profile.board_id or "TQBR"
+        secid = profile.ticker or _strip_moex_prefix(profile.instrument_id)
+        payload = {
+            "secid": secid,
+            "board_id": board_id,
+            "time_range": job.time_range.to_dict(),
+        }
+        idempotency_key = f"{job.idempotency_key}:trades:{profile.instrument_id}:{board_id}"
+        return ExternalRequest(
+            request_id=f"request_{_stable_hash({'idempotency_key': idempotency_key})[:24]}",
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="trades",
+            universe_id=job.universe_id,
+            instrument_ids=(profile.instrument_id,),
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=60, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _instrument_metadata_request(self, job: ModuleJob, instrument_id: str) -> ExternalRequest:
+        secid = _strip_moex_prefix(instrument_id)
+        payload = {
+            "secid": secid,
+            "board_id": "TQBR",
+        }
+        idempotency_key = f"{job.idempotency_key}:instruments:{instrument_id}:TQBR"
+        return ExternalRequest(
+            request_id=f"request_{_stable_hash({'idempotency_key': idempotency_key})[:24]}",
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="instruments",
+            universe_id=job.universe_id,
+            instrument_ids=(instrument_id,),
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=86400, write_cache=True),
             timeout_ms=5000,
             retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
             idempotency_key=idempotency_key,
@@ -930,3 +990,8 @@ def _trades_stale(trades: tuple[RawTrade, ...], job: ModuleJob) -> bool:
 def _stable_hash(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _strip_moex_prefix(value: str) -> str:
+    text = str(value or "")
+    return text.split(":", 1)[1] if text.startswith("moex:") else text

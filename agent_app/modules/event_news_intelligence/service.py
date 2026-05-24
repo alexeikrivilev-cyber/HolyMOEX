@@ -114,11 +114,32 @@ DEFAULT_EVENT_PRESSURE_WEIGHTS = {
     "news_novelty_score": 1.0,
     "event_decay_score": 1.0,
 }
+OFFICIAL_CONFIRMATION_SOURCE_TYPES = {
+    "issuer_disclosure",
+    "prime_disclosure",
+    "akm_disclosure",
+    "corporate_site",
+    "regulatory_text",
+    "cbr_macro",
+    "moex_macro",
+    "macro_text",
+}
+OFFICIAL_CONFIRMATION_REQUIRED_EVENT_TYPES = {"corporate_action", "dividend", "earnings"}
 SOURCE_CREDIBILITY_DEFAULTS = {
     "issuer_disclosure": 0.9,
+    "prime_disclosure": 0.9,
+    "akm_disclosure": 0.88,
     "regulatory_text": 0.9,
+    "cbr_macro": 0.9,
+    "moex_macro": 0.88,
     "corporate_site": 0.85,
     "news_api": 0.7,
+    "rbc_news": 0.75,
+    "tass_news": 0.75,
+    "interfax_news": 0.75,
+    "prime_news": 0.75,
+    "finam_news": 0.70,
+    "smartlab_news": 0.55,
     "macro_text": 0.75,
     "macro_api": 0.75,
 }
@@ -560,6 +581,7 @@ class EventNewsIntelligenceService:
                     event=event,
                     event_input=event_input,
                     job=job,
+                    profiles=profiles,
                 )
                 event_reactions.extend(reactions)
                 for instrument_id in event.instrument_ids:
@@ -691,7 +713,10 @@ class EventNewsIntelligenceService:
             )
         )
         scores = self._event_scores(item, envelope, raw_item, profiles, instrument_ids, event_type)
+        confirmation_status = self._confirmation_status(raw_item, event_type)
         reason_codes = self.assign_reason_codes(item, envelope, scores=scores, event_type=event_type)
+        if confirmation_status != "official_confirmed":
+            reason_codes = tuple(dict.fromkeys((*reason_codes, confirmation_status)))
         event_payload = {
             "schema_version": envelope.schema_version,
             "task_type": envelope.task_type,
@@ -699,6 +724,10 @@ class EventNewsIntelligenceService:
             "llm_prompt_version": event_input.llm_prompt_version,
             "event_ontology_version": event_input.event_ontology_version,
             "source_type": raw_item.source_type or raw_item.source,
+            "source": raw_item.source,
+            "trust_level": raw_item.source_payload.get("trust_level"),
+            "confirmation_status": confirmation_status,
+            "official_confirmation_required": confirmation_status == "candidate_requires_official_confirmation",
             "content_hash": raw_item.content_hash,
             "item_index": item_index,
             "source_credibility_score": scores["source_credibility_score"],
@@ -836,12 +865,13 @@ class EventNewsIntelligenceService:
         event: StructuredEvent,
         event_input: EventNewsInput,
         job: ModuleJob,
+        profiles: tuple[InstrumentProfile, ...] = (),
     ) -> tuple[EventReaction, ...]:
         reaction_payload = _reaction_payload(item, raw_item)
         if not reaction_payload:
             if event_input.market_reaction_window and self.gateway is not None:
-                request = self.create_market_reaction_request(event, event_input, job)
-                self._gateway_process(request)
+                for request in self.create_market_reaction_requests(event, event_input, job, profiles):
+                    self._gateway_process(request)
             return ()
 
         reactions: list[EventReaction] = []
@@ -1068,23 +1098,56 @@ class EventNewsIntelligenceService:
             idempotency_key=idempotency_key,
         )
 
+    def create_market_reaction_requests(
+        self,
+        event: StructuredEvent,
+        event_input: EventNewsInput,
+        job: ModuleJob,
+        profiles: tuple[InstrumentProfile, ...] = (),
+    ) -> tuple[ExternalRequest, ...]:
+        profile_by_id = {profile.instrument_id: profile for profile in profiles}
+        return tuple(
+            self.create_market_reaction_request(
+                event,
+                event_input,
+                job,
+                instrument_id=instrument_id,
+                profile=profile_by_id.get(instrument_id),
+            )
+            for instrument_id in event.instrument_ids
+        )
+
     def create_market_reaction_request(
         self,
         event: StructuredEvent,
         event_input: EventNewsInput,
         job: ModuleJob,
+        *,
+        instrument_id: str | None = None,
+        profile: InstrumentProfile | None = None,
     ) -> ExternalRequest:
-        idempotency_key = f"{job.idempotency_key}:market_reaction:{event.event_id}"
+        target_instrument_id = instrument_id or (event.instrument_ids[0] if event.instrument_ids else "")
+        board_id = str(
+            (profile.board_id if profile is not None else "")
+            or (profile.metadata.get("board_id") if profile is not None else "")
+            or "TQBR"
+        )
+        secid = (profile.ticker if profile is not None and profile.ticker else _strip_moex_prefix(target_instrument_id))
+        idempotency_key = f"{job.idempotency_key}:market_reaction:{event.event_id}:{target_instrument_id}:{board_id}:1d"
         return ExternalRequest(
             request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
             caller_module=self.module_name,
             provider="moex_iss",
             request_type="market_data",
             universe_id=job.universe_id,
-            instrument_ids=event.instrument_ids,
+            instrument_ids=(target_instrument_id,) if target_instrument_id else (),
             payload={
                 "event_id": event.event_id,
                 "event_ts": event.event_ts,
+                "secid": secid,
+                "board_id": board_id,
+                "timeframe": "1d",
+                "timeframes": ["1d"],
                 "market_reaction_window": list(event_input.market_reaction_window),
                 "time_range": job.time_range.to_dict(),
                 "purpose": "compute_market_reaction_if_available",
@@ -1172,6 +1235,17 @@ class EventNewsIntelligenceService:
             return explicit
         source_type = (raw_item.source_type or raw_item.source or "").lower()
         return SOURCE_CREDIBILITY_DEFAULTS.get(source_type, 0.6)
+
+    def _confirmation_status(self, raw_item: RawTextItem, event_type: str) -> str:
+        explicit = str(raw_item.source_payload.get("confirmation_status") or "")
+        if explicit == "official_confirmed":
+            return explicit
+        source_type = (raw_item.source_type or raw_item.source or "").lower()
+        if event_type not in OFFICIAL_CONFIRMATION_REQUIRED_EVENT_TYPES:
+            return "official_confirmed" if source_type in OFFICIAL_CONFIRMATION_SOURCE_TYPES else "candidate_early_signal"
+        if source_type in OFFICIAL_CONFIRMATION_SOURCE_TYPES:
+            return "official_confirmed"
+        return "candidate_requires_official_confirmation"
 
     def _issuer_relevance(
         self,
@@ -1512,6 +1586,11 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     except TypeError:
         return (str(value),)
     return tuple(str(item) for item in iterator if item not in (None, ""))
+
+
+def _strip_moex_prefix(value: str) -> str:
+    text = str(value or "")
+    return text.split(":", 1)[1] if text.startswith("moex:") else text
 
 
 def _optional_float(value: Any) -> float | None:

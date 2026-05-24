@@ -14,6 +14,7 @@ class InstrumentProfile:
     sector: str | None = None
     is_active: bool = True
     tradable: bool = True
+    board_id: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "InstrumentProfile":
@@ -21,6 +22,7 @@ class InstrumentProfile:
             instrument_id=str(payload.get("instrument_id") or ""),
             universe_id=str(payload.get("universe_id") or ""),
             ticker=str(payload.get("ticker") or ""),
+            board_id=_optional_text(payload.get("board_id")),
             sector=_optional_text(payload.get("sector")),
             is_active=bool(payload.get("is_active", True)),
             tradable=bool(payload.get("tradable", True)),
@@ -350,7 +352,7 @@ class PostgresLiquidityMicrostructureRepository:
         instrument_ids: tuple[str, ...],
     ) -> tuple[InstrumentProfile, ...]:
         query = """
-            SELECT instrument_id, universe_id, ticker, sector, is_active, tradable
+            SELECT instrument_id, universe_id, ticker, board_id, sector, is_active, tradable
               FROM registry.instrument_profile
              WHERE universe_id = %s
                AND is_active = true
@@ -369,9 +371,10 @@ class PostgresLiquidityMicrostructureRepository:
                 instrument_id=row[0],
                 universe_id=row[1],
                 ticker=row[2],
-                sector=row[3],
-                is_active=bool(row[4]),
-                tradable=bool(row[5]),
+                board_id=row[3],
+                sector=row[4],
+                is_active=bool(row[5]),
+                tradable=bool(row[6]),
             )
             for row in rows
         )

@@ -75,6 +75,16 @@
 
 ## 7. Processing rules
 
+Public macro/market intake contract:
+
+- CBR loaders: `key_rate`, `ruonia`, `usd_rub_cbr`/`currency`, `cny_rub_cbr`, `ofz_1y`, `ofz_2y`, `ofz_10y`.
+- FRED/EIA loaders: `oil`/`brent_fred`, optional `wti_fred`.
+- MOEX ISS loaders: `IMOEX`, `RTSI`, `RGBI`, `USD000UTSTOM`, `CNYRUB_TOM` and regular instrument candles.
+- Every MOEX ISS market-series request must be a single-secid request with explicit `payload.secid`, `payload.board_id`, `payload.timeframe=1d` and `time_range`.
+- Rosstat loaders are optional and may stay absent without blocking the module.
+- When rows are missing or stale, the module creates one source-specific Gateway request per known series.
+- After Gateway processing the module must re-read `raw_macro.raw_macro_point`, `raw_market.raw_index_value` and `raw_market.raw_candle` before deciding whether the run is skipped or computable.
+
 - `compute_index_returns`
 - `compute_market_breadth`
 - `compute_sector_strength`
@@ -145,6 +155,8 @@
 | `read` | `Event Store` |
 | `write` | `Feature Store` |
 | `write` | `Market State Store` |
+
+`raw_macro.raw_macro_point` rows consumed by this module must include `provider`, `series_name`, `point_ts`, `value`, `unit`, `source_url`, `confidence_score` and `quality_flags`. Source-specific parsing quality is represented through flags such as `cbr_xml_dynamic_loader`, `cbr_public_html_loader`, `cbr_zcyc_public_html_loader`, `fred_csv_loader`, `moex_iss_index_candles_loader` and `moex_iss_fx_candles_loader`.
 
 ## 12. TTL and freshness
 

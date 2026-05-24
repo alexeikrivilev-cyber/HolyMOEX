@@ -62,6 +62,12 @@
 
 Запрашивает issuer disclosures, financial data и market cap через Gateway. LLM допускается только для извлечения чисел/полей из текстов с evidence.
 
+MOEX ISS market-cap/price support requests:
+
+- Market data requests must be generated per instrument, never for the complete `instrument_ids` list.
+- Each MOEX `market_data` request must include one `instrument_id`, explicit `payload.secid`, `payload.board_id`, `payload.timeframe=1d` and `time_range`.
+- Raw candles used for valuation must preserve the same `instrument_id` that was requested from Selected Instruments DB or module input.
+
 ## 7. Processing rules
 
 - `parse_financial_fields`

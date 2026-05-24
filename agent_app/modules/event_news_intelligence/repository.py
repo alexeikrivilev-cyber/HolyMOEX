@@ -94,6 +94,7 @@ class InstrumentProfile:
     instrument_id: str
     universe_id: str
     ticker: str
+    board_id: str | None = None
     sector: str | None = None
     issuer_name: str | None = None
     aliases: tuple[str, ...] = ()
@@ -110,6 +111,7 @@ class InstrumentProfile:
             instrument_id=str(payload.get("instrument_id") or ""),
             universe_id=str(payload.get("universe_id") or ""),
             ticker=str(payload.get("ticker") or payload.get("secid") or ""),
+            board_id=_optional_text(payload.get("board_id")),
             sector=_optional_text(payload.get("sector")),
             issuer_name=_optional_text(payload.get("issuer_name")),
             aliases=tuple(str(item) for item in (payload.get("aliases") or ())),
@@ -506,7 +508,7 @@ class PostgresEventNewsIntelligenceRepository:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT instrument_id, universe_id, ticker, sector, issuer_name,
+                    SELECT instrument_id, universe_id, ticker, board_id, sector, issuer_name,
                            aliases, related_entities, is_active, metadata
                       FROM registry.instrument_profile
                      WHERE universe_id = %s
@@ -522,12 +524,13 @@ class PostgresEventNewsIntelligenceRepository:
                 instrument_id=row[0],
                 universe_id=row[1],
                 ticker=row[2] or "",
-                sector=row[3],
-                issuer_name=row[4],
-                aliases=tuple(row[5] or ()),
-                related_entities=tuple(row[6] or ()),
-                is_active=bool(row[7]),
-                metadata=row[8] or {},
+                board_id=row[3],
+                sector=row[4],
+                issuer_name=row[5],
+                aliases=tuple(row[6] or ()),
+                related_entities=tuple(row[7] or ()),
+                is_active=bool(row[8]),
+                metadata=row[9] or {},
             )
             for row in rows
         )

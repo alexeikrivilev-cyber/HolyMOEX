@@ -73,6 +73,13 @@
 
 ## 7. Processing rules
 
+MOEX ISS intake contract:
+
+- `market_data` requests are generated separately for every active `Selected Instruments DB` profile and every requested timeframe.
+- Each request carries exactly one `instrument_id`, explicit `secid`, `board_id`, `timeframe`, `time_range.from_ts` and `time_range.to_ts`.
+- `trades` and `instruments` lookup requests are also generated per instrument.
+- After Gateway processing the module must re-read `raw_market.raw_candle`, `raw_market.raw_trade` and index rows before deciding that raw data is missing.
+
 - `compute_returns`
 - `compute_log_returns`
 - `compute_rolling_momentum`

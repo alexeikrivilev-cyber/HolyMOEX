@@ -439,6 +439,8 @@ class InMemoryCorporateActionsAdjustmentRepository:
         requested_instruments = set(instrument_ids)
         events = []
         for event in self.structured_events:
+            if _requires_official_confirmation(event):
+                continue
             if requested_refs and event.event_id not in requested_refs:
                 continue
             if not requested_refs:
@@ -538,6 +540,7 @@ class PostgresCorporateActionsAdjustmentRepository:
                                reason_codes, model_version, payload
                           FROM events.structured_event
                          WHERE event_id = ANY(%s)
+                           AND COALESCE(payload ->> 'confirmation_status', 'official_confirmed') <> 'candidate_requires_official_confirmation'
                          ORDER BY event_ts, event_id
                         """,
                         (ref_ids,),
@@ -550,8 +553,9 @@ class PostgresCorporateActionsAdjustmentRepository:
                                materiality_score, novelty_score, surprise_score,
                                sentiment_score, confidence_score, evidence,
                                reason_codes, model_version, payload
-                          FROM events.structured_event
+                         FROM events.structured_event
                          WHERE event_type IN ('corporate_action', 'dividend')
+                           AND COALESCE(payload ->> 'confirmation_status', 'official_confirmed') <> 'candidate_requires_official_confirmation'
                            AND event_ts BETWEEN %s AND %s
                            AND (cardinality(instrument_ids) = 0 OR instrument_ids && %s)
                          ORDER BY event_ts, event_id
@@ -838,6 +842,10 @@ def _timestamp_in_range(timestamp: str, from_ts: str, to_ts: str) -> bool:
 
 def _ref_tail(ref: str) -> str:
     return str(ref).rsplit(":", 1)[-1] if ":" in str(ref) else str(ref)
+
+
+def _requires_official_confirmation(event: StructuredEvent) -> bool:
+    return str(event.payload.get("confirmation_status") or "") == "candidate_requires_official_confirmation"
 
 
 def _optional_text(value: Any) -> str | None:

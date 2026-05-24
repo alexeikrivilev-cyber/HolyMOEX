@@ -479,9 +479,15 @@ class PostgresExternalRequestGatewayRepository:
         close_price = _numeric(_lookup(item, "close_price", "closeprice", "close", "c", "last", "lastprice"))
         if all(value is None for value in (open_price, high_price, low_price, close_price)):
             return ""
-        open_ts = _timestamp_or(
-            _lookup(item, "open_ts", "begin", "start", "timestamp", "ts", "date", "tradedate"),
+        instrument_id = _instrument_id(request, item)
+        if not instrument_id:
+            return ""
+        open_ts = _timestamp_from_item(
+            item,
             received_at,
+            ("open_ts", "begin", "start", "timestamp", "ts", "systime", "date", "tradedate"),
+            date_keys=("date", "tradedate"),
+            time_keys=("time", "updatetime"),
         )
         close_ts = _timestamp_text(_lookup(item, "close_ts", "end", "finish"))
         timeframe = _text(
@@ -490,6 +496,7 @@ class PostgresExternalRequestGatewayRepository:
             or request.payload.get("timeframe")
             or "unknown"
         )
+        board_id = _text(_lookup(item, "board_id", "boardid", "board") or request.payload.get("board") or request.payload.get("board_id") or "TQBR")
         cur.execute(
             """
             INSERT INTO raw_market.raw_candle (
@@ -497,12 +504,22 @@ class PostgresExternalRequestGatewayRepository:
                 open_price, high_price, low_price, close_price, volume, turnover,
                 provider, source_payload, received_at
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (provider, instrument_id, universe_id, board_id, timeframe, open_ts) DO UPDATE SET
+                close_ts = EXCLUDED.close_ts,
+                open_price = EXCLUDED.open_price,
+                high_price = EXCLUDED.high_price,
+                low_price = EXCLUDED.low_price,
+                close_price = EXCLUDED.close_price,
+                volume = EXCLUDED.volume,
+                turnover = EXCLUDED.turnover,
+                source_payload = EXCLUDED.source_payload,
+                received_at = EXCLUDED.received_at
             RETURNING raw_candle_id
             """,
             (
-                _instrument_id(request, item),
+                instrument_id,
                 request.universe_id,
-                _text(_lookup(item, "board_id", "boardid", "board") or request.payload.get("board") or request.payload.get("board_id")),
+                board_id,
                 timeframe,
                 open_ts,
                 close_ts,
@@ -539,12 +556,16 @@ class PostgresExternalRequestGatewayRepository:
         value = _numeric(_lookup(item, "value", "index_value", "close", "last", "price"))
         if value is None:
             return ""
-        value_ts = _timestamp_or(_lookup(item, "value_ts", "timestamp", "ts", "date", "tradedate", "time"), received_at)
+        value_ts = _timestamp_or(_lookup(item, "value_ts", "timestamp", "ts", "date", "tradedate", "time", "begin", "end"), received_at)
         cur.execute(
             """
             INSERT INTO raw_market.raw_index_value (
                 index_id, value_ts, value, provider, source_payload, received_at
             ) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (provider, index_id, value_ts) DO UPDATE SET
+                value = EXCLUDED.value,
+                source_payload = EXCLUDED.source_payload,
+                received_at = EXCLUDED.received_at
             RETURNING raw_index_value_id
             """,
             (
@@ -574,18 +595,32 @@ class PostgresExternalRequestGatewayRepository:
                     quantity = _numeric(_lookup(item, "quantity", "qty", "volume", "vol"))
                     if price is None and quantity is None:
                         continue
+                    instrument_id = _instrument_id(request, item)
+                    if not instrument_id:
+                        continue
                     cur.execute(
                         """
                         INSERT INTO raw_market.raw_trade (
                             instrument_id, universe_id, trade_ts, price, quantity, side,
                             trade_value, provider, provider_trade_id, source_payload, received_at
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (provider, instrument_id, universe_id, trade_ts, price, quantity, side) DO UPDATE SET
+                            trade_value = EXCLUDED.trade_value,
+                            provider_trade_id = EXCLUDED.provider_trade_id,
+                            source_payload = EXCLUDED.source_payload,
+                            received_at = EXCLUDED.received_at
                         RETURNING raw_trade_id
                         """,
                         (
-                            _instrument_id(request, item),
+                            instrument_id,
                             request.universe_id,
-                            _timestamp_or(_lookup(item, "trade_ts", "tradetime", "timestamp", "ts", "date", "tradedate"), received_at),
+                            _timestamp_from_item(
+                                item,
+                                received_at,
+                                ("trade_ts", "timestamp", "ts", "systime"),
+                                date_keys=("date", "tradedate", "trade_date"),
+                                time_keys=("time", "tradetime", "trade_time"),
+                            ),
                             price,
                             quantity,
                             _text(_lookup(item, "side", "buysell", "direction")),
@@ -613,6 +648,9 @@ class PostgresExternalRequestGatewayRepository:
         if not bids and not asks:
             return []
         first_item = items[0] if items else {}
+        instrument_id = _instrument_id(request, first_item)
+        if not instrument_id:
+            return []
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -621,10 +659,15 @@ class PostgresExternalRequestGatewayRepository:
                         instrument_id, universe_id, snapshot_ts, bids, asks,
                         provider, source_payload, received_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (provider, instrument_id, universe_id, snapshot_ts) DO UPDATE SET
+                        bids = EXCLUDED.bids,
+                        asks = EXCLUDED.asks,
+                        source_payload = EXCLUDED.source_payload,
+                        received_at = EXCLUDED.received_at
                     RETURNING raw_orderbook_id
                     """,
                     (
-                        _instrument_id(request, first_item),
+                        instrument_id,
                         request.universe_id,
                         _timestamp_or(
                             _lookup(first_item, "snapshot_ts", "timestamp", "ts", "systime", "date", "tradedate")
@@ -661,9 +704,47 @@ class PostgresExternalRequestGatewayRepository:
                     if not (source_url or title or body):
                         continue
                     source_payload = _source_payload(payload, item)
+                    query_payload = payload.get("query") if isinstance(payload.get("query"), Mapping) else {}
+                    source_type = _text(_lookup(item, "source_type")) or _text(payload.get("source_type")) or request.provider
+                    source_name = _text(_lookup(item, "source_name", "source"))
+                    if not source_name and isinstance(query_payload, Mapping):
+                        source_name = _text(query_payload.get("source_name"))
+                    source_name = source_name or source_type
+                    trust_level = _text(_lookup(item, "trust_level"))
+                    if not trust_level and isinstance(query_payload, Mapping):
+                        trust_level = _text(query_payload.get("trust_level"))
+                    source_layer = _text(_lookup(item, "source_layer"))
+                    if not source_layer and isinstance(query_payload, Mapping):
+                        source_layer = _text(query_payload.get("source_layer"))
+                    quality_flags = _quality_flags_for_gateway_item(
+                        source_type=source_type,
+                        trust_level=trust_level,
+                        source_layer=source_layer,
+                        source_url=source_url,
+                        title=title,
+                        body=body,
+                        published_at=_timestamp_text(_lookup(item, "published_at", "published", "date", "created_at")),
+                    )
+                    instrument_candidates = [
+                        {"instrument_id": instrument_id, "score": 0.60, "source": "request_context"}
+                        for instrument_id in request.instrument_ids
+                    ]
+                    confidence_score = _raw_text_confidence(trust_level, quality_flags)
+                    source_payload = {
+                        **dict(source_payload),
+                        "source": source_name,
+                        "source_type": source_type,
+                        "source_layer": source_layer or None,
+                        "trust_level": trust_level or None,
+                        "confidence_score": confidence_score,
+                        "instrument_candidates": instrument_candidates,
+                        "issuer_candidates": [],
+                        "quality_flags": quality_flags,
+                    }
                     content_hash = _text(_lookup(item, "content_hash", "hash")) or _content_hash(
                         {
-                            "source": request.provider,
+                            "source": source_name,
+                            "source_type": source_type,
                             "source_url": source_url,
                             "title": title,
                             "body": body,
@@ -673,18 +754,25 @@ class PostgresExternalRequestGatewayRepository:
                     cur.execute(
                         """
                         INSERT INTO raw_text.raw_text_item (
-                            universe_id, instrument_ids, source, source_url, title, body,
-                            language, published_at, fetched_at, content_hash, source_payload
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            universe_id, instrument_ids, source, source_type, source_url, title, body,
+                            language, published_at, fetched_at, content_hash, source_payload,
+                            trust_level, confidence_score, instrument_candidates, issuer_candidates, quality_flags
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (content_hash) DO UPDATE SET
                             fetched_at = EXCLUDED.fetched_at,
-                            source_payload = EXCLUDED.source_payload
+                            source_payload = EXCLUDED.source_payload,
+                            trust_level = EXCLUDED.trust_level,
+                            confidence_score = EXCLUDED.confidence_score,
+                            instrument_candidates = EXCLUDED.instrument_candidates,
+                            issuer_candidates = EXCLUDED.issuer_candidates,
+                            quality_flags = EXCLUDED.quality_flags
                         RETURNING raw_text_item_id
                         """,
                         (
                             request.universe_id,
                             list(request.instrument_ids),
-                            request.provider,
+                            source_name,
+                            source_type,
                             source_url or None,
                             title or None,
                             body or None,
@@ -693,6 +781,11 @@ class PostgresExternalRequestGatewayRepository:
                             received_at,
                             content_hash,
                             jsonb_type(source_payload),
+                            trust_level or None,
+                            confidence_score,
+                            jsonb_type(instrument_candidates),
+                            jsonb_type([]),
+                            quality_flags,
                         ),
                     )
                     row = cur.fetchone()
@@ -716,28 +809,43 @@ class PostgresExternalRequestGatewayRepository:
                         or request.payload.get("series_id")
                         or _first(request.payload.get("series_ids"))
                     )
+                    series_name = _text(_lookup(item, "series_name", "name") or request.payload.get("series_name") or series_id)
                     point_ts = _timestamp_text(_lookup(item, "point_ts", "timestamp", "ts", "date", "period", "time"))
-                    value = _numeric(_lookup(item, "value", "close", "last", "rate"))
+                    value = _numeric(_lookup(item, series_id, "value", "close", "last", "rate"))
                     if not series_id or point_ts is None or value is None:
                         continue
+                    source_url = _text(_lookup(item, "source_url", "url") or request.payload.get("source_url") or request.payload.get("endpoint") or request.payload.get("path"))
+                    quality_flags = _string_list(_lookup(item, "quality_flags") or request.payload.get("quality_flags") or ())
+                    confidence_score = _numeric(_lookup(item, "confidence_score") or request.payload.get("confidence_score"))
+                    if confidence_score is None:
+                        confidence_score = 1.0 if request.provider in {"macro_api", "moex_iss"} else 0.75
                     cur.execute(
                         """
                         INSERT INTO raw_macro.raw_macro_point (
-                            series_id, point_ts, value, unit, provider, source_payload, received_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            series_id, series_name, point_ts, value, unit, provider,
+                            source_url, confidence_score, quality_flags, source_payload, received_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (series_id, point_ts, provider) DO UPDATE SET
+                            series_name = EXCLUDED.series_name,
                             value = EXCLUDED.value,
                             unit = EXCLUDED.unit,
+                            source_url = EXCLUDED.source_url,
+                            confidence_score = EXCLUDED.confidence_score,
+                            quality_flags = EXCLUDED.quality_flags,
                             source_payload = EXCLUDED.source_payload,
                             received_at = EXCLUDED.received_at
                         RETURNING raw_macro_point_id
                         """,
                         (
                             series_id,
+                            series_name or None,
                             point_ts,
                             value,
-                            _text(_lookup(item, "unit", "units")),
+                            _text(_lookup(item, "unit", "units") or request.payload.get("unit")),
                             request.provider,
+                            source_url or None,
+                            confidence_score,
+                            quality_flags,
                             jsonb_type(_source_payload(payload, item)),
                             received_at,
                         ),
@@ -797,6 +905,33 @@ def default_provider_configs() -> dict[str, ProviderConfig]:
                 "allowed_request_types": ["market_data", "orderbook", "trades", "instruments"],
                 "gateway_only": True,
                 "cache_defaults": {"market_data": 60, "instruments": 86400},
+                "public_market_series_catalog": {
+                    "imoex": {
+                        "provider": "moex_iss",
+                        "index_id": "IMOEX",
+                        "source_url": "https://iss.moex.com/iss/engines/stock/markets/index/boards/SNDX/securities/IMOEX/candles.json",
+                    },
+                    "rtsi": {
+                        "provider": "moex_iss",
+                        "index_id": "RTSI",
+                        "source_url": "https://iss.moex.com/iss/engines/stock/markets/index/boards/SNDX/securities/RTSI/candles.json",
+                    },
+                    "rgbi": {
+                        "provider": "moex_iss",
+                        "index_id": "RGBI",
+                        "source_url": "https://iss.moex.com/iss/engines/stock/markets/index/boards/SNDX/securities/RGBI/candles.json",
+                    },
+                    "usd_rub_moex": {
+                        "provider": "moex_iss",
+                        "index_id": "USD000UTSTOM",
+                        "source_url": "https://iss.moex.com/iss/engines/currency/markets/selt/boards/CETS/securities/USD000UTSTOM/candles.json",
+                    },
+                    "cny_rub_moex": {
+                        "provider": "moex_iss",
+                        "index_id": "CNYRUB_TOM",
+                        "source_url": "https://iss.moex.com/iss/engines/currency/markets/selt/boards/CETS/securities/CNYRUB_TOM/candles.json",
+                    },
+                },
             },
             default_base_url="https://iss.moex.com/iss",
         ),
@@ -871,6 +1006,62 @@ def default_provider_configs() -> dict[str, ProviderConfig]:
                 "gateway_only": True,
                 "raw_store": "raw_macro.raw_macro_point",
                 "source_catalog": ["cbr_macro", "moex_macro", "fred_eia_macro", "rosstat_macro"],
+                "macro_series_catalog": {
+                    "key_rate": {
+                        "provider": "macro_api",
+                        "source": "cbr",
+                        "unit": "percent",
+                        "source_url": "https://www.cbr.ru/hd_base/KeyRate/",
+                    },
+                    "ruonia": {
+                        "provider": "macro_api",
+                        "source": "cbr",
+                        "unit": "percent",
+                        "source_url": "https://www.cbr.ru/hd_base/ruonia/",
+                    },
+                    "ofz_1y": {
+                        "provider": "macro_api",
+                        "source": "cbr_zcyc",
+                        "unit": "percent",
+                        "source_url": "https://www.cbr.ru/hd_base/zcyc_params/",
+                    },
+                    "ofz_2y": {
+                        "provider": "macro_api",
+                        "source": "cbr_zcyc",
+                        "unit": "percent",
+                        "source_url": "https://www.cbr.ru/hd_base/zcyc_params/",
+                    },
+                    "ofz_10y": {
+                        "provider": "macro_api",
+                        "source": "cbr_zcyc",
+                        "unit": "percent",
+                        "source_url": "https://www.cbr.ru/hd_base/zcyc_params/",
+                    },
+                    "usd_rub_cbr": {
+                        "provider": "macro_api",
+                        "source": "cbr_fx",
+                        "unit": "RUB",
+                        "source_url": "https://www.cbr.ru/scripts/XML_dynamic.asp",
+                    },
+                    "cny_rub_cbr": {
+                        "provider": "macro_api",
+                        "source": "cbr_fx",
+                        "unit": "RUB",
+                        "source_url": "https://www.cbr.ru/scripts/XML_dynamic.asp",
+                    },
+                    "brent_fred": {
+                        "provider": "macro_api",
+                        "source": "fred",
+                        "unit": "USD/bbl",
+                        "source_url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DCOILBRENTEU",
+                    },
+                    "wti_fred": {
+                        "provider": "macro_api",
+                        "source": "fred",
+                        "unit": "USD/bbl",
+                        "source_url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DCOILWTICO",
+                    },
+                },
             },
             default_base_url="https://www.cbr.ru",
         ),
@@ -991,6 +1182,16 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
+def _string_list(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item or "").strip()]
+    return [str(value)]
+
+
 def _numeric(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -1023,6 +1224,30 @@ def _timestamp_or(value: Any, fallback: str) -> str:
     return _timestamp_text(value) or fallback
 
 
+def _timestamp_from_item(
+    item: Mapping[str, Any],
+    fallback: str,
+    value_keys: tuple[str, ...],
+    *,
+    date_keys: tuple[str, ...] = (),
+    time_keys: tuple[str, ...] = (),
+) -> str:
+    direct = _timestamp_text(_lookup(item, *value_keys))
+    if direct:
+        return direct
+    date_text = _text(_lookup(item, *date_keys)) if date_keys else ""
+    time_text = _text(_lookup(item, *time_keys)) if time_keys else ""
+    if date_text and time_text:
+        combined = _timestamp_text(f"{date_text}T{time_text}+03:00")
+        if combined:
+            return combined
+    if date_text:
+        date_value = _timestamp_text(date_text)
+        if date_value:
+            return date_value
+    return fallback
+
+
 def _first(value: Any) -> str:
     if isinstance(value, (list, tuple)) and value:
         return str(value[0])
@@ -1033,6 +1258,22 @@ def _first(value: Any) -> str:
 
 def _instrument_id(request: ExternalRequest, item: Mapping[str, Any]) -> str:
     candidate = _text(_lookup(item, "instrument_id", "instrument", "secid", "security", "ticker", "symbol"))
+    payload_secid = _text(
+        request.payload.get("secid")
+        or request.payload.get("security")
+        or request.payload.get("ticker")
+        or request.payload.get("index_id")
+        or request.payload.get("index")
+    )
+    if request.provider in {"moex_iss", "moex_fast"} and request.request_type in {"market_data", "trades", "orderbook"}:
+        if len(request.instrument_ids) != 1:
+            return ""
+        request_instrument_id = request.instrument_ids[0]
+        requested_secid = _strip_moex_prefix(payload_secid or request_instrument_id)
+        candidate_secid = _strip_moex_prefix(candidate)
+        if candidate_secid and requested_secid and candidate_secid.upper() != requested_secid.upper():
+            return ""
+        return request_instrument_id
     if request.instrument_ids:
         if not candidate:
             return request.instrument_ids[0]
@@ -1052,6 +1293,55 @@ def _strip_moex_prefix(value: str) -> str:
 
 def _source_payload(payload: Mapping[str, Any], item: Mapping[str, Any]) -> Mapping[str, Any]:
     return {"item": dict(item), "provider_response": dict(payload)}
+
+
+def _quality_flags_for_gateway_item(
+    *,
+    source_type: str,
+    trust_level: str,
+    source_layer: str,
+    source_url: str,
+    title: str,
+    body: str,
+    published_at: str | None,
+) -> list[str]:
+    flags: list[str] = []
+    if source_layer == "fast_news" or source_type.endswith("_news") or source_type == "news_api":
+        flags.append("candidate_early_signal")
+    if source_type == "smartlab_news":
+        flags.append("weak_source")
+    if source_layer in {"official_disclosure", "official_issuer_site", "official_macro", "official_market"}:
+        flags.append("official_confirmation_layer")
+    if trust_level in {"medium_weak", "weak", "unknown", ""}:
+        flags.append("low_source_trust")
+    if not source_url:
+        flags.append("missing_source_url")
+    if not title:
+        flags.append("missing_title")
+    if not body:
+        flags.append("missing_body")
+    if not published_at:
+        flags.append("missing_published_at")
+    return list(dict.fromkeys(flags))
+
+
+def _raw_text_confidence(trust_level: str, quality_flags: list[str]) -> float:
+    base = {
+        "high": 0.95,
+        "normal_high": 0.80,
+        "normal": 0.70,
+        "medium_weak": 0.50,
+        "weak": 0.35,
+    }.get(trust_level, 0.60)
+    if "candidate_early_signal" in quality_flags:
+        base = min(base, 0.75)
+    if "weak_source" in quality_flags:
+        base = min(base, 0.50)
+    if "missing_body" in quality_flags:
+        base *= 0.80
+    if "missing_source_url" in quality_flags:
+        base *= 0.85
+    return min(1.0, max(0.0, base))
 
 
 def _content_hash(payload: Mapping[str, Any]) -> str:

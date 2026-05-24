@@ -77,6 +77,7 @@ Orchestration Module
 |---|---|---|
 | `Selected Instruments DB` | вручную выбранная вселенная до 20 акций | `instrument_profile`, `instrument_alias`, `instrument_mapping` |
 | `Raw Market Data Store` | сырые свечи, сделки, стакан, индексы | `raw_candle`, `raw_trade`, `raw_orderbook`, `raw_index_value` |
+| `MOEX ISS market intake` | per instrument/per board/per timeframe загрузка и dedup | `raw_market` natural keys |
 | `Raw Text Store` | новости, раскрытия, отчёты, тексты ЦБ/эмитентов | `raw_text_item` |
 | `Raw Macro Data Store` | ставка, ОФЗ, валюта, сырьё, индексы | `raw_macro_point` |
 | `Event Store` | структурированные события | `structured_event`, `event_cluster`, `event_reaction` |
@@ -390,6 +391,8 @@ Raw Market Data Store
 
 Raw Macro Data Store
   -> Market Context Module
+  required public series: CBR key rate, RUONIA, CBR FX official rates, CBR ZCYC/OFZ curve, FRED/EIA Brent/WTI
+  required market series through Raw Market Data Store: MOEX ISS IMOEX, RTSI, RGBI, USD/RUB, CNY/RUB
 
 Event Store
   -> Event & News Intelligence Module
@@ -628,6 +631,22 @@ SELECT *
  ORDER BY check_name;
 ```
 
+Public macro intake readiness is checked separately:
+
+```sql
+SELECT *
+  FROM audit.public_macro_series_readiness_check
+ ORDER BY check_name;
+```
+
+MOEX ISS raw-market idempotency is checked separately:
+
+```sql
+SELECT *
+  FROM audit.moex_market_data_idempotency_check
+ ORDER BY check_name;
+```
+
 Все строки должны иметь `status = 'pass'`. Этот view проверяет только инфраструктурную готовность БД: наличие stores, активного universe, стартового portfolio state, paper-trading risk policy, provider/source config, module schedules, dependency graph и product baseline seed-весов. Он не означает, что рыночные/новостные/макро данные уже заполнены владельцем.
 
 Детальная проверка весов выполняется через:
@@ -649,6 +668,16 @@ SELECT *
 ```
 
 Этот view проверяет, что включены gateway providers `news_api`, `issuer_disclosure`, `macro_api`, а конкретные публичные источники новостей, раскрытий и макро заведены в `raw_text.text_source_config`. Конкретные порталы/RSS не становятся новыми provider names: они задаются через `query_template.endpoint`, чтобы сохранить контракт Gateway.
+
+Product-level нормализация `raw_text_item` проверяется через:
+
+```sql
+SELECT *
+  FROM audit.public_text_intake_readiness_check
+ ORDER BY check_name;
+```
+
+Каждый raw text item должен сохранять `source`, `source_url`, `published_at`, `fetched_at`, `title`, `body`, `language`, `trust_level`, `confidence_score`, `instrument_candidates`, `issuer_candidates` и `quality_flags`. Fast-news источники дают candidate/early signal; confirmed corporate event требует official confirmation layer.
 
 ### 16.2 Docker environment contract
 

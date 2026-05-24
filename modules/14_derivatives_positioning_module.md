@@ -68,6 +68,12 @@
 
 Через Gateway запрашивает derivatives market data, open interest и spot reference data.
 
+MOEX ISS derivatives/spot support requests:
+
+- Futures, options and spot-reference market data requests must be generated per active instrument profile.
+- Each MOEX `market_data` request must include one `instrument_id`, explicit `payload.secid`, `payload.board_id`, `payload.timeframe` and `time_range`.
+- If derivatives data is unavailable for an instrument, the module writes availability/skip records instead of mixing another instrument's market rows into the current one.
+
 ## 7. Processing rules
 
 - `check_derivatives_liquidity`

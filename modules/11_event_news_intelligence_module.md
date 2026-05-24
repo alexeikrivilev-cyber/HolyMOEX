@@ -68,6 +68,12 @@
 
 LLM-запросы выполняются через Gateway с `request_type=llm_completion`. Если нужна реакция рынка, market data запрашивается через Gateway.
 
+MOEX ISS market-reaction requests:
+
+- Market-reaction data is an auxiliary event-study input and must be requested per affected instrument.
+- Each request must include exactly one `instrument_id`, explicit `payload.secid`, `payload.board_id`, `payload.timeframe` and `time_range`.
+- A multi-instrument news event may create multiple MOEX requests, but raw candles from one `secid` must never be persisted under another `instrument_id`.
+
 ## 7. Processing rules
 
 - `load_text_and_metadata`
@@ -164,6 +170,13 @@ News/event features получают TTL по `event_type`: intraday noise — �
 
 Если LLM response не проходит schema validation, event не попадает в Feature Store. Raw text остаётся в Raw Text Store с error flag.
 
+Corporate-event confirmation policy:
+
+- `news_api`, `rbc_news`, `tass_news`, `interfax_news`, `prime_news`, `finam_news` and `smartlab_news` are early/candidate sources.
+- `issuer_disclosure`, `prime_disclosure`, `akm_disclosure`, `corporate_site`, `regulatory_text`, `cbr_macro`, `moex_macro` and `macro_text` are official/confirmation sources.
+- For `earnings`, `dividend` and `corporate_action`, ordinary news may create only a candidate event with `payload.confirmation_status = candidate_requires_official_confirmation`.
+- A confirmed corporate event requires the official confirmation layer; downstream corporate-action processing must ignore candidate-only events.
+
 ## 14. Acceptance criteria
 
 - `llm_output_schema_validated`
@@ -172,6 +185,7 @@ News/event features получают TTL по `event_type`: intraday noise — �
 - `no_freeform_trading_recommendation`
 - `market_reaction_separate_from_sentiment`
 - `confidence_score_required`
+- `ordinary_news_does_not_confirm_corporate_event`
 
 ## 15. Metric formulas / calculation rules
 

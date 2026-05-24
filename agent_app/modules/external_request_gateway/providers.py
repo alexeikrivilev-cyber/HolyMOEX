@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
+import re
 import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from html import unescape
+from html.parser import HTMLParser
 from typing import Any, Mapping, Protocol
 from urllib.parse import urlencode, urljoin
 
@@ -192,16 +197,17 @@ class ProviderRequestNormalizer:
         path = self._configured_path(request, config, MOEX_DEFAULT_PATHS)
         query = self._query_params(request, include_payload=True)
         query.setdefault("iss.meta", "off")
-        if request.request_type == "market_data":
+        if request.request_type in {"market_data", "trades"}:
             time_range = request.payload.get("time_range")
             if isinstance(time_range, Mapping):
                 if time_range.get("from_ts"):
                     query.setdefault("from", str(time_range["from_ts"])[:10])
                 if time_range.get("to_ts"):
                     query.setdefault("till", str(time_range["to_ts"])[:10])
-            timeframe = _first(request.payload.get("timeframes"))
+        if request.request_type == "market_data":
+            timeframe = str(request.payload.get("timeframe") or _first(request.payload.get("timeframes")) or "")
             if timeframe:
-                query.setdefault("interval", timeframe)
+                query.setdefault("interval", _moex_interval(timeframe))
         return ProviderHttpRequest(
             provider=request.provider,
             request_type=request.request_type,
@@ -221,7 +227,10 @@ class ProviderRequestNormalizer:
         json_payload: Mapping[str, Any] | None = None
         url = self._url(config, formatted_path)
         if method == "GET":
-            url += self._encoded_query(self._query_params(request, include_payload=True))
+            url += self._encoded_query(
+                self._query_params(request, include_payload=True),
+                separator="&" if "?" in url else "?",
+            )
         else:
             body = payload.get("body") or payload.get("json") or payload
             if not isinstance(body, Mapping):
@@ -315,6 +324,20 @@ class ProviderRequestNormalizer:
             "series_id": str(payload.get("series_id") or _first(payload.get("series_ids")) or ""),
             "document_id": str(payload.get("document_id") or payload.get("id") or ""),
         }
+        time_range = payload.get("time_range")
+        if isinstance(time_range, Mapping):
+            from_ts = str(time_range.get("from_ts") or "")
+            to_ts = str(time_range.get("to_ts") or "")
+            path_values.update(
+                {
+                    "from_date": from_ts[:10],
+                    "to_date": to_ts[:10],
+                    "from_ddmmyyyy": _ddmmyyyy(from_ts),
+                    "to_ddmmyyyy": _ddmmyyyy(to_ts),
+                    "from_ddmmyyyy_dot": _ddmmyyyy(from_ts, "."),
+                    "to_ddmmyyyy_dot": _ddmmyyyy(to_ts, "."),
+                }
+            )
         try:
             return path.format(**path_values)
         except KeyError as error:
@@ -339,6 +362,23 @@ class ProviderRequestNormalizer:
         query_payload = payload.get("query_params")
         if isinstance(query_payload, Mapping):
             query.update(_flatten_query(query_payload))
+        if request.request_type == "macro_series" and (payload.get("endpoint") or payload.get("path")):
+            return query
+        if request.provider in {"moex_iss", "moex_fast"} and request.request_type in {"market_data", "trades", "orderbook"}:
+            if len(request.instrument_ids) != 1:
+                raise ProviderNormalizationError(f"{request.provider} {request.request_type} requires exactly one instrument_id")
+            if not (payload.get("secid") or payload.get("security") or payload.get("ticker")):
+                raise ProviderNormalizationError(f"{request.provider} {request.request_type} requires explicit payload.secid")
+            if not (payload.get("board_id") or payload.get("board")):
+                raise ProviderNormalizationError(f"{request.provider} {request.request_type} requires explicit payload.board_id")
+            time_range = payload.get("time_range")
+            if request.request_type in {"market_data", "trades"} and not (
+                isinstance(time_range, Mapping) and time_range.get("from_ts") and time_range.get("to_ts")
+            ):
+                raise ProviderNormalizationError(f"{request.provider} {request.request_type} requires explicit time_range.from_ts/to_ts")
+            if request.request_type == "market_data" and not (payload.get("timeframe") or _first(payload.get("timeframes"))):
+                raise ProviderNormalizationError(f"{request.provider} market_data requires explicit payload.timeframe")
+            return query
         if request.instrument_ids:
             query.setdefault("instrument_ids", ",".join(request.instrument_ids))
             query.setdefault("securities", ",".join(_strip_moex_prefix(item) for item in request.instrument_ids))
@@ -346,7 +386,25 @@ class ProviderRequestNormalizer:
             query.setdefault("universe_id", request.universe_id)
         if include_payload:
             for key, value in payload.items():
-                if key in {"path", "endpoint", "method", "body", "json", "headers", "query_params"}:
+                if key in {
+                    "path",
+                    "endpoint",
+                    "method",
+                    "body",
+                    "json",
+                    "headers",
+                    "query_params",
+                    "source_url",
+                    "series_name",
+                    "unit",
+                    "confidence_score",
+                    "quality_flags",
+                    "macro_refs",
+                    "index_refs",
+                    "sector_refs",
+                    "event_refs",
+                    "windows",
+                }:
                     continue
                 if key == "query" and isinstance(value, Mapping):
                     query.update(_flatten_query(value))
@@ -361,11 +419,11 @@ class ProviderRequestNormalizer:
                     query.setdefault(key, _query_value(value))
         return query
 
-    def _encoded_query(self, query: Mapping[str, str]) -> str:
+    def _encoded_query(self, query: Mapping[str, str], separator: str = "?") -> str:
         clean_query = {key: value for key, value in query.items() if value not in {"", "None"}}
         if not clean_query:
             return ""
-        return "?" + urlencode(clean_query)
+        return separator + urlencode(clean_query)
 
 
 def normalize_provider_response(
@@ -495,10 +553,6 @@ def _provider_envelope(request: ExternalRequest, body: Mapping[str, Any]) -> Map
 
 
 def _extract_items(body: Mapping[str, Any], request_type: str) -> list[Mapping[str, Any]]:
-    for key in ("items", "data", "results", "documents", "points"):
-        value = body.get(key)
-        if isinstance(value, list):
-            return [_coerce_item(item) for item in value]
     table_keys_by_type = {
         "market_data": ("candles", "marketdata", "securities"),
         "trades": ("trades",),
@@ -513,6 +567,10 @@ def _extract_items(body: Mapping[str, Any], request_type: str) -> list[Mapping[s
         records = _records_from_provider_value(value)
         if records:
             return records
+    for key in ("items", "data", "results", "documents", "points"):
+        value = body.get(key)
+        if isinstance(value, list):
+            return [_coerce_item(item) for item in value]
     records = _records_from_provider_value(body)
     return records if records else [dict(body)] if body else []
 
@@ -578,8 +636,17 @@ def _parse_json_body(
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        cbr = _parse_cbr_xml_body(text)
+        if cbr is not None:
+            return cbr
         feed = _parse_feed_body(text)
-        return feed if feed is not None else text
+        if feed is not None:
+            return feed
+        csv_payload = _parse_csv_series_body(text)
+        if csv_payload is not None:
+            return csv_payload
+        html_payload = _parse_html_body(text)
+        return html_payload if html_payload is not None else text
 
 
 def _decode_body(raw_body: bytes, headers: Mapping[str, str] | None) -> str:
@@ -637,6 +704,40 @@ def _parse_feed_body(text: str) -> Mapping[str, Any] | None:
     return None
 
 
+def _parse_cbr_xml_body(text: str) -> Mapping[str, Any] | None:
+    stripped = text.lstrip()
+    if not stripped.startswith("<"):
+        return None
+    try:
+        root = ET.fromstring(stripped)
+    except ET.ParseError:
+        return None
+    if _local_xml_name(root.tag) != "ValCurs":
+        return None
+    points = []
+    for record in _xml_children(root, "Record"):
+        raw_date = record.attrib.get("Date") or ""
+        numeric_value = _numeric_text(_xml_text(record, "Value"))
+        nominal_value = _numeric_text(_xml_text(record, "Nominal")) or 1.0
+        if raw_date and numeric_value is not None:
+            points.append({"point_ts": _iso_date_from_ddmmyyyy(raw_date), "value": numeric_value / nominal_value})
+    return {"format": "cbr_xml_dynamic", "points": points} if points else None
+
+
+def _parse_csv_series_body(text: str) -> Mapping[str, Any] | None:
+    first_line = text.lstrip().splitlines()[0] if text.strip() else ""
+    if "," not in first_line:
+        return None
+    reader = csv.DictReader(io.StringIO(text))
+    points = []
+    for row in reader:
+        date_value = row.get("DATE") or row.get("date") or row.get("Date")
+        numeric_value = _numeric_text(row.get("VALUE") or row.get("value") or row.get("Value"))
+        if date_value and numeric_value is not None:
+            points.append({"point_ts": f"{str(date_value)[:10]}T00:00:00Z", "value": numeric_value})
+    return {"format": "csv_series", "points": points} if points else None
+
+
 def _rss_item_payload(item: ET.Element) -> Mapping[str, Any]:
     return {
         "title": _xml_text(item, "title"),
@@ -690,6 +791,136 @@ def _local_xml_name(tag: str) -> str:
     return str(tag).rsplit("}", 1)[-1]
 
 
+def _parse_html_body(text: str) -> Mapping[str, Any] | None:
+    stripped = text.lstrip()
+    if not stripped.lower().startswith(("<!doctype html", "<html")):
+        return None
+    parser = _TextHtmlParser()
+    parser.feed(stripped)
+    title = parser.title.strip()
+    body = " ".join(parser.text_parts)
+    body = " ".join(unescape(body).split())
+    if len(body) > 12000:
+        body = body[:12000]
+    if not title and not body:
+        return None
+    points = _parse_html_numeric_points(body)
+    return {
+        "format": "html",
+        "title": title,
+        "body": body,
+        "points": points,
+        "items": [
+            {
+                "title": title,
+                "body": body,
+            }
+        ],
+    }
+
+
+class _TextHtmlParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self.text_parts: list[str] = []
+        self._in_title = False
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "title":
+            self._in_title = True
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "title":
+            self._in_title = False
+        if tag in {"script", "style", "noscript", "svg"} and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(str(data or "").split())
+        if not text:
+            return
+        if self._in_title:
+            self.title = f"{self.title} {text}".strip()
+            return
+        if self._skip_depth:
+            return
+        self.text_parts.append(text)
+
+
+def _parse_html_numeric_points(body: str) -> list[Mapping[str, Any]]:
+    if "0,25 0,5 0,75 1 2 3 5 7 10 15 20 30" in body:
+        zcyc_points = _parse_cbr_zcyc_points(body)
+        if zcyc_points:
+            return zcyc_points
+    points = []
+    pattern = re.compile(r"(\d{2}\.\d{2}\.\d{4})\D{0,80}([+-]?\d+(?:[\s\u00a0]\d{3})*(?:[,.]\d+)?)")
+    for match in pattern.finditer(body):
+        value = _numeric_text(match.group(2))
+        if value is not None:
+            points.append({"point_ts": _iso_date_from_ddmmyyyy(match.group(1)), "value": value})
+    return points[:500]
+
+
+def _parse_cbr_zcyc_points(body: str) -> list[Mapping[str, Any]]:
+    number = r"([+-]?\d+(?:[\s\u00a0]\d{3})*(?:[,.]\d+)?)"
+    pattern = re.compile(r"(\d{2}\.\d{2}\.\d{4})\s+" + r"\s+".join(number for _ in range(12)))
+    points: list[Mapping[str, Any]] = []
+    maturity_keys = (
+        "ofz_025y",
+        "ofz_05y",
+        "ofz_075y",
+        "ofz_1y",
+        "ofz_2y",
+        "ofz_3y",
+        "ofz_5y",
+        "ofz_7y",
+        "ofz_10y",
+        "ofz_15y",
+        "ofz_20y",
+        "ofz_30y",
+    )
+    for match in pattern.finditer(body):
+        values = [_numeric_text(value) for value in match.groups()[1:]]
+        if any(value is None for value in values):
+            continue
+        point = {"point_ts": _iso_date_from_ddmmyyyy(match.group(1)), "maturity_source": "cbr_zcyc"}
+        point.update({key: value for key, value in zip(maturity_keys, values, strict=False) if value is not None})
+        points.append(point)
+    return points[:500]
+
+
+def _numeric_text(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        text = str(value).replace("\u00a0", "").replace(" ", "").replace(",", ".")
+        if text.strip() in {"", "."}:
+            return None
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _iso_date_from_ddmmyyyy(value: str) -> str:
+    parts = str(value).split(".")
+    if len(parts) != 3:
+        return str(value)
+    return f"{parts[2]}-{parts[1]}-{parts[0]}T00:00:00Z"
+
+
+def _ddmmyyyy(value: str, separator: str = "/") -> str:
+    text = str(value or "")
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return f"{text[8:10]}{separator}{text[5:7]}{separator}{text[0:4]}"
+    return text
+
+
 def _flatten_query(payload: Mapping[str, Any]) -> dict[str, str]:
     return {str(key): _query_value(value) for key, value in payload.items() if _is_query_scalar(value)}
 
@@ -714,6 +945,18 @@ def _first(value: Any) -> str:
     if isinstance(value, str):
         return value
     return ""
+
+
+def _moex_interval(timeframe: str) -> str:
+    return {
+        "1m": "1",
+        "5m": "5",
+        "10m": "10",
+        "15m": "15",
+        "1h": "60",
+        "1d": "24",
+        "daily": "24",
+    }.get(str(timeframe), str(timeframe))
 
 
 def _strip_moex_prefix(value: str) -> str:

@@ -1564,15 +1564,8 @@ class EarningsDividendIntelligenceService:
                 )
             )
         if not candles or not gap_records:
-            requests.append(
-                self._external_request(
-                    job=job,
-                    module_input=module_input,
-                    provider="moex_iss",
-                    request_type="market_data",
-                    suffix="dividend_gap_history",
-                )
-            )
+            for instrument_id in module_input.instrument_ids:
+                requests.append(self._moex_market_data_request(job, instrument_id, "dividend_gap_history"))
         return tuple(requests)
 
     def create_llm_extraction_request(
@@ -1662,6 +1655,31 @@ class EarningsDividendIntelligenceService:
                 "dividend_event_refs": list(module_input.dividend_event_refs),
                 "financial_expectation_ref": module_input.financial_expectation_ref,
                 "historical_gap_ref": module_input.historical_gap_ref,
+                "time_range": job.time_range.to_dict(),
+                "gateway_only": True,
+            },
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=MARKET_PRICE_TTL_SECONDS, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _moex_market_data_request(self, job: ModuleJob, instrument_id: str, suffix: str) -> ExternalRequest:
+        secid = _strip_moex_prefix(instrument_id)
+        idempotency_key = f"{job.idempotency_key}:{suffix}:{instrument_id}:TQBR:1d"
+        return ExternalRequest(
+            request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
+            caller_module=self.module_name,
+            provider="moex_iss",
+            request_type="market_data",
+            universe_id=job.universe_id,
+            instrument_ids=(instrument_id,),
+            payload={
+                "secid": secid,
+                "board_id": "TQBR",
+                "timeframe": "1d",
+                "timeframes": ["1d"],
+                "dividend_gap_ref": "dividend_gap_history",
                 "time_range": job.time_range.to_dict(),
                 "gateway_only": True,
             },
@@ -1981,6 +1999,11 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     except TypeError:
         return (str(value),)
     return tuple(str(item) for item in iterator if item not in (None, ""))
+
+
+def _strip_moex_prefix(value: str) -> str:
+    text = str(value or "")
+    return text.split(":", 1)[1] if text.startswith("moex:") else text
 
 
 def _coerce_timestamp(value: Any, fallback: str) -> str:

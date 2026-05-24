@@ -121,6 +121,26 @@ SOURCE_CREDIBILITY_REGISTRY = {
     "smartlab_news": 0.55,
     "default": 0.50,
 }
+TRUST_LEVEL_BY_SOURCE_TYPE = {
+    "issuer_disclosure": "high",
+    "prime_disclosure": "high",
+    "akm_disclosure": "high",
+    "corporate_site": "high",
+    "regulatory_text": "high",
+    "cbr_macro": "high",
+    "moex_macro": "high",
+    "macro_text": "high",
+    "rbc_news": "normal_high",
+    "tass_news": "normal_high",
+    "interfax_news": "normal_high",
+    "prime_news": "normal_high",
+    "finam_news": "normal",
+    "news_api": "normal",
+    "smartlab_news": "medium_weak",
+    "fred_eia_macro": "normal",
+    "rosstat_macro": "normal",
+}
+OFFICIAL_CONFIRMATION_SOURCE_TYPES = OFFICIAL_DISCLOSURE_SOURCE_TYPES | REGULATORY_SOURCE_TYPES | {"cbr_macro", "moex_macro", "macro_text"}
 MARKET_WIDE_CATEGORIES = {"macro", "regulation"}
 
 
@@ -245,7 +265,13 @@ class RawTextItem:
     published_at: str | None
     fetched_at: str | None
     content_hash: str
+    source: str | None = None
     source_payload: Mapping[str, Any] = field(default_factory=dict)
+    trust_level: str | None = None
+    confidence_score: float = 0.0
+    instrument_candidates: tuple[Mapping[str, Any], ...] = ()
+    issuer_candidates: tuple[Mapping[str, Any], ...] = ()
+    quality_flags: tuple[str, ...] = ()
     discovery_run_id: str | None = None
     discovery_item_id: str | None = None
     discovery_mode: str | None = None
@@ -289,7 +315,8 @@ class RawTextItem:
             payload = payload["raw_text_item"]  # type: ignore[assignment]
         title = str(payload.get("title") or payload.get("headline") or "").strip()
         body = str(payload.get("body") or payload.get("text") or payload.get("content") or "").strip()
-        source_type = str(payload.get("source_type") or payload.get("source") or default_source_type).strip()
+        source_type = str(payload.get("source_type") or default_source_type or payload.get("source") or "").strip()
+        source = _optional_text(payload.get("source_name") or payload.get("source_ref_name") or payload.get("source"))
         source_url = _optional_text(payload.get("source_url") or payload.get("url"))
         item_hash = str(payload.get("content_hash") or content_hash(title, body or source_url or ""))
         source_ref = str(
@@ -311,6 +338,7 @@ class RawTextItem:
             universe_id=str(payload.get("universe_id") or universe_id),
             instrument_ids=instrument_ids,
             source_type=source_type,
+            source=source or source_type,
             source_ref=source_ref,
             source_url=source_url,
             title=title,
@@ -319,7 +347,12 @@ class RawTextItem:
             published_at=_optional_text(payload.get("published_at")),
             fetched_at=fetched_at,
             content_hash=item_hash,
-            source_payload={**dict(payload), "source_ref": source_ref},
+            source_payload={**dict(payload), "source_ref": source_ref, "source": source or source_type},
+            trust_level=_optional_text(payload.get("trust_level")) or TRUST_LEVEL_BY_SOURCE_TYPE.get(source_type),
+            confidence_score=_float_or_zero(payload.get("confidence_score")),
+            instrument_candidates=_mapping_tuple(payload.get("instrument_candidates")),
+            issuer_candidates=_mapping_tuple(payload.get("issuer_candidates")),
+            quality_flags=_string_tuple(payload.get("quality_flags")),
             discovery_run_id=_optional_text(payload.get("discovery_run_id")),
             discovery_item_id=_optional_text(payload.get("discovery_item_id") or _ref_id(payload.get("discovery_item_ref"))),
             discovery_mode=_optional_text(payload.get("discovery_mode")),
@@ -332,6 +365,7 @@ class RawTextItem:
             "universe_id": self.universe_id,
             "instrument_ids": list(self.instrument_ids),
             "source_type": self.source_type,
+            "source": self.source or self.source_type,
             "source_ref": self.source_ref,
             "source_url": self.source_url,
             "title": self.title,
@@ -340,6 +374,11 @@ class RawTextItem:
             "published_at": self.published_at,
             "fetched_at": self.fetched_at,
             "content_hash": self.content_hash,
+            "trust_level": self.trust_level,
+            "confidence_score": self.confidence_score,
+            "instrument_candidates": [dict(item) for item in self.instrument_candidates],
+            "issuer_candidates": [dict(item) for item in self.issuer_candidates],
+            "quality_flags": list(self.quality_flags),
             "discovery_run_id": self.discovery_run_id,
             "discovery_item_id": self.discovery_item_id,
             "discovery_mode": self.discovery_mode,
@@ -1167,6 +1206,7 @@ class DataIntakeRoutingService:
                 "query_terms": list(query_terms),
                 "query": query_payload,
                 "external_request_id": request.request_id,
+                **self._source_context(config, source_type, query_payload),
             }
         return requests, discovery_items, request_contexts
 
@@ -1389,10 +1429,42 @@ class DataIntakeRoutingService:
         raw_item: RawTextItem,
         active_profiles: tuple[Any, ...],
     ) -> RawTextItem:
-        mapped_ids, entity_match_score = self.map_text_to_instrument_ids(raw_item, active_profiles)
+        instrument_candidates = self._instrument_candidates(raw_item, active_profiles)
+        issuer_candidates = self._issuer_candidates(instrument_candidates, active_profiles)
+        mapped_ids = tuple(
+            str(candidate["instrument_id"])
+            for candidate in instrument_candidates
+            if float(candidate.get("score") or 0.0) >= 0.70
+        )
+        entity_match_score = max((float(candidate.get("score") or 0.0) for candidate in instrument_candidates), default=0.0)
         source_score = self.score_source_credibility(raw_item.source_type)
         category = self.classify_text_category(raw_item)
         topic_match = self._topic_match_score(category)
+        trust_level = raw_item.trust_level or TRUST_LEVEL_BY_SOURCE_TYPE.get(raw_item.source_type, "unknown")
+        quality_flags = self._quality_flags_for_raw_item(
+            raw_item=raw_item,
+            category=category,
+            trust_level=trust_level,
+            instrument_candidates=instrument_candidates,
+        )
+        relevance = relevance_score(entity_match_score, topic_match, source_score)
+        raw_confidence = self._raw_confidence_score(
+            source_score=source_score,
+            entity_match_score=entity_match_score,
+            relevance=relevance,
+            quality_flags=quality_flags,
+        )
+        enriched_payload = {
+            **dict(raw_item.source_payload),
+            "source": raw_item.source or raw_item.source_type,
+            "source_type": raw_item.source_type,
+            "trust_level": trust_level,
+            "confidence_score": raw_confidence,
+            "instrument_candidates": [dict(item) for item in instrument_candidates],
+            "issuer_candidates": [dict(item) for item in issuer_candidates],
+            "quality_flags": list(quality_flags),
+            "confirmation_status": self._confirmation_status(raw_item.source_type),
+        }
         return replace(
             raw_item,
             instrument_ids=mapped_ids,
@@ -1400,7 +1472,13 @@ class DataIntakeRoutingService:
             text_category=category,
             instrument_mapping_confidence=instrument_mapping_confidence(entity_match_score),
             source_credibility_score=source_score,
-            relevance_score=relevance_score(entity_match_score, topic_match, source_score),
+            relevance_score=relevance,
+            trust_level=trust_level,
+            confidence_score=raw_confidence,
+            instrument_candidates=instrument_candidates,
+            issuer_candidates=issuer_candidates,
+            quality_flags=quality_flags,
+            source_payload=enriched_payload,
         )
 
     def _raw_payloads_from_external_response(
@@ -1428,6 +1506,10 @@ class DataIntakeRoutingService:
             "discovery_item_ref": response_context.get("discovery_item_ref"),
             "discovery_mode": response_context.get("discovery_mode"),
             "external_request_id": response_context.get("external_request_id") or response.request_id,
+            "source_name": response_context.get("source_name"),
+            "source_layer": response_context.get("source_layer"),
+            "trust_level": response_context.get("trust_level"),
+            "quality_flags": response_context.get("quality_flags"),
         }
         items = data.get("items")
         if not isinstance(items, list):
@@ -1653,6 +1735,30 @@ class DataIntakeRoutingService:
             transport["endpoint"] = endpoint.strip()
         return transport
 
+    def _source_context(
+        self,
+        config: TextSourceConfig | None,
+        source_type: str,
+        query_payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        policy = dict(config.source_policy) if config is not None else {}
+        trust_level = str(policy.get("trust_level") or query_payload.get("trust_level") or TRUST_LEVEL_BY_SOURCE_TYPE.get(source_type, "unknown"))
+        flags: list[str] = []
+        if source_type in FAST_NEWS_SOURCE_TYPES:
+            flags.append("candidate_early_signal")
+        if source_type == "smartlab_news":
+            flags.append("weak_source")
+        if str(policy.get("fetch_scope") or "") == "market_wide_once":
+            flags.append("market_wide_feed")
+        if source_type in OFFICIAL_CONFIRMATION_SOURCE_TYPES:
+            flags.append("official_confirmation_layer")
+        return {
+            "source_name": policy.get("source_name") or query_payload.get("source_name") or source_type,
+            "source_layer": policy.get("source_layer") or query_payload.get("source_layer"),
+            "trust_level": trust_level,
+            "quality_flags": tuple(dict.fromkeys(flags)),
+        }
+
     def _market_wide_once_source(self, config: TextSourceConfig | None) -> bool:
         if config is None:
             return False
@@ -1780,6 +1886,114 @@ class DataIntakeRoutingService:
             if reason_code in {"source_disabled", "instrument_not_eligible"}:
                 reason_codes.append(reason_code)
         return tuple(dict.fromkeys(reason_codes))
+
+    def _instrument_candidates(
+        self,
+        raw_item: RawTextItem,
+        active_profiles: tuple[Any, ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        text = f"{raw_item.title}\n{raw_item.body}"
+        explicit_ids = set(raw_item.instrument_ids)
+        candidates: list[Mapping[str, Any]] = []
+        for profile in active_profiles:
+            instrument_id = str(_profile_value(profile, "instrument_id"))
+            matched_aliases: list[str] = []
+            score = 0.0
+            for alias, alias_type in self._profile_aliases(profile):
+                if self._contains_alias(text, alias):
+                    matched_aliases.append(alias)
+                    score = max(score, self._alias_score(alias_type))
+            if instrument_id in explicit_ids:
+                score = max(score, 0.60)
+            if score > 0:
+                candidates.append(
+                    {
+                        "instrument_id": instrument_id,
+                        "ticker": str(_profile_value(profile, "ticker", "") or ""),
+                        "issuer_name": str(_profile_value(profile, "issuer_name", "") or ""),
+                        "score": round(score, 6),
+                        "matched_aliases": list(dict.fromkeys(matched_aliases))[:8],
+                    }
+                )
+        candidates.sort(key=lambda item: (-float(item["score"]), str(item["instrument_id"])))
+        return tuple(candidates[:10])
+
+    def _issuer_candidates(
+        self,
+        instrument_candidates: tuple[Mapping[str, Any], ...],
+        active_profiles: tuple[Any, ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        profiles_by_id = {str(_profile_value(profile, "instrument_id")): profile for profile in active_profiles}
+        candidates: list[Mapping[str, Any]] = []
+        for candidate in instrument_candidates:
+            profile = profiles_by_id.get(str(candidate.get("instrument_id") or ""))
+            if profile is None:
+                continue
+            issuer_name = str(_profile_value(profile, "issuer_name", "") or candidate.get("issuer_name") or "")
+            if not issuer_name:
+                continue
+            candidates.append(
+                {
+                    "issuer_name": issuer_name,
+                    "instrument_id": str(candidate.get("instrument_id") or ""),
+                    "ticker": str(candidate.get("ticker") or ""),
+                    "score": float(candidate.get("score") or 0.0),
+                }
+            )
+        return tuple(candidates[:10])
+
+    def _quality_flags_for_raw_item(
+        self,
+        *,
+        raw_item: RawTextItem,
+        category: str,
+        trust_level: str,
+        instrument_candidates: tuple[Mapping[str, Any], ...],
+    ) -> tuple[str, ...]:
+        flags: list[str] = list(raw_item.quality_flags)
+        if raw_item.source_type in FAST_NEWS_SOURCE_TYPES:
+            flags.append("candidate_early_signal")
+        if raw_item.source_type == "smartlab_news":
+            flags.append("weak_source")
+        if raw_item.source_type in OFFICIAL_CONFIRMATION_SOURCE_TYPES:
+            flags.append("official_confirmation_layer")
+        if trust_level not in {"high", "normal_high", "normal"}:
+            flags.append("low_source_trust")
+        if not raw_item.published_at:
+            flags.append("missing_published_at")
+        if not raw_item.body:
+            flags.append("missing_body")
+        if not instrument_candidates and category not in MARKET_WIDE_CATEGORIES:
+            flags.append("no_instrument_match")
+        if category in {"corporate_action", "dividend", "earnings"} and raw_item.source_type not in OFFICIAL_CONFIRMATION_SOURCE_TYPES:
+            flags.append("requires_official_confirmation")
+        return tuple(dict.fromkeys(flags))
+
+    def _raw_confidence_score(
+        self,
+        *,
+        source_score: float,
+        entity_match_score: float,
+        relevance: float,
+        quality_flags: tuple[str, ...],
+    ) -> float:
+        confidence = 0.40 * source_score + 0.35 * entity_match_score + 0.25 * relevance
+        if "requires_official_confirmation" in quality_flags:
+            confidence = min(confidence, 0.72)
+        if "weak_source" in quality_flags:
+            confidence = min(confidence, 0.55)
+        if "missing_body" in quality_flags:
+            confidence *= 0.80
+        if "no_instrument_match" in quality_flags:
+            confidence *= 0.65
+        return _clip01(confidence)
+
+    def _confirmation_status(self, source_type: str) -> str:
+        if source_type in OFFICIAL_CONFIRMATION_SOURCE_TYPES:
+            return "official_confirmed"
+        if source_type in OFFICIAL_CONFIRMATION_SOURCE_TYPES | REGULATORY_SOURCE_TYPES:
+            return "official_context"
+        return "candidate_requires_official_confirmation"
 
     def _profile_aliases(self, profile: Any) -> tuple[tuple[str, str], ...]:
         aliases: list[tuple[str, str]] = []
@@ -2068,6 +2282,35 @@ def _profile_value(item: Any, name: str, default: Any = None) -> Any:
     if isinstance(item, Mapping):
         return item.get(name, default)
     return getattr(item, name, default)
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple, set)):
+        return tuple(str(item) for item in value if str(item or "").strip())
+    return (str(value),)
+
+
+def _mapping_tuple(value: Any) -> tuple[Mapping[str, Any], ...]:
+    if isinstance(value, Mapping):
+        return (dict(value),)
+    if isinstance(value, (list, tuple)):
+        return tuple(dict(item) for item in value if isinstance(item, Mapping))
+    return ()
+
+
+def _float_or_zero(value: Any) -> float:
+    try:
+        return _clip01(float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _clip01(value: float) -> float:
+    return min(1.0, max(0.0, float(value)))
 
 
 def _to_mapping(item: Any) -> Mapping[str, Any]:
