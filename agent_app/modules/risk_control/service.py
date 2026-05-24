@@ -665,6 +665,18 @@ class RiskControlService:
         side = "buy" if action == "buy" else "sell"
         proposed_trade_value = requested_quantity * price
         available_cash = self.available_cash(portfolio_snapshot)
+        min_expected_edge = self.portfolio_limit_value(portfolio_limits, risk_policy, "min_expected_edge_after_cost_score")
+        expected_edge = _payload_float(decision, "expected_edge_score")
+        expected_edge_after_cost = self.expected_edge_after_cost_score(decision, feature_vector)
+        metrics["expected_edge_score"] = expected_edge
+        metrics["expected_edge_after_cost_score"] = expected_edge_after_cost
+        if min_expected_edge is not None and expected_edge_after_cost < min_expected_edge:
+            flags.append("expected_edge_after_cost_below_threshold")
+        if "turnover_mandate_urgency" in tuple(decision.get("primary_reason_codes") or ()):
+            metrics["turnover_driven_expected_edge_after_cost"] = expected_edge_after_cost
+            if expected_edge_after_cost <= 0:
+                flags.append("turnover_trade_without_positive_edge")
+
         if side == "buy" and proposed_trade_value > available_cash:
             adjusted_quantity = floor_quantity(available_cash / price)
             adjustments.append(self.adjustment(instrument_id, "quantity", requested_quantity, adjusted_quantity, "cash_check"))
@@ -673,6 +685,22 @@ class RiskControlService:
             flags.append("cash_check_adjusted")
             if requested_quantity <= 0:
                 flags.append("cash_check_failed")
+
+        max_daily_turnover = self.portfolio_limit_value(portfolio_limits, risk_policy, "max_daily_turnover_rub")
+        if max_daily_turnover is not None:
+            current_daily_turnover = _payload_float(portfolio_snapshot.payload, "gross_turnover_rub_1d")
+            projected_daily_turnover = current_daily_turnover + proposed_trade_value
+            metrics["projected_daily_turnover_rub"] = projected_daily_turnover
+            metrics["max_daily_turnover_rub"] = max_daily_turnover
+            if projected_daily_turnover > max_daily_turnover:
+                allowed_value = max(0.0, max_daily_turnover - current_daily_turnover)
+                adjusted_quantity = floor_quantity(allowed_value / price)
+                adjustments.append(self.adjustment(instrument_id, "quantity", requested_quantity, adjusted_quantity, "max_daily_turnover"))
+                requested_quantity = adjusted_quantity
+                proposed_trade_value = requested_quantity * price
+                flags.append("max_daily_turnover_adjusted")
+                if requested_quantity <= 0:
+                    flags.append("max_daily_turnover_failed")
 
         max_order_value = self.max_order_value_rub(instrument_limit, risk_policy, portfolio_limits)
         if max_order_value is None:
@@ -720,10 +748,11 @@ class RiskControlService:
         if sector_exposure > sector_limit:
             flags.append("sector_limit_exceeded")
 
-        daily_loss_limit = self.portfolio_limit_value(portfolio_limits, risk_policy, "max_daily_loss_limit")
+        daily_loss_limit = self.max_daily_loss_rub(portfolio_limits, risk_policy, portfolio_snapshot)
         if daily_loss_limit is None:
             return self.manual_assessment(decision_set.decision_set_id, instrument_id, action, "max_daily_loss_limit_missing")
         daily_usage = daily_loss_usage(self.daily_pnl(portfolio_snapshot), daily_loss_limit)
+        metrics["daily_loss_limit_rub"] = daily_loss_limit
         metrics["daily_loss_usage"] = daily_usage
         if daily_usage >= 1.0:
             flags.append("daily_loss_limit_exceeded")
@@ -766,7 +795,7 @@ class RiskControlService:
             for flag in flags
             if flag.endswith("_exceeded")
             or flag.endswith("_failed")
-            or flag in {"data_quality_score_below_threshold", "adjusted_quantity_non_positive"}
+            or flag in {"data_quality_score_below_threshold", "adjusted_quantity_non_positive", "expected_edge_after_cost_below_threshold", "turnover_trade_without_positive_edge"}
         )
         if reject_flags:
             return RiskDecisionAssessment(
@@ -1036,6 +1065,49 @@ class RiskControlService:
                 flags.append(f"stale_feature_blocked:{metric_name}")
         return tuple(dict.fromkeys(flags))
 
+
+    def max_daily_loss_rub(
+        self,
+        portfolio_limits: tuple[PortfolioLimit, ...],
+        risk_policy: RiskPolicy | None,
+        portfolio_snapshot: PortfolioSnapshot,
+    ) -> float | None:
+        """Return the daily loss hard limit in RUB.
+
+        Older bootstrap policies stored only ``max_daily_loss_pct``.  Treating a
+        ratio such as ``0.02`` as two kopecks would make live trading reject
+        almost every decision.  The risk gate now prefers explicit RUB limits
+        and converts percentage limits using current portfolio equity.
+        """
+        explicit_rub = self.portfolio_limit_value(portfolio_limits, risk_policy, "max_daily_loss_limit")
+        if explicit_rub is not None and explicit_rub > 1.0:
+            return explicit_rub
+        daily_loss_pct = self.portfolio_limit_value(portfolio_limits, risk_policy, "max_daily_loss_pct")
+        equity = portfolio_snapshot.equity or portfolio_snapshot.cash or portfolio_snapshot.initial_capital_rub
+        if daily_loss_pct is not None and daily_loss_pct > 0 and equity and equity > 0:
+            return float(daily_loss_pct) * float(equity)
+        # If an explicit value <= 1 was supplied under a legacy alias, treat it
+        # as a ratio rather than RUB.
+        if explicit_rub is not None and explicit_rub > 0 and equity and equity > 0:
+            return float(explicit_rub) * float(equity)
+        return None
+
+    def expected_edge_after_cost_score(self, decision: Mapping[str, Any], feature_vector: FeatureVector) -> float:
+        explicit = _payload_float(decision, "expected_edge_after_cost_score")
+        if explicit is not None:
+            return explicit
+        raw_edge = _payload_float(decision, "expected_edge_score")
+        cost_bps = 0.0
+        for metric_name in ("estimated_order_slippage_bps", "estimated_slippage_bps", "spread_bps", "commission_bps"):
+            value = _feature_numeric(feature_vector.features, metric_name)
+            if value is not None and value > 0:
+                cost_bps += float(value)
+        # Decision edge is a normalized score, so bps are converted to a small
+        # comparable score penalty.  When a future alpha model emits explicit
+        # expected_edge_after_cost_bps/score, it should be passed directly in the
+        # decision payload and will take precedence above.
+        return raw_edge - (cost_bps / 10_000.0)
+
     def portfolio_limit_value(
         self,
         portfolio_limits: tuple[PortfolioLimit, ...],
@@ -1043,12 +1115,15 @@ class RiskControlService:
         name: str,
     ) -> float | None:
         aliases = {
-            "max_portfolio_exposure_pct": ("max_portfolio_exposure_pct", "max_gross_exposure_pct"),
+            "max_portfolio_exposure_pct": ("max_portfolio_exposure_pct", "max_portfolio_gross_exposure_pct", "max_gross_exposure_pct"),
             "max_daily_loss_limit": ("max_daily_loss_limit", "max_daily_loss_rub", "daily_loss_limit_rub"),
+            "max_daily_loss_pct": ("max_daily_loss_pct", "daily_loss_limit_pct"),
             "max_drawdown_limit": ("max_drawdown_limit", "max_drawdown_pct"),
             "max_allowed_slippage_bps": ("max_allowed_slippage_bps", "max_slippage_bps"),
             "max_order_value_rub": ("max_order_value_rub", "default_max_order_value_rub"),
             "arena_go_daily_trade_limit": ("arena_go_daily_trade_limit", "daily_trade_limit"),
+            "max_daily_turnover_rub": ("max_daily_turnover_rub", "daily_turnover_limit_rub"),
+            "min_expected_edge_after_cost_score": ("min_expected_edge_after_cost_score", "min_expected_edge_after_cost"),
             "max_sector_exposure_pct": ("max_sector_exposure_pct", "sector_limit_pct"),
             "portfolio_snapshot_ttl_seconds": ("portfolio_snapshot_ttl_seconds", "portfolio_state_ttl_seconds"),
             "min_data_quality_score": ("min_data_quality_score",),

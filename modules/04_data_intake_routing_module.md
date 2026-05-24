@@ -234,3 +234,7 @@ Fast news sources are saved as `candidate_early_signal`. Official disclosure, CB
 - Запрещено напрямую вызывать news/API/LLM provider, минуя Gateway.
 - Запрещено пропускать активный `instrument_id` в scheduled discovery без явного `source_disabled` или `instrument_not_eligible` audit reason.
 - Запрещено удалять raw text; допускается только пометка duplicate/irrelevant.
+
+## Runtime hardening note v5
+
+`source_missing_endpoint` is a valid scheduled discovery skip reason. It means the source is enabled and the instrument is eligible, but the source requires per-issuer metadata such as `issuer_ir_url` that is not yet populated. This condition must be stored, monitored and fixed through registry enrichment, not treated as a database schema error.

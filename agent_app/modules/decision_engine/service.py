@@ -489,7 +489,15 @@ class DecisionEngineService:
         if request.decision_mode == "manual_approval_required":
             reason_codes.append("manual_approval_required")
 
-        edge = expected_edge_score(contributions)
+        raw_edge = expected_edge_score(contributions)
+        turnover_context = self.turnover_context(portfolio_snapshot)
+        turnover_urgency = turnover_context.get("trade_urgency_score", 0.0)
+        edge = raw_edge
+        if request.run_mode == "live_trading" and raw_edge > 0 and turnover_urgency > 0:
+            turnover_boost = raw_edge * 0.60 * turnover_urgency
+            contributions["turnover_urgency_score"] = turnover_boost
+            edge = raw_edge + turnover_boost
+            reason_codes.append("turnover_mandate_urgency")
         risk_values = self.risk_components(
             vector_features=vector_features,
             data_quality_score=data_quality_score,
@@ -501,6 +509,8 @@ class DecisionEngineService:
             if metric_name in rules_by_metric
         }
         risk = weighted_average(risk_values, risk_weights)
+        execution_cost_bps = self.execution_cost_estimate_bps(vector_features)
+        expected_edge_after_cost = edge - (execution_cost_bps / 10_000.0)
         confidence = decision_confidence_score(
             coverage_ratio=coverage_ratio,
             feature_confidences=contribution_confidences,
@@ -591,6 +601,10 @@ class DecisionEngineService:
                 "risk_components": risk_values,
                 "latest_price": latest_price,
                 "feature_contributions": contributions,
+                "raw_expected_edge_score": raw_edge,
+                "expected_edge_after_cost_score": expected_edge_after_cost,
+                "execution_cost_estimate_bps": execution_cost_bps,
+                "turnover_context": turnover_context,
                 "reason_codes": list(cleaned_reasons),
                 "risk_control_required": True,
                 "order_intent_created": False,
@@ -598,7 +612,18 @@ class DecisionEngineService:
             },
         )
         decision_payload = _decision_record_to_dict(record)
+        decision_payload["expected_edge_after_cost_score"] = expected_edge_after_cost
+        decision_payload["execution_cost_estimate_bps"] = execution_cost_bps
         return InstrumentDecision(record=record, explanation=explanation, decision_payload=decision_payload)
+
+
+    def execution_cost_estimate_bps(self, vector_features: Mapping[str, Mapping[str, Any]]) -> float:
+        total = 0.0
+        for metric_name in ("estimated_order_slippage_bps", "estimated_slippage_bps", "spread_bps", "commission_bps"):
+            value = _feature_numeric(vector_features, metric_name)
+            if value is not None and value > 0:
+                total += float(value)
+        return max(0.0, total)
 
     def rules_by_metric(self, metric_rules: tuple[MetricWeightRule, ...]) -> dict[str, MetricWeightRule]:
         selected: dict[str, MetricWeightRule] = {}
@@ -607,6 +632,35 @@ class DecisionEngineService:
             if current is None or abs(rule.weight) > abs(current.weight):
                 selected[rule.metric_name] = rule
         return selected
+
+    def turnover_context(self, portfolio_snapshot: PortfolioSnapshot | None) -> dict[str, float | str | bool]:
+        if portfolio_snapshot is None or not isinstance(portfolio_snapshot.payload, Mapping):
+            return {
+                "turnover_mandate_enabled": False,
+                "turnover_target_status": "unknown",
+                "trade_urgency_score": 0.0,
+            }
+        payload = portfolio_snapshot.payload
+        status = str(payload.get("turnover_target_status") or "unknown")
+        progress = clip(_payload_float(payload, "turnover_progress_ratio"))
+        remaining = max(0.0, _payload_float(payload, "remaining_turnover_rub_14d"))
+        target = max(0.0, _payload_float(payload, "target_gross_turnover_rub_14d"))
+        if status == "achieved" or target <= 0:
+            urgency = 0.0
+        elif status == "critically_behind":
+            urgency = 1.0
+        elif status == "behind":
+            urgency = max(0.35, min(0.85, 1.0 - progress))
+        else:
+            urgency = max(0.0, min(0.35, 1.0 - progress))
+        return {
+            "turnover_mandate_enabled": bool(payload.get("turnover_mandate_enabled", True)),
+            "turnover_target_status": status,
+            "turnover_progress_ratio": progress,
+            "remaining_turnover_rub_14d": remaining,
+            "target_gross_turnover_rub_14d": target,
+            "trade_urgency_score": urgency,
+        }
 
     def global_block_reasons(
         self,
@@ -726,8 +780,9 @@ class DecisionEngineService:
         reason_codes: tuple[str, ...],
         position: PositionState | None,
     ) -> str:
-        if reason_codes:
-            return "block" if request.decision_mode != "manual_approval_required" else "block"
+        blocking_reasons = self.blocking_reason_codes(reason_codes)
+        if blocking_reasons:
+            return "block"
         if request.decision_mode == "manual_approval_required":
             return "block"
         if risk_score >= self.policy.risk_block_threshold:
@@ -746,6 +801,37 @@ class DecisionEngineService:
         if expected_edge < 0:
             return "sell" if current_quantity > 0 else "hold"
         return "hold"
+
+    def blocking_reason_codes(self, reason_codes: tuple[str, ...]) -> tuple[str, ...]:
+        """Return only hard-block reasons.
+
+        ``primary_reason_codes`` intentionally include explanatory codes such as
+        ``turnover_mandate_urgency``. Earlier versions treated any reason code as
+        a block, which made autonomous turnover-aware decisions self-blocking.
+        """
+        hard_prefixes = (
+            "feature_vector_missing",
+            "feature_coverage_low",
+            "feature_confidence_below_rule",
+            "expired_feature_blocked",
+            "market_session_status:",
+            "market_regime:stress",
+        )
+        hard_codes = {
+            "weights_profile_not_active",
+            "weights_profile_horizon_mismatch",
+            "run_mode_not_allowed_by_weights_profile",
+            "portfolio_snapshot_missing",
+            "portfolio_state_stale",
+            "market_state_stale",
+            "expired_features_not_allowed",
+            "manual_approval_required",
+        }
+        return tuple(
+            code
+            for code in reason_codes
+            if code in hard_codes or any(code.startswith(prefix) for prefix in hard_prefixes)
+        )
 
     def build_audit_record(
         self,

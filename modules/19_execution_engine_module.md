@@ -209,3 +209,9 @@ ArenaGo success response must be mapped into `execution_result` and `portfolio_u
   }
 }
 ```
+
+## Runtime stabilization note v4
+
+The execution input may contain an empty `order_intent_refs` list. This means the current autonomous cycle produced no risk-approved orders and the correct result is `skipped` with no broker call. The module must not resolve `orders.order_intent:latest` and submit stale orders just to stay active.
+
+Execution remains a pure executor: it does not create turnover, does not decide direction, and does not bypass `Risk Control Module`.

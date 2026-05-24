@@ -301,6 +301,8 @@ class InMemoryExecutionEngineRepository:
 
     def get_order_intent(self, order_intent_ref: str) -> OrderIntentRecord | None:
         requested = ref_tail(order_intent_ref)
+        if requested in {"", "latest", "scheduled"}:
+            return sorted(self.order_intents, key=lambda item: (item.created_at, item.order_intent_id))[-1] if self.order_intents else None
         for order_intent in self.order_intents:
             if order_intent.order_intent_id == requested:
                 return order_intent
@@ -308,6 +310,8 @@ class InMemoryExecutionEngineRepository:
 
     def get_risk_check_result(self, risk_check_ref: str) -> RiskCheckResultRecord | None:
         requested = ref_tail(risk_check_ref)
+        if requested in {"", "latest", "scheduled"}:
+            return sorted(self.risk_check_results, key=lambda item: (item.checked_at, item.risk_check_id))[-1] if self.risk_check_results else None
         for result in self.risk_check_results:
             if result.risk_check_id == requested:
                 return result
@@ -390,35 +394,62 @@ class PostgresExecutionEngineRepository:
         return psycopg.connect(self.database_url)
 
     def get_order_intent(self, order_intent_ref: str) -> OrderIntentRecord | None:
+        requested = ref_tail(order_intent_ref)
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT order_intent_id, instrument_id, side, quantity, order_type,
-                           limit_price, time_in_force, max_slippage_bps,
-                           execution_ttl_seconds, decision_set_id, risk_check_id,
-                           run_mode, created_at, payload
-                      FROM orders.order_intent
-                     WHERE order_intent_id = %s
-                    """,
-                    (ref_tail(order_intent_ref),),
-                )
+                if requested in {"", "latest", "scheduled"}:
+                    cur.execute(
+                        """
+                        SELECT order_intent_id, instrument_id, side, quantity, order_type,
+                               limit_price, time_in_force, max_slippage_bps,
+                               execution_ttl_seconds, decision_set_id, risk_check_id,
+                               run_mode, created_at, payload
+                          FROM orders.order_intent
+                         ORDER BY created_at DESC, order_intent_id DESC
+                         LIMIT 1
+                        """
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT order_intent_id, instrument_id, side, quantity, order_type,
+                               limit_price, time_in_force, max_slippage_bps,
+                               execution_ttl_seconds, decision_set_id, risk_check_id,
+                               run_mode, created_at, payload
+                          FROM orders.order_intent
+                         WHERE order_intent_id = %s
+                        """,
+                        (requested,),
+                    )
                 row = cur.fetchone()
         return _order_intent_from_row(row) if row else None
 
     def get_risk_check_result(self, risk_check_ref: str) -> RiskCheckResultRecord | None:
+        requested = ref_tail(risk_check_ref)
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT risk_check_id, decision_set_id, status,
-                           approved_order_intents, rejected_decisions, risk_flags,
-                           adjustments, checked_at, payload
-                      FROM risk.risk_check_result
-                     WHERE risk_check_id = %s
-                    """,
-                    (ref_tail(risk_check_ref),),
-                )
+                if requested in {"", "latest", "scheduled"}:
+                    cur.execute(
+                        """
+                        SELECT risk_check_id, decision_set_id, status,
+                               approved_order_intents, rejected_decisions, risk_flags,
+                               adjustments, checked_at, payload
+                          FROM risk.risk_check_result
+                         ORDER BY checked_at DESC, risk_check_id DESC
+                         LIMIT 1
+                        """
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT risk_check_id, decision_set_id, status,
+                               approved_order_intents, rejected_decisions, risk_flags,
+                               adjustments, checked_at, payload
+                          FROM risk.risk_check_result
+                         WHERE risk_check_id = %s
+                        """,
+                        (requested,),
+                    )
                 row = cur.fetchone()
         return _risk_check_result_from_row(row) if row else None
 

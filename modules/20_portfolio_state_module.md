@@ -191,3 +191,17 @@ At first launch, if no `portfolio_snapshot` exists, create:
 ```
 
 After first ArenaGo sync, provider state has priority over seed state.
+
+## Turnover accounting
+
+`Portfolio State Module` is the source of truth for realized turnover progress. It calculates rolling `gross_turnover_rub_1d` and `gross_turnover_rub_14d` from actual fills/trades, not from intended orders. These values feed `Decision Engine Module`, `Risk Control Module`, monitoring and validation.
+
+## Runtime stabilization note v4
+
+Turnover mandate metrics are calculated from realized fills/trades, not order intents. The 1-day turnover is summed for the current day, broker trades are filtered to the rolling mandate window, required daily turnover is based on remaining days, and projected 14-day turnover is based on observed average daily pace.
+
+`turnover_target_status` is time-aware: actual progress is compared to expected progress for the elapsed part of the mandate window. This lets the agent become more active when it is genuinely behind schedule, without rewarding blind churn.
+
+## Runtime hardening note v5
+
+Turnover progress is a realized KPI, not an order-intent KPI. The module must calculate turnover from fills, execution results and normalized ArenaGo trades after timestamp normalization. These realized turnover fields are used by Decision Engine and Monitoring, and they are also required for `expected_edge_after_cost` / churn-quality analysis.

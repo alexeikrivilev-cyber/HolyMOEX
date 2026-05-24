@@ -174,3 +174,17 @@ Base portfolio capital comes from `Portfolio State Store`. Initial capital must 
 ```
 
 `Decision Engine Module` cannot assume fixed cash after startup. It must use latest `portfolio_snapshot`.
+
+## Autonomous live turnover mandate
+
+`Decision Engine Module` treats `trading_mandate:live:turnover_10m_14d:v1` as a strategy objective in `live_trading`. It may raise `trade_urgency_score` when `Portfolio State Module` reports `turnover_target_status = behind | critically_behind`, but it must not generate trades with negative expected edge only to create volume. Turnover-driven decisions must include reason code `turnover_mandate_urgency` and remain subject to `Risk Control Module`.
+
+## Runtime stabilization note v4
+
+`reason_codes` are not automatically blocking. The module distinguishes hard-blocking reason codes from explanatory/warning reason codes. `turnover_mandate_urgency` is explanatory: it may increase trade urgency for a positive-edge decision but must not by itself convert the decision action to `block`.
+
+Hard blocking remains valid for missing feature vectors, insufficient coverage, disallowed run mode, inactive or mismatched weights profile, stale portfolio/market state, expired features under block policy and explicit manual-review/risk-off conditions.
+
+## Post-cost turnover note v5
+
+For autonomous live turnover, the module must emit `expected_edge_after_cost_score` and `execution_cost_estimate_bps` in the `decision_set.decisions` payload. The estimate is derived from the scored edge minus a cost proxy from spread, slippage and commission features when no explicit post-cost alpha model output is available. This lets `Risk Control Module` distinguish profitable active trading from churn.

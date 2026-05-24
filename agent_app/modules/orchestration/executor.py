@@ -73,13 +73,28 @@ DEFAULT_SERVICE_TARGETS: Mapping[str, ServiceTarget] = {
 
 
 class LocalModuleExecutor:
+    """Local module executor with runtime repository injection.
+
+    Unit tests may keep the default in-memory services, but production/paper/live
+    runtime must not silently fall back to in-memory stores. When ``database_url``
+    is provided (or ``DATABASE_URL`` exists and ``use_postgres`` is true), services
+    are constructed with their matching ``Postgres*Repository`` classes and share
+    one External Request Gateway instance.
+    """
+
     def __init__(
         self,
         service_targets: Mapping[str, ServiceTarget] | None = None,
         service_instances: Mapping[str, Any] | None = None,
+        database_url: str | None = None,
+        use_postgres: bool | None = None,
     ) -> None:
+        import os
+
         self.service_targets = dict(service_targets or DEFAULT_SERVICE_TARGETS)
         self.service_instances = dict(service_instances or {})
+        self.database_url = database_url or os.getenv("DATABASE_URL", "")
+        self.use_postgres = bool(self.database_url) if use_postgres is None else bool(use_postgres and self.database_url)
 
     def execute(self, job: ModuleJob, payload: Mapping[str, Any]) -> ModuleJobResult:
         started_at = to_utc_iso(utc_now())
@@ -111,8 +126,64 @@ class LocalModuleExecutor:
             raise ValueError(f"module executor target is not configured: {module_name}")
         module = importlib.import_module(target.module_path)
         service_class = getattr(module, target.class_name)
-        service = service_class()
+        kwargs = self._constructor_kwargs(module_name, target)
+        service = service_class(**kwargs)
         self.service_instances[module_name] = service
+        return service
+
+    def _constructor_kwargs(self, module_name: str, target: ServiceTarget) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if self.use_postgres:
+            kwargs["repository"] = self._postgres_repository_for(module_name, target)
+        # In-memory/unit-test execution must not accidentally open real HTTP connections.
+        # Production/paper/live runtimes use Postgres-backed providers and get the shared
+        # External Request Gateway; in-memory services keep their own deterministic defaults.
+        if self.use_postgres and self._service_accepts_gateway(target):
+            kwargs["gateway"] = self._gateway_service()
+        return kwargs
+
+    def _postgres_repository_for(self, module_name: str, target: ServiceTarget) -> Any:
+        repo_module_path = target.module_path.rsplit(".", 1)[0] + ".repository"
+        repo_module = importlib.import_module(repo_module_path)
+        repo_class = self._find_postgres_repository_class(repo_module, module_name)
+        return repo_class(self.database_url)
+
+    def _find_postgres_repository_class(self, repo_module: Any, module_name: str) -> Any:
+        candidates = [
+            name
+            for name in dir(repo_module)
+            if name.startswith("Postgres") and name.endswith("Repository")
+        ]
+        if not candidates:
+            raise ValueError(f"Postgres repository is not configured for {module_name}")
+        if len(candidates) == 1:
+            return getattr(repo_module, candidates[0])
+        normalized_module = _normalize_identifier(module_name.replace(" Module", ""))
+        for name in candidates:
+            if normalized_module in _normalize_identifier(name):
+                return getattr(repo_module, name)
+        return getattr(repo_module, sorted(candidates)[0])
+
+    def _service_accepts_gateway(self, target: ServiceTarget) -> bool:
+        import inspect
+
+        module = importlib.import_module(target.module_path)
+        service_class = getattr(module, target.class_name)
+        signature = inspect.signature(service_class.__init__)
+        return "gateway" in signature.parameters
+
+    def _gateway_service(self) -> Any:
+        gateway_name = "External Request Gateway Module"
+        if gateway_name in self.service_instances:
+            return self.service_instances[gateway_name]
+        target = self.service_targets[gateway_name]
+        module = importlib.import_module(target.module_path)
+        service_class = getattr(module, target.class_name)
+        kwargs: dict[str, Any] = {}
+        if self.use_postgres:
+            kwargs["repository"] = self._postgres_repository_for(gateway_name, target)
+        service = service_class(**kwargs)
+        self.service_instances[gateway_name] = service
         return service
 
     def _call_service(self, service: Any, payload: Mapping[str, Any], job: ModuleJob) -> Any:
@@ -151,6 +222,8 @@ class LocalModuleExecutor:
         )
 
 
+def _normalize_identifier(value: str) -> str:
+    return "".join(ch.lower() for ch in value if ch.isalnum())
 def _output_refs(raw_result: Any) -> tuple[str, ...]:
     if isinstance(raw_result, Mapping):
         value = raw_result.get("output_refs") or raw_result.get("output_ref")

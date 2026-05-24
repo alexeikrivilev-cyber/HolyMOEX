@@ -189,3 +189,15 @@ Monitoring events постоянные для audit. Health report обновл�
 - Запрещено отправлять заявки.
 - Запрещено скрывать or delete audit records.
 - Запрещено store raw API keys/secrets in logs.
+
+## Turnover and autonomous live monitoring
+
+Monitoring must track `gross_turnover_rub_14d`, `turnover_progress_ratio`, `remaining_turnover_rub_14d`, `projected_turnover_rub_14d`, `turnover_target_status`, risk rejections, slippage/commission drag and harmful churn. Falling behind the target is an alert, not a reason to bypass risk controls.
+
+## Runtime stabilization note v4
+
+Monitoring should treat `turnover_target_status`, `projected_turnover_rub_14d`, `required_daily_turnover_rub`, risk rejections, execution skips, stale-source warnings and harmful churn as first-class live health signals. A skipped execution cycle is normal when Risk Control produced no approved orders; repeated skips while the turnover mandate is behind should raise an operational alert, not bypass risk.
+
+## Runtime hardening note v5
+
+Monitoring must treat `source_missing_endpoint`, non-normalized live weights, failed readiness checks, stale scheduler ticks, high commission/slippage drag and negative post-cost edge as product-readiness issues. For server deployment, monitoring should distinguish optional/manual services from the primary autonomous `scheduler_worker` daemon.

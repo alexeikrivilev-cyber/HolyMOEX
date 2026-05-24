@@ -192,3 +192,17 @@ Orchestration responsibilities after execution:
 - save `module_job_result`;
 - write an `audit_record` for executed, skipped, and failed jobs;
 - keep business calculations inside the target module, not inside Orchestration.
+
+## Runtime stabilization note v4
+
+`Orchestration Module` must preserve current-cycle `output_refs` and pass them into subsequent `module_job.input_refs`. This prevents live jobs from relying on stale placeholder refs such as `decisions.decision_set:latest` or `orders.order_intent:latest` when a current-cycle object exists.
+
+The autonomous server worker is persistent and repeatedly triggers orchestration for market data, macro, text, feature, decision, execution, portfolio and monitoring sources. It does not call analytical modules directly and does not bypass the `External Request Gateway Module`, `Decision Engine Module`, `Risk Control Module` or `Execution Engine Module` boundaries.
+
+`Execution Engine Module` must receive explicit current-cycle `order_intent_refs`. If the current risk check produced no approved order intents, execution is skipped rather than falling back to a stale latest order.
+
+## Runtime hardening note v5
+
+`scheduler_worker` is schedule-aware in PostgreSQL runtime. It reads enabled `audit.schedule_config` rows, derives intervals from `interval_seconds` or `frequency`, and triggers Orchestration by source. Pure event-driven schedules such as `on_decision_set` and `on_approved_order` are not launched blindly by timer; they are handled by current-cycle refs produced by upstream modules.
+
+Docker/server runtime must treat `scheduler_worker` as the primary long-running process. `agent_app` is a manual one-shot control entrypoint, and `research_worker` is an optional batch profile. Restart-loops around one-shot entrypoints are forbidden.

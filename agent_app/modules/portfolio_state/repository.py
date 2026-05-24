@@ -185,6 +185,9 @@ class PortfolioStateRepository(Protocol):
     def get_order_intent(self, order_intent_id: str) -> OrderIntentRecord | None:
         ...
 
+    def list_recent_fill_reports(self, portfolio_id: str, as_of_ts: str, window_days: int) -> tuple[FillReportRecord, ...]:
+        ...
+
     def get_latest_market_prices(
         self,
         instrument_ids: tuple[str, ...],
@@ -253,6 +256,20 @@ class InMemoryPortfolioStateRepository:
             if order.order_intent_id == requested:
                 return order
         return None
+
+    def list_recent_fill_reports(self, portfolio_id: str, as_of_ts: str, window_days: int) -> tuple[FillReportRecord, ...]:
+        del portfolio_id
+        as_of = parse_utc_iso(as_of_ts)
+        window_seconds = max(1, int(window_days)) * 86_400
+        recent = []
+        for fill in self.fill_reports:
+            if not fill.fill_ts:
+                continue
+            fill_ts = parse_utc_iso(fill.fill_ts)
+            age = (as_of - fill_ts).total_seconds()
+            if 0 <= age <= window_seconds:
+                recent.append(fill)
+        return tuple(sorted(recent, key=lambda item: item.fill_ts))
 
     def get_latest_market_prices(
         self,
@@ -361,6 +378,25 @@ class PostgresPortfolioStateRepository:
                 )
                 row = cur.fetchone()
         return _order_intent_from_row(row) if row else None
+
+    def list_recent_fill_reports(self, portfolio_id: str, as_of_ts: str, window_days: int) -> tuple[FillReportRecord, ...]:
+        del portfolio_id
+        as_of = parse_utc_iso(as_of_ts)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT fill_report_id, order_intent_id, provider_fill_id,
+                           fill_ts, filled_quantity, fill_price, fees, payload
+                      FROM orders.fill_report
+                     WHERE fill_ts <= %s
+                       AND fill_ts >= %s - (%s::text || ' days')::interval
+                     ORDER BY fill_ts, fill_report_id
+                    """,
+                    (as_of, as_of, int(window_days)),
+                )
+                rows = cur.fetchall()
+        return tuple(_fill_report_from_row(row) for row in rows)
 
     def get_latest_market_prices(
         self,

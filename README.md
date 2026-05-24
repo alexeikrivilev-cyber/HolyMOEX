@@ -494,7 +494,7 @@ Active paper/analysis baseline profiles:
 | `swing` | `weights:product_baseline:swing:v1` | price, event, earnings/fundamental, market context and risk |
 | `position` | `weights:product_baseline:position:v1` | fundamental, valuation, dividends, macro/sector context and risk |
 
-The previous `strict_default` profiles are retained for audit/replay but seeded as `deprecated`. Runtime schedules must reference `product_baseline` profiles. Live-trading weights remain inactive until a separate governance process approves a live-specific version.
+The previous `strict_default` profiles are retained for audit/replay but seeded as `deprecated`. Runtime schedules for analysis/paper use `product_baseline` profiles. Autonomous live trading uses separate `weights:live_autonomous:*:v1` profiles and `risk_policy:live_autonomous_turnover:v1`, seeded by the autonomous live governance migration.
 
 `weights_profile`:
 
@@ -713,7 +713,7 @@ LLM_DEFAULT_RESPONSE_FORMAT=json_object
 
 ## 17. ArenaGo execution integration
 
-Торговая платформа: `ArenaGo`. Начальный капитал системы: `1000000 RUB`. Базовый режим запуска до ручного переключения: `paper_trading`. Для `live_trading` нужен отдельный `risk_policy` и активный `weights_profile` с `run_mode_allowed` включая `live_trading`.
+Торговая платформа: `ArenaGo`. Начальный капитал системы: `1000000 RUB`. Целевой продуктовый режим: автономный `live_trading` с отдельным live risk policy, live weights и turnover mandate. `paper_trading` остаётся обязательным проверочным контуром, но не является финальным режимом продукта.
 
 ### 17.1 ArenaGo provider
 
@@ -953,7 +953,271 @@ Base notation:
 10. `Risk Control Module` проверяет daily trade limit, cash, exposure, stale portfolio, market session.
 11. `Execution Engine Module` не выполняет заявку без approved `risk_check_result`.
 12. `Portfolio State Module` синхронизирует cash/positions/trades через ArenaGo перед live decision.
-13. Fresh PostgreSQL volume applies all files from `agent_app/storage/postgres/migrations` through the compose init mount.
+13. PostgreSQL migrations are applied by `python -m agent_app.storage.postgres.apply_migrations` before application services start; fresh volumes and existing volumes must both pass migration readiness.
 14. `audit.database_readiness_check` returns only `status = 'pass'` rows before runtime assembly.
 15. `audit.metric_weights_readiness_check` returns only `status = 'pass'` rows and Decision schedule references `weights:product_baseline:*:v1`.
 16. Any future empirically optimized `Metric Weights DB` proposal starts from `prompts/metric_weights_optimization_prompt.md` and remains `draft` until manual governance approval.
+
+---
+
+# Дополнение v3 — Autonomous Live Trading, turnover mandate и server runtime
+
+Версия дополнения: `3.0-autonomous-live-turnover`
+Статус: обязательная часть документации. Это дополнение уточняет, что целевой продуктовый режим системы — не advisory и не paper-only, а полностью автономный `live_trading` агент с автоматическими risk gates.
+
+## 22. Product goal
+
+Целевой режим системы: `fully_autonomous_live_trading`.
+
+Агент должен сам выполнять полный контур:
+
+```text
+persistent scheduler
+  -> public/open data refresh
+  -> portfolio sync from ArenaGo
+  -> feature refresh
+  -> decision_set generation
+  -> risk_check_result
+  -> approved order_intents
+  -> ArenaGo execution
+  -> fills/trades/positions sync
+  -> monitoring/audit/alerts
+```
+
+Ручное подтверждение каждой нормальной сделки не требуется. `manual_review_required` используется только для abnormal cases: конфликт источников, stale portfolio, market closed, invalid secid, превышение лимитов, низкое качество данных, kill switch, подозрительная цена, высокий spread/slippage или иная критическая неоднозначность.
+
+## 23. Turnover mandate
+
+Для live-режима вводится обязательный trading mandate:
+
+```json
+{
+  "trading_mandate_id": "trading_mandate:live:turnover_10m_14d:v1",
+  "run_mode": "live_trading",
+  "initial_capital_rub": 1000000,
+  "target_gross_turnover_rub": 10000000,
+  "target_window_days": 14,
+  "target_turnover_ratio": 10.0,
+  "objective_priority": "secondary_after_risk_and_positive_expected_edge"
+}
+```
+
+Формула оборота:
+
+```text
+gross_turnover_rub = sum(abs(filled_quantity * avg_fill_price))
+```
+
+Считать оборот нужно по фактическим `fill_report`, `execution_result` и `ArenaGo get_trades`, а не по `order_intent`.
+
+Turnover mandate делает агента активным, но не разрешает бессмысленный churn. Сделки ради оборота допускаются только среди решений с положительным `expected_edge_after_costs`, достаточным `confidence_score`, нормальной ликвидностью и прохождением `Risk Control Module`.
+
+## 24. Module responsibility for turnover mandate
+
+| Responsibility | Module / Store |
+|---|---|
+| Mandate definition | `risk.trading_mandate`, `Risk Policy Store` |
+| Turnover progress calculation | `Portfolio State Module` |
+| Turnover-aware decision urgency | `Decision Engine Module` |
+| Safety limits and anti-churn gates | `Risk Control Module` |
+| Real execution only after approved risk | `Execution Engine Module` |
+| Progress, lag and harmful churn monitoring | `Monitoring & Audit Module` |
+| Feasibility validation | `Backtesting & Paper Trading Module`, `Feature Validation & Research Module` |
+
+`Portfolio State Module` writes portfolio payload fields:
+
+```text
+gross_turnover_rub_1d
+gross_turnover_rub_14d
+turnover_ratio_14d
+turnover_progress_ratio
+target_completion_pct
+remaining_turnover_rub_14d
+required_daily_turnover_rub
+projected_turnover_rub_14d
+turnover_target_status
+```
+
+`Decision Engine Module` may increase trade urgency when `turnover_target_status` is `behind` or `critically_behind`, but it must not convert negative-edge trades into buys just to hit turnover.
+
+`Risk Control Module` enforces:
+
+```text
+max_daily_turnover_rub
+max_single_order_value_rub
+max_trade_count_per_day
+max_position_pct
+max_gross_exposure_pct
+max_daily_loss_pct
+max_drawdown_pct
+max_spread_bps
+max_estimated_slippage_bps
+min_expected_edge_after_cost_score
+min_liquidity_threshold
+stale data / stale portfolio / market session / kill switch gates
+```
+
+## 25. Runtime requirement
+
+Docker/server runtime must use PostgreSQL-backed stores. In-memory repositories are allowed only for unit tests and isolated smoke runs. If `DATABASE_URL` is set and `APP_ENV` is not a test environment, `agent_app.main` uses PostgreSQL by default; `paper_trading` and `live_trading` must not silently run on in-memory state.
+
+`scheduler_worker` is a persistent autonomous daemon. It must not be treated as a one-shot script in server deployment.
+
+## 26. Live readiness
+
+Before `live_trading`, the operator must check:
+
+```sql
+SELECT * FROM audit.live_trading_readiness_check ORDER BY check_name;
+```
+
+All rows must be `status = 'pass'`. This view checks active live risk policy, active live weights, turnover mandate, ArenaGo/MOEX provider config, tradable universe, live limits and live schedules.
+
+
+---
+
+# Дополнение v4 — Stabilized autonomous runtime chain
+
+Версия дополнения: `4.0-autonomous-runtime-stabilization`
+Статус: обязательная часть документации. Это дополнение фиксирует runtime-правила после стабилизации P0-блокеров автономного live-контура.
+
+## 27. PostgreSQL migrations in Docker/server runtime
+
+Docker/server runtime must not rely only on `/docker-entrypoint-initdb.d`, because that mechanism runs only for a fresh PostgreSQL volume. The compose runtime includes `migration_runner`, which executes:
+
+```bash
+python -m agent_app.storage.postgres.apply_migrations
+```
+
+The migration runner creates `audit.schema_migration`, applies sorted files from `agent_app/storage/postgres/migrations`, checks checksums for already applied migrations and fails fast if an applied migration was edited. Application services must start only after PostgreSQL is healthy and migrations completed successfully.
+
+## 28. Autonomous scheduler behavior
+
+`scheduler_worker` is a persistent daemon. It repeatedly triggers the orchestration entrypoint across the autonomous source set:
+
+```text
+Order Store
+Raw Market Data Store
+Raw Macro Data Store
+Raw Text Store
+Feature Store
+Request Log Store
+Audit Log Store
+```
+
+The worker remains outside analytical modules and does not bypass module boundaries. Its job is to keep the data/decision/risk/execution/portfolio/monitoring contours active on a server. Source-level locks/Redis queues may be added later, but the worker must never become a direct execution shortcut.
+
+## 29. Runtime reference chain
+
+Orchestration must carry `output_refs` from each executed module into subsequent `module_job.input_refs` in the same cycle. The intended current-cycle chain is:
+
+```text
+raw data / quality records
+  -> feature_records / feature_vectors
+  -> decision_set
+  -> risk_check_result / approved order_intents
+  -> execution_result / fill_report
+  -> portfolio_snapshot
+  -> monitoring/audit records
+```
+
+Refs ending in `:latest` are allowed only as repository read conveniences or non-execution fallbacks. Execution must receive explicit current-cycle `order_intent_refs`; if the current Risk Control run produced no approved order intents, Execution Engine must return `skipped` rather than execute stale latest orders.
+
+## 30. Decision reason codes
+
+`reason_codes` are not all blocking reasons. The Decision Engine separates hard-blocking reasons from explanatory/warning reasons. Codes such as `turnover_mandate_urgency` explain why an otherwise valid trade was prioritized and must not by themselves turn a decision into `block`.
+
+## 31. Turnover math and pace tracking
+
+`Portfolio State Module` calculates turnover mandate progress from realized fills/trades inside the rolling mandate window. The module must:
+
+- sum actual 1-day turnover instead of taking `max` values;
+- filter broker/ArenaGo trades to the mandate window;
+- compute remaining turnover against remaining days, not the full window every time;
+- project 14-day turnover from the observed average daily pace;
+- classify `turnover_target_status` against expected progress for the elapsed part of the window.
+
+This keeps the 10,000,000 RUB / 14-day target active without rewarding blind churn.
+
+## 32. No-network in-memory execution
+
+In-memory runtime is for tests and local smoke checks only. It must not inject the real External Request Gateway and must not perform live HTTP calls accidentally. PostgreSQL-backed paper/live runtime uses the gateway; in-memory runtime uses deterministic local repositories.
+
+---
+
+# Дополнение v5 — Predfinal runtime hardening and product-readiness gates
+
+Версия дополнения: `5.0-predfinal-runtime-hardening`
+Статус: обязательная часть документации. Это дополнение фиксирует предфинальные правила после аудита заглушек, источников, weights DB, scheduler/runtime, turnover mandate и соответствия кода документации.
+
+## 33. Schedule-aware autonomous worker
+
+`scheduler_worker` больше не должен быть простым бесконечным source-loop. В PostgreSQL-backed runtime он читает включённые записи `audit.schedule_config`, извлекает `interval_seconds` или `frequency`, пропускает чисто event-driven schedules без таймера и превращает due schedules в orchestration triggers.
+
+Event-driven schedules вроде `on_decision_set` и `on_approved_order` не запускаются слепо по таймеру: они должны срабатывать от current-cycle refs, созданных Decision/Risk modules. Если PostgreSQL schedule config недоступен, worker может использовать fallback source-loop только для smoke/local recovery.
+
+## 34. Docker service roles
+
+В server runtime главным long-running процессом является `scheduler_worker`. `agent_app` является optional one-shot/manual service и не должен запускаться с `restart: unless-stopped`, иначе one-shot orchestration entrypoint превращается в скрытый restart-loop. `research_worker` также является optional batch service и включается отдельным Docker profile.
+
+## 35. Disclosure source skip reasons
+
+`Data Intake & Routing Module` может помечать planned discovery item как `source_missing_endpoint`, когда источник требует `issuer_ir_url` или другой per-issuer endpoint, но metadata выбранного инструмента ещё не содержит endpoint. Этот skip reason является валидным состоянием, а не ошибкой схемы БД. Такие записи должны попадать в monitoring как metadata coverage issue.
+
+## 36. Daily loss units
+
+Risk policy должна различать:
+
+```text
+max_daily_loss_rub
+max_daily_loss_pct
+```
+
+`Risk Control Module` сначала ищет явный RUB-лимит. Если задан только `max_daily_loss_pct`, он конвертирует его в RUB через текущий `portfolio_snapshot.equity` / `cash` / `initial_capital_rub`. Нельзя трактовать `0.02` как рублёвый лимит убытка.
+
+## 37. Live weights quality
+
+Live autonomous profiles остаются отдельными от product baseline. После добавления turnover/churn terms live weights должны быть нормализованы: сумма весов каждого active live profile должна быть около `1.0`. `audit.metric_weights_readiness_check` проверяет не только наличие live profiles/rules, но и нормализацию product/live весов.
+
+Bootstrap live weights всё ещё не являются доказанной прибыльной стратегией. Они являются governance seed для autonomous live contour. Перед реальным live-money запуском Codex/operator должен провести validation/backtest с реальными API/историей и подтвердить `validation_report_ref`.
+
+## 38. Post-cost edge gate for profitable turnover
+
+Turnover mandate не должен превращаться в churn. `Decision Engine Module` добавляет в decision payload:
+
+```text
+expected_edge_after_cost_score
+execution_cost_estimate_bps
+```
+
+`Risk Control Module` использует `expected_edge_after_cost_score` как основной gate для turnover-driven decisions. Если explicit value отсутствует, Risk Control оценивает post-cost edge из `expected_edge_score` минус cost proxy по `spread_bps`, `estimated_slippage_bps`, `estimated_order_slippage_bps`, `commission_bps`.
+
+Минимальное правило live режима:
+
+```text
+expected_edge_after_cost_score > min_expected_edge_after_cost_score
+```
+
+особенно для решений с `turnover_mandate_urgency`.
+
+## 39. Predfinal integration requirement
+
+Перед финальным запуском на сервере нужно провести полноценный integration run с реальными ключами/сервисами или максимально близким staging:
+
+```text
+fresh PostgreSQL volume
+  -> apply migrations 001..013
+  -> database_readiness_check
+  -> metric_weights_readiness_check
+  -> live_trading_readiness_check
+  -> MOEX ISS request
+  -> CBR request
+  -> public news/disclosure fetch
+  -> PolzaAI GET /models and JSON completion smoke
+  -> ArenaGo get_bots/get_positions/get_trades
+  -> mock or minimal safe submit_order path
+  -> scheduler tick
+  -> data -> features -> decision -> risk -> execution -> portfolio -> monitoring
+```
+
+Production-readiness считается недоказанной, пока этот сценарий не пройден в Docker с PostgreSQL-backed stores.

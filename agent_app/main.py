@@ -28,19 +28,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--universe-id", default=os.getenv("SELECTED_UNIVERSE_ID", "moex_top20_manual"))
     parser.add_argument("--instrument-id", action="append", default=[])
     parser.add_argument("--horizon", action="append", default=[])
-    parser.add_argument("--use-postgres", action="store_true")
+    parser.add_argument("--use-postgres", action="store_true", help="Force PostgreSQL-backed runtime")
+    parser.add_argument("--no-postgres", action="store_true", help="Force in-memory runtime; intended only for tests/smoke")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     database_url = os.getenv("DATABASE_URL", "")
-    repository = (
-        PostgresOrchestrationRepository(database_url)
-        if args.use_postgres and database_url
-        else InMemoryOrchestrationRepository()
-    )
-    service = OrchestrationService(repository)
+    app_env = os.getenv("APP_ENV", "local").lower()
+    use_postgres = bool(database_url) and not args.no_postgres and (args.use_postgres or app_env not in {"test", "unit_test"})
+    if args.use_postgres and not database_url:
+        raise RuntimeError("--use-postgres was requested but DATABASE_URL is not set")
+    if args.system_mode in {"paper_trading", "live_trading"} and database_url and not use_postgres:
+        raise RuntimeError("paper/live runtime must use PostgreSQL-backed stores unless DATABASE_URL is intentionally unset")
+    repository = PostgresOrchestrationRepository(database_url) if use_postgres else InMemoryOrchestrationRepository()
+    executor = None
+    if use_postgres:
+        from agent_app.modules.orchestration.executor import LocalModuleExecutor
+
+        executor = LocalModuleExecutor(database_url=database_url, use_postgres=True)
+    service = OrchestrationService(repository, executor=executor)
     request = OrchestrationInput(
         schedule_config_ref=None,
         dependency_graph_ref=None,

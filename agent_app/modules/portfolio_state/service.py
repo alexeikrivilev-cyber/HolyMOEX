@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -71,6 +72,9 @@ class PortfolioConfig:
     used_risk_budget: float = 0.0
     arena_go_bot_name: str = ""
     arena_go_portfolio: str = ""
+    target_gross_turnover_rub_14d: float = 10_000_000.0
+    turnover_window_days: int = 14
+
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None = None) -> "PortfolioConfig":
@@ -88,6 +92,8 @@ class PortfolioConfig:
             used_risk_budget=_float(payload.get("used_risk_budget")) or 0.0,
             arena_go_bot_name=str(payload.get("arena_go_bot_name") or ""),
             arena_go_portfolio=str(payload.get("arena_go_portfolio") or ""),
+            target_gross_turnover_rub_14d=_float(payload.get("target_gross_turnover_rub_14d")) or _float(os.getenv("TARGET_GROSS_TURNOVER_RUB_14D")) or 10_000_000.0,
+            turnover_window_days=int(payload.get("turnover_window_days") or os.getenv("TURNOVER_WINDOW_DAYS", "14")),
         )
 
     @property
@@ -465,6 +471,13 @@ class PortfolioStateService:
         inconsistent = "reconciliation_mismatch_exceeds_threshold" in warnings
         confidence = self.data_quality_score(warnings, broker_sync, request.run_mode)
         state_source = self.snapshot_source(previous_snapshot, broker_sync)
+        turnover_profile = self.turnover_profile(
+            request=request,
+            previous_snapshot=previous_snapshot,
+            broker_sync=broker_sync,
+            newly_applied_fills=tuple(newly_applied_fills),
+            fill_contexts=fill_contexts,
+        )
         snapshot_payload = {
             "source_module": self.module_name,
             "calculation_version": CALCULATION_VERSION,
@@ -476,6 +489,7 @@ class PortfolioStateService:
             "initial_seed_created": state_source == "initial_seed",
             "initial_capital_rub": initial_capital,
             "run_mode": request.run_mode,
+            **turnover_profile,
             "positions": [position.to_contract() for position in position_records],
             "applied_fill_refs": sorted(applied_fill_refs),
             "newly_applied_fill_refs": newly_applied_fills,
@@ -525,6 +539,125 @@ class PortfolioStateService:
             reconciliation_report=reconciliation_report,
             warnings=tuple(dict.fromkeys(warnings)),
         )
+
+    def turnover_profile(
+        self,
+        *,
+        request: PortfolioUpdateRequest,
+        previous_snapshot: PortfolioSnapshotRecord | None,
+        broker_sync: BrokerSyncResult,
+        newly_applied_fills: tuple[str, ...],
+        fill_contexts: tuple[tuple[str, FillReportRecord | None, OrderIntentRecord | None], ...],
+    ) -> dict[str, Any]:
+        target = max(0.0, self.config.target_gross_turnover_rub_14d)
+        window_days = max(1, self.config.turnover_window_days)
+        recent_fills = self.repository.list_recent_fill_reports(request.portfolio_id, request.as_of_ts, window_days)
+        recent_fill_ids = {fill.fill_report_id for fill in recent_fills}
+        current_fills = tuple(
+            fill
+            for fill_ref, fill, _order in fill_contexts
+            if fill is not None and fill_ref in newly_applied_fills and fill.fill_report_id not in recent_fill_ids
+        )
+        recent_turnover = sum(abs(fill.filled_quantity * fill.fill_price) for fill in recent_fills)
+        current_fill_turnover = sum(abs(fill.filled_quantity * fill.fill_price) for fill in current_fills)
+        recent_turnover += current_fill_turnover
+        broker_turnover = self.broker_gross_turnover(broker_sync.trades, request.as_of_ts, window_days)
+        if request.run_mode == "live_trading" and broker_turnover > recent_turnover:
+            recent_turnover = broker_turnover
+        previous_payload = dict(previous_snapshot.payload) if previous_snapshot else {}
+        as_of_dt = parse_utc_iso(request.as_of_ts)
+        one_day_turnover = sum(
+            abs(fill.filled_quantity * fill.fill_price)
+            for fill in (*recent_fills, *current_fills)
+            if fill.fill_ts and parse_utc_iso(fill.fill_ts).date() == as_of_dt.date()
+        )
+        if request.run_mode == "live_trading" and broker_sync.trades:
+            broker_1d = self.broker_gross_turnover(broker_sync.trades, request.as_of_ts, 1)
+            one_day_turnover = max(one_day_turnover, broker_1d)
+        window_started_at = str(previous_payload.get("turnover_window_started_at") or request.as_of_ts)
+        try:
+            elapsed_days = (as_of_dt.date() - parse_utc_iso(window_started_at).date()).days + 1
+        except Exception:
+            window_started_at = request.as_of_ts
+            elapsed_days = 1
+        elapsed_days = max(1, min(window_days, elapsed_days))
+        remaining_days = max(1, window_days - elapsed_days + 1)
+        remaining = max(0.0, target - recent_turnover)
+        progress = 1.0 if target <= 0 else min(1.0, recent_turnover / target)
+        required_daily = remaining / remaining_days
+        average_daily_turnover = recent_turnover / elapsed_days
+        projected = average_daily_turnover * window_days
+        expected_progress = 1.0 if target <= 0 else min(1.0, elapsed_days / window_days)
+        if progress >= 1.0:
+            status = "achieved"
+        elif progress < expected_progress * 0.65:
+            status = "critically_behind"
+        elif progress < expected_progress * 0.90:
+            status = "behind"
+        else:
+            status = "on_track"
+        initial_capital = _float(previous_payload.get("initial_capital_rub")) or self.config.initial_capital_rub
+        ratio = recent_turnover / initial_capital if initial_capital > 0 else 0.0
+        return {
+            "turnover_mandate_enabled": True,
+            "target_gross_turnover_rub_14d": target,
+            "turnover_window_days": window_days,
+            "gross_turnover_rub_1d": one_day_turnover,
+            "gross_turnover_rub_14d": recent_turnover,
+            "turnover_ratio_14d": ratio,
+            "turnover_progress_ratio": progress,
+            "target_completion_pct": progress * 100.0,
+            "remaining_turnover_rub_14d": remaining,
+            "required_daily_turnover_rub": required_daily,
+            "average_daily_turnover_rub": average_daily_turnover,
+            "projected_turnover_rub_14d": projected,
+            "expected_turnover_progress_ratio": expected_progress,
+            "turnover_window_started_at": window_started_at,
+            "turnover_elapsed_days": elapsed_days,
+            "turnover_remaining_days": remaining_days,
+            "turnover_target_status": status,
+            "turnover_source": "arena_go_trades" if request.run_mode == "live_trading" and broker_turnover >= recent_turnover and broker_turnover > 0 else "fill_reports",
+        }
+
+    def broker_gross_turnover(self, trades: tuple[Mapping[str, Any], ...], as_of_ts: str, window_days: int) -> float:
+        as_of = parse_utc_iso(as_of_ts)
+        window_seconds = max(1, int(window_days)) * 86_400
+        total = 0.0
+        for trade in trades:
+            trade_ts = self.broker_trade_timestamp(trade)
+            if trade_ts is not None:
+                age = (as_of - trade_ts).total_seconds()
+                if age < 0 or age > window_seconds:
+                    continue
+            quantity = _float(trade.get("quantity") or trade.get("filled_quantity") or trade.get("qty")) or 0.0
+            price = _float(trade.get("price") or trade.get("avg_fill_price") or trade.get("fill_price")) or 0.0
+            total += abs(quantity * price)
+        return total
+
+    def broker_trade_timestamp(self, trade: Mapping[str, Any]):
+        for key in ("timestamp", "trade_ts", "fill_ts", "datetime", "created_at"):
+            value = trade.get(key)
+            if value:
+                try:
+                    return parse_utc_iso(str(value))
+                except Exception:
+                    pass
+        tradedate = str(trade.get("tradedate") or trade.get("trade_date") or "").strip()
+        tradetime = str(trade.get("tradetime") or trade.get("trade_time") or "00:00:00").strip()
+        if tradedate:
+            candidate = f"{tradedate}T{tradetime}"
+            if candidate.endswith("Z"):
+                candidate = candidate[:-1]
+            try:
+                return datetime.fromisoformat(candidate).replace(tzinfo=timezone.utc)
+            except ValueError:
+                return None
+        return None
+
+    def same_trading_day(self, snapshot: PortfolioSnapshotRecord | None, as_of_ts: str) -> bool:
+        if snapshot is None or not snapshot.as_of_ts:
+            return False
+        return parse_utc_iso(snapshot.as_of_ts).date() == parse_utc_iso(as_of_ts).date()
 
     def load_fill_contexts(
         self,

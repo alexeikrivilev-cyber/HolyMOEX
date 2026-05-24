@@ -172,3 +172,13 @@ Every approved `order_intent` must pass:
 - `arena_go_daily_trade_limit_check`
 - `portfolio_snapshot_freshness_check`
 - `global_kill_switch_check`
+
+## Live autonomous turnover guardrails
+
+`Risk Control Module` owns the hard safety boundary for the turnover mandate. `target_gross_turnover_rub_14d = 10000000` is not permission to churn. Live orders are approved only if risk policy `risk_policy:live_autonomous_turnover:v1` allows them after checking market session, data freshness, portfolio freshness, exposure, cash, daily loss, drawdown, spread/slippage, expected edge after costs, daily turnover limit and ArenaGo constraints.
+
+## Runtime hardening note v5
+
+`max_daily_loss_rub` and `max_daily_loss_pct` are distinct. If only percentage loss is configured, `Risk Control Module` converts it to RUB using the latest `portfolio_snapshot.equity` / `cash` / `initial_capital_rub`. A ratio such as `0.02` must never be interpreted as a two-kopeck absolute loss limit.
+
+For turnover-driven decisions, the authoritative profitability gate is `expected_edge_after_cost_score`. If Decision Engine supplies the value, Risk Control uses it directly. Otherwise Risk Control computes a conservative proxy from `expected_edge_score` minus spread/slippage/commission cost features. Orders with `turnover_mandate_urgency` must still pass `min_expected_edge_after_cost_score` and all liquidity/risk gates.

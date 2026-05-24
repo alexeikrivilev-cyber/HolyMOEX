@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 
 from agent_app.contracts.unified_objects import ModuleJob, ModuleJobResult, TimeRange
@@ -177,11 +177,18 @@ class OrchestrationService:
 
         created_jobs: list[ModuleJob] = []
         executed_results: list[ModuleJobResult] = []
+        cycle_refs = list(self._input_refs(request, context))
+        cycle_config_ref = context.config_ref or self._default_runtime_config_ref(request.system_mode)
         for target in targets:
+            job_context = replace(
+                context,
+                input_refs=tuple(dict.fromkeys(cycle_refs)),
+                config_ref=cycle_config_ref,
+            )
             job = self.build_module_job(
                 module_name=target,
                 request=request,
-                context=context,
+                context=job_context,
                 active_instruments=active_instruments,
             )
             self.check_idempotency_key(job)
@@ -191,11 +198,12 @@ class OrchestrationService:
                 save_result.created,
                 pipeline_run_id,
                 request,
-                context,
+                job_context,
             )
             created_jobs.append(save_result.job)
             if result is not None:
                 executed_results.append(result)
+                cycle_refs.extend(result.output_refs)
 
         critical_path = self._critical_path(targets, graph, request)
         status = self._pipeline_status(
@@ -670,7 +678,39 @@ class OrchestrationService:
         payload_ref = request.incoming_trigger.payload_ref
         if payload_ref and not payload_ref.startswith("module:") and payload_ref not in refs:
             refs.append(payload_ref)
+        if request.incoming_trigger.trigger_type == "scheduled" and not refs:
+            refs.extend(self._autonomous_cycle_refs(context))
         return tuple(dict.fromkeys(refs))
+
+    def _autonomous_cycle_refs(self, context: PipelineContext) -> tuple[str, ...]:
+        run_mode = context.run_mode_override or context.system_mode
+        risk_policy_ref = (
+            "risk.risk_policy:risk_policy:live_autonomous_turnover:v1"
+            if run_mode == "live_trading"
+            else "risk.risk_policy:risk_policy:paper_trading:v1"
+        )
+        return (
+            "raw_market.raw_candle:scheduled",
+            "raw_market.raw_trade:scheduled",
+            "raw_market.raw_index_value:IMOEX",
+            "raw_market.raw_index_value:sector",
+            "raw_text.raw_text_item:scheduled",
+            "raw_text.event_routing_message:scheduled",
+            "raw_macro.raw_macro_point:scheduled",
+            "events.structured_event:scheduled",
+            "features.feature_record:latest",
+            "features.feature_vector:latest",
+            "features.data_quality_report:latest",
+            "features.market_state_record:latest",
+            "portfolio.portfolio_snapshot:latest",
+            "decisions.decision_set:latest",
+            "orders.order_intent:latest",
+            "orders.fill_report:latest",
+            "broker.snapshot:scheduled",
+            "price.snapshot:scheduled",
+            risk_policy_ref,
+            "execution_policy:arena_go:live:v1" if run_mode == "live_trading" else "execution_policy:arena_go:paper:v1",
+        )
 
     def _pipeline_status(
         self,
@@ -711,6 +751,37 @@ class OrchestrationService:
         }
         return f"pipeline_{self._stable_hash(payload)[:24]}"
 
+
+    def _default_runtime_config_ref(self, system_mode: str) -> str:
+        if system_mode == "live_trading":
+            return "runtime_config:live_autonomous:v1"
+        if system_mode == "paper_trading":
+            return "runtime_config:paper_trading:v1"
+        if system_mode == "maintenance":
+            return "runtime_config:maintenance:v1"
+        return "runtime_config:analysis_only:v1"
+
+
+    def _current_input_ref(self, refs: Iterable[str], prefix: str, fallback: str = "") -> str:
+        for ref in reversed(tuple(refs)):
+            text = str(ref)
+            if text.startswith(prefix + ":") and not text.endswith((":scheduled", ":latest")):
+                return text
+        return fallback
+
+    def _latest_input_ref(self, refs: Iterable[str], prefix: str, fallback: str) -> str:
+        for ref in reversed(tuple(refs)):
+            if str(ref).startswith(prefix + ":") and not str(ref).endswith(":scheduled"):
+                return str(ref)
+        for ref in reversed(tuple(refs)):
+            if str(ref).startswith(prefix + ":"):
+                return str(ref)
+        return fallback
+
+    def _input_refs_by_prefix(self, refs: Iterable[str], prefix: str, fallback: tuple[str, ...] = ()) -> tuple[str, ...]:
+        matches = tuple(str(ref) for ref in refs if str(ref).startswith(prefix + ":") and not str(ref).endswith((":scheduled", ":latest")))
+        return matches or fallback
+
     def _module_payload(
         self,
         job: ModuleJob,
@@ -726,7 +797,178 @@ class OrchestrationService:
                 return payloads[input_ref]
         if "__default__" in payloads:
             return payloads["__default__"]
-        return {}
+        return self._autonomous_default_payload(job, context)
+
+    def _autonomous_default_payload(self, job: ModuleJob, context: PipelineContext) -> Mapping[str, Any]:
+        instrument_ids = tuple(job.instrument_ids or context.instrument_ids)
+        horizons = tuple(job.horizons or context.horizons)
+        horizon = horizons[0] if horizons else "intraday"
+        as_of_ts = job.time_range.to_ts
+        run_mode = job.run_mode
+        risk_policy_id = (
+            "risk_policy:live_autonomous_turnover:v1"
+            if run_mode == "live_trading"
+            else "risk_policy:paper_trading:v1"
+        )
+        weights_profile_id = (
+            f"weights:live_autonomous:{horizon}:v1"
+            if run_mode == "live_trading"
+            else f"weights:product_baseline:{horizon}:v1"
+        )
+        feature_vector_ref = self._latest_input_ref(job.input_refs, "features.feature_vector", "features.feature_vector:latest")
+        feature_record_ref = self._latest_input_ref(job.input_refs, "features.feature_record", "features.feature_record:latest")
+        portfolio_snapshot_ref = self._latest_input_ref(job.input_refs, "portfolio.portfolio_snapshot", "portfolio.portfolio_snapshot:latest")
+        # Risk must check the decision set produced in the current cycle.
+        # Falling back to decisions.decision_set:latest could approve stale orders.
+        decision_set_ref = self._current_input_ref(job.input_refs, "decisions.decision_set")
+        market_state_ref = self._latest_input_ref(job.input_refs, "features.market_state_record", "features.market_state_record:latest")
+        data_quality_report_ref = self._latest_input_ref(job.input_refs, "features.data_quality_report", "features.data_quality_report:latest")
+        order_intent_refs = self._input_refs_by_prefix(job.input_refs, "orders.order_intent", ())
+        fill_report_refs = self._input_refs_by_prefix(job.input_refs, "orders.fill_report", ())
+        quality_input_refs = tuple(
+            ref
+            for ref in job.input_refs
+            if str(ref).startswith((
+                "raw_market.raw_candle:",
+                "raw_market.raw_trade:",
+                "raw_market.raw_orderbook:",
+                "raw_market.raw_index_value:",
+                "raw_text.raw_text_item:",
+                "features.feature_record:",
+                "features.feature_vector:",
+                "portfolio.portfolio_snapshot:",
+            ))
+        ) or ("raw_market.raw_candle:scheduled",)
+        monitoring_payload_ref = self._latest_input_ref(job.input_refs, "portfolio.portfolio_snapshot", self._latest_input_ref(job.input_refs, "orders.execution_result", "audit.module_run:scheduled"))
+        payload_by_module: dict[str, Mapping[str, Any]] = {
+            "Data Quality Module": {
+                "quality_check_request": {
+                    "input_refs": list(quality_input_refs),
+                    "check_level": "raw",
+                    "required_freshness_seconds": 300 if run_mode == "live_trading" else 3600,
+                    "required_coverage_ratio": 0.80 if run_mode == "live_trading" else 0.50,
+                    "critical_fields": ["timestamp", "source_module", "calculation_version"],
+                }
+            },
+            "Market Data Metrics Module": {
+                "market_data_metrics_input": {
+                    "instrument_ids": list(instrument_ids),
+                    "candles_ref": "raw_market.raw_candle:scheduled",
+                    "trades_ref": "raw_market.raw_trade:scheduled",
+                    "market_index_ref": "raw_market.raw_index_value:IMOEX",
+                    "sector_index_ref": "raw_market.raw_index_value:sector",
+                    "timeframes": ["1m", "5m", "1d"],
+                    "horizons": list(horizons),
+                }
+            },
+            "Liquidity & Microstructure Module": {
+                "liquidity_input": {
+                    "instrument_ids": list(instrument_ids),
+                    "orderbook_ref": "raw_market.raw_orderbook:scheduled",
+                    "trades_ref": "raw_market.raw_trade:scheduled",
+                    "quotes_ref": "raw_market.raw_quote:scheduled",
+                    "depth_levels": ["10bps", "30bps", "50bps", "100bps"],
+                    "notional_scenarios": [100000, 1000000],
+                }
+            },
+            "Derivatives & Positioning Module": {
+                "derivatives_input": {
+                    "instrument_ids": list(instrument_ids),
+                    "futures_refs": ["raw_market.raw_futures:scheduled"],
+                    "options_refs": ["raw_market.raw_options:scheduled"],
+                    "spot_refs": ["raw_market.raw_candle:scheduled", "raw_market.raw_trade:scheduled"],
+                    "liquidity_thresholds": {
+                        "min_turnover": 0.0,
+                        "min_open_interest": 0.0,
+                    },
+                }
+            },
+            "Volatility & Risk Metrics Module": {
+                "risk_metrics_input": {
+                    "instrument_ids": list(instrument_ids),
+                    "candles_ref": "raw_market.raw_candle:scheduled",
+                    "market_index_ref": "raw_market.raw_index_value:IMOEX",
+                    "sector_index_ref": "raw_market.raw_index_value:sector",
+                    "macro_refs": ["raw_macro.raw_macro_point:scheduled"],
+                    "windows": [5, 20, 60],
+                    "horizons": list(horizons),
+                }
+            },
+            "Market Context Module": {
+                "market_context_input": {
+                    "universe_id": job.universe_id,
+                    "instrument_ids": list(instrument_ids),
+                    "macro_refs": ["raw_macro.raw_macro_point:scheduled"],
+                    "index_refs": ["raw_market.raw_index_value:IMOEX", "raw_market.raw_index_value:RTSI", "raw_market.raw_index_value:RGBI"],
+                    "sector_refs": ["raw_market.raw_index_value:sector"],
+                    "event_refs": ["events.structured_event:scheduled"],
+                    "windows": [5, 20, 60],
+                }
+            },
+            "Normalization & Feature Vector Module": {
+                "normalization_input": {
+                    "instrument_ids": list(instrument_ids),
+                    "horizons": list(horizons),
+                    "as_of_ts": as_of_ts,
+                    "feature_refs": [feature_record_ref],
+                    "normalization_profile_id": "normalization:live_autonomous:v1" if run_mode == "live_trading" else "normalization:product_baseline:v1",
+                }
+            },
+            "Decision Engine Module": {
+                "decision_request": {
+                    "decision_request_id": f"decision_request:{job.job_id}",
+                    "universe_id": job.universe_id,
+                    "instrument_ids": list(instrument_ids),
+                    "horizon": horizon,
+                    "as_of_ts": as_of_ts,
+                    "feature_vector_refs": [feature_vector_ref],
+                    "portfolio_state_ref": portfolio_snapshot_ref,
+                    "weights_profile_id": weights_profile_id,
+                    "run_mode": run_mode,
+                    "decision_mode": "normal",
+                }
+            },
+            "Risk Control Module": {
+                "risk_check_request": {
+                    "decision_set_id": decision_set_ref,
+                    "portfolio_state_ref": portfolio_snapshot_ref,
+                    "risk_policy_id": risk_policy_id,
+                    "market_state_ref": market_state_ref,
+                    "data_quality_report_ref": data_quality_report_ref,
+                    "run_mode": run_mode,
+                }
+            },
+            "Execution Engine Module": {
+                "execution_request": {
+                    "order_intent_refs": list(order_intent_refs),
+                    "market_session_status_ref": market_state_ref,
+                    "execution_policy_id": "execution_policy:arena_go:live:v1" if run_mode == "live_trading" else "execution_policy:arena_go:paper:v1",
+                    "run_mode": run_mode if run_mode in {"paper_trading", "live_trading"} else "paper_trading",
+                    "idempotency_key": job.idempotency_key,
+                }
+            },
+            "Portfolio State Module": {
+                "portfolio_update_request": {
+                    "portfolio_id": "arena_go_default",
+                    "fill_report_refs": list(fill_report_refs),
+                    "broker_snapshot_ref": "broker.snapshot:scheduled",
+                    "price_snapshot_ref": "price.snapshot:scheduled",
+                    "run_mode": run_mode if run_mode in {"analysis_only", "paper_trading", "live_trading"} else "paper_trading",
+                    "as_of_ts": as_of_ts,
+                }
+            },
+            "Monitoring & Audit Module": {
+                "monitoring_event": {
+                    "event_id": f"monitoring_event:{job.job_id}",
+                    "event_type": "system",
+                    "severity": "info",
+                    "source_module": "Orchestration Module",
+                    "payload_ref": monitoring_payload_ref,
+                    "created_at": as_of_ts,
+                }
+            },
+        }
+        return payload_by_module.get(job.module_name, {})
 
     def _stable_hash(self, payload: dict[str, Any]) -> str:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")

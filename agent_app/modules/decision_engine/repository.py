@@ -347,7 +347,7 @@ class InMemoryDecisionEngineRepository:
         horizon: str,
         as_of_ts: str,
     ) -> tuple[FeatureVector, ...]:
-        requested_refs = {_ref_tail(ref) for ref in feature_vector_refs}
+        requested_refs = {_ref_tail(ref) for ref in feature_vector_refs if _ref_tail(ref) not in {"latest", "scheduled"}}
         requested_ids = set(instrument_ids)
         as_of = parse_utc_iso(as_of_ts)
         records = [
@@ -410,7 +410,7 @@ class InMemoryDecisionEngineRepository:
             if snapshot.as_of_ts
             and parse_utc_iso(snapshot.as_of_ts) <= as_of
             and snapshot.universe_id in (None, "", universe_id)
-            and (snapshot.portfolio_snapshot_id == requested or snapshot.universe_id == universe_id)
+            and (requested in {"", "latest", "scheduled"} or snapshot.portfolio_snapshot_id == requested or snapshot.universe_id == universe_id)
         ]
         if not candidates:
             return None
@@ -489,7 +489,7 @@ class PostgresDecisionEngineRepository:
         horizon: str,
         as_of_ts: str,
     ) -> tuple[FeatureVector, ...]:
-        requested_refs = tuple(dict.fromkeys(_ref_tail(ref) for ref in feature_vector_refs if ref))
+        requested_refs = tuple(dict.fromkeys(_ref_tail(ref) for ref in feature_vector_refs if ref and _ref_tail(ref) not in {"latest", "scheduled"}))
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -571,11 +571,11 @@ class PostgresDecisionEngineRepository:
                      FROM portfolio.portfolio_snapshot
                      WHERE as_of_ts <= %s
                        AND (universe_id = %s OR universe_id IS NULL)
-                       AND (portfolio_snapshot_id = %s OR universe_id = %s)
+                       AND (%s IN ('', 'latest', 'scheduled') OR portfolio_snapshot_id = %s OR universe_id = %s)
                      ORDER BY as_of_ts DESC, portfolio_snapshot_id DESC
                      LIMIT 1
                     """,
-                    (parse_utc_iso(as_of_ts), universe_id, requested, universe_id),
+                    (parse_utc_iso(as_of_ts), universe_id, requested, requested, universe_id),
                 )
                 row = cur.fetchone()
         return _portfolio_snapshot_from_row(row) if row else None

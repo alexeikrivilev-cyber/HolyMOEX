@@ -462,8 +462,8 @@ class DataQualityService:
         request = DataQualityRequest.from_dict(payload, job)
         if not request.input_refs:
             raise DataQualityError("quality_check_request.input_refs is required")
-        if tuple(job.input_refs) and request.input_refs != tuple(job.input_refs):
-            raise DataQualityError("quality_check_request.input_refs must match module_job.input_refs")
+        if tuple(job.input_refs) and not set(request.input_refs).issubset(set(job.input_refs)):
+            raise DataQualityError("quality_check_request.input_refs must be present in module_job.input_refs")
         return request
 
     def _blocking_errors(

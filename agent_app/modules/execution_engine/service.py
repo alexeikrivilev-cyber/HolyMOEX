@@ -114,11 +114,9 @@ class ExecutionRequest:
             raise ExecutionEngineError(f"execution_request has undocumented fields: {extra_fields}")
 
         order_refs_payload = request_payload.get("order_intent_refs")
-        if not isinstance(order_refs_payload, (list, tuple)) or not order_refs_payload:
-            raise ExecutionEngineError("execution_request.order_intent_refs must be a non-empty list")
+        if not isinstance(order_refs_payload, (list, tuple)):
+            raise ExecutionEngineError("execution_request.order_intent_refs must be a list")
         order_intent_refs = tuple(str(item) for item in order_refs_payload if str(item or ""))
-        if not order_intent_refs:
-            raise ExecutionEngineError("execution_request.order_intent_refs must contain non-empty refs")
 
         run_mode = str(request_payload.get("run_mode") or "")
         if run_mode not in VALID_RUN_MODES:
@@ -1070,7 +1068,7 @@ class ExecutionEngineService:
 
     def module_result_status(self, statuses: tuple[str, ...]) -> str:
         if not statuses:
-            return "failed"
+            return "skipped"
         if all(status in SUCCESS_STATUSES for status in statuses):
             return "success"
         if any(status in SUCCESS_STATUSES for status in statuses):
@@ -1081,7 +1079,7 @@ class ExecutionEngineService:
 
     def aggregate_confidence(self, execution_results: tuple[ExecutionResultRecord, ...]) -> float:
         if not execution_results:
-            return 0.0
+            return 1.0
         values = [_confidence(item.payload) for item in execution_results]
         return max(0.0, min(1.0, sum(values) / len(values)))
 

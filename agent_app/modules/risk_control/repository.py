@@ -343,6 +343,10 @@ class InMemoryRiskControlRepository:
 
     def get_decision_set(self, decision_set_id: str) -> DecisionSet | None:
         requested = _ref_tail(decision_set_id)
+        if requested in {"", "latest", "scheduled"}:
+            if not self.decision_sets:
+                return None
+            return sorted(self.decision_sets, key=lambda item: (item.created_at, item.decision_set_id))[-1]
         for decision_set in self.decision_sets:
             if decision_set.decision_set_id == requested:
                 return decision_set
@@ -381,7 +385,7 @@ class InMemoryRiskControlRepository:
             for snapshot in self.portfolio_snapshots
             if snapshot.as_of_ts
             and parse_utc_iso(snapshot.as_of_ts) <= as_of
-            and snapshot.portfolio_snapshot_id == requested
+            and (requested in {"", "latest", "scheduled"} or snapshot.portfolio_snapshot_id == requested)
         ]
         if not candidates:
             return None
@@ -460,17 +464,29 @@ class PostgresRiskControlRepository:
         return psycopg.connect(self.database_url)
 
     def get_decision_set(self, decision_set_id: str) -> DecisionSet | None:
+        requested = _ref_tail(decision_set_id)
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT decision_set_id, decision_request_id, horizon, decisions,
-                           calculation_version, created_at
-                      FROM decisions.decision_set
-                     WHERE decision_set_id = %s
-                    """,
-                    (_ref_tail(decision_set_id),),
-                )
+                if requested in {"", "latest", "scheduled"}:
+                    cur.execute(
+                        """
+                        SELECT decision_set_id, decision_request_id, horizon, decisions,
+                               calculation_version, created_at
+                          FROM decisions.decision_set
+                         ORDER BY created_at DESC, decision_set_id DESC
+                         LIMIT 1
+                        """
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT decision_set_id, decision_request_id, horizon, decisions,
+                               calculation_version, created_at
+                          FROM decisions.decision_set
+                         WHERE decision_set_id = %s
+                        """,
+                        (requested,),
+                    )
                 row = cur.fetchone()
         return _decision_set_from_row(row) if row else None
 
@@ -522,6 +538,7 @@ class PostgresRiskControlRepository:
         return tuple(_portfolio_limit_from_row(row) for row in rows)
 
     def get_portfolio_snapshot(self, portfolio_state_ref: str, as_of_ts: str) -> PortfolioSnapshot | None:
+        requested = _ref_tail(portfolio_state_ref)
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -530,12 +547,12 @@ class PostgresRiskControlRepository:
                            initial_capital_rub, cash, equity, gross_exposure,
                            net_exposure, realized_pnl, unrealized_pnl, payload
                       FROM portfolio.portfolio_snapshot
-                     WHERE portfolio_snapshot_id = %s
-                       AND as_of_ts <= %s
+                     WHERE as_of_ts <= %s
+                       AND (%s IN ('', 'latest', 'scheduled') OR portfolio_snapshot_id = %s)
                      ORDER BY as_of_ts DESC, portfolio_snapshot_id DESC
                      LIMIT 1
                     """,
-                    (_ref_tail(portfolio_state_ref), parse_utc_iso(as_of_ts)),
+                    (parse_utc_iso(as_of_ts), requested, requested),
                 )
                 row = cur.fetchone()
         return _portfolio_snapshot_from_row(row) if row else None
