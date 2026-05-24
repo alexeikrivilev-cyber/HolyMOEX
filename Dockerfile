@@ -30,7 +30,8 @@ COPY --from=python_runtime /etc/ssl/certs /etc/ssl/certs
 WORKDIR /app
 COPY agent_app /app/agent_app
 COPY scripts/start_autonomous.sh /app/scripts/start_autonomous.sh
-RUN chmod +x /app/scripts/start_autonomous.sh
+RUN sed -i 's/\r$//' /app/scripts/start_autonomous.sh \
+    && chmod +x /app/scripts/start_autonomous.sh
 
 VOLUME ["/data"]
 
