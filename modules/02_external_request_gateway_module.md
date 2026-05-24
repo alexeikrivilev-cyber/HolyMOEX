@@ -245,7 +245,8 @@ If provider payload cannot be mapped to the target raw table without inventing v
 - `llm_completion`: `POST ${POLZA_BASE_URL}/chat/completions`.
 - `models`: `GET ${POLZA_BASE_URL}/models`; if unavailable, healthcheck falls back to strict JSON `llm_completion`.
 - `Authorization` header value: `Bearer ${POLZA_API_KEY}`.
-- default `model`: `${POLZA_LLM_MODEL}`.
+- task-specific `model`: `${POLZA_FAST_MODEL}` for light news/event classification and `${POLZA_REASONING_MODEL}` for reports/macro/reasoning; `${POLZA_DEFAULT_MODEL}` / `${POLZA_LLM_MODEL}` are fallbacks.
+- LLM throttle env: `LLM_ENABLED`, `LLM_MAX_CALLS_PER_MINUTE`, `LLM_MAX_CALLS_PER_HOUR`, `LLM_MAX_CALLS_PER_DAY`, `LLM_MAX_ITEMS_PER_RUN`, `LLM_MIN_SECONDS_BETWEEN_CALLS`.
 - required `response_format`: `{"type":"json_object"}` unless explicitly overridden by schema-based task.
 
 ## 17. Forbidden actions

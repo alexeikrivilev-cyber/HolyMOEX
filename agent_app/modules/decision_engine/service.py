@@ -689,7 +689,7 @@ class DecisionEngineService:
             age = (parse_utc_iso(request.as_of_ts) - parse_utc_iso(market_state.as_of_ts)).total_seconds()
             if age > self.policy.market_state_stale_seconds:
                 reasons.append("market_state_stale")
-            if market_state.market_session_status in {"closed", "halted"}:
+            if market_state.market_session_status and market_state.market_session_status != "open":
                 reasons.append(f"market_session_status:{market_state.market_session_status}")
             if market_state.market_regime in {"risk_off", "stress"}:
                 reasons.append(f"market_regime:{market_state.market_regime}")

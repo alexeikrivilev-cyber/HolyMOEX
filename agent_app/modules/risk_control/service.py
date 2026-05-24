@@ -1177,7 +1177,7 @@ class RiskControlService:
             _rule_text(portfolio_snapshot.payload, "market_session_status"),
         ):
             if source:
-                return source
+                return source.strip().lower()
         return None
 
     def market_regime(

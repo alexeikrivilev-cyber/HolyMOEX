@@ -969,7 +969,12 @@ def default_provider_configs() -> dict[str, ProviderConfig]:
             config_payload={
                 "default_base_url": "https://polza.ai/api/v1",
                 "auth_scheme": "Bearer",
-                "default_model_env": "POLZA_LLM_MODEL",
+                "fast_model_env": "POLZA_FAST_MODEL",
+                "reasoning_model_env": "POLZA_REASONING_MODEL",
+                "default_model_env": "POLZA_DEFAULT_MODEL",
+                "fast_model": "deepseek/deepseek-v4-flash",
+                "reasoning_model": "qwen/qwen3.6-35b-a3b",
+                "default_model": "qwen/qwen3.6-35b-a3b",
                 "response_format": "json_object",
                 "temperature": 0,
                 "allowed_request_types": ["llm_completion", "models"],

@@ -138,6 +138,21 @@ class ExternalRequest:
 
     @property
     def cache_key(self) -> str:
+        if self.provider == "polza_ai" and self.request_type == "llm_completion":
+            payload_map = dict(self.payload)
+            key_payload = {
+                "provider": self.provider,
+                "request_type": self.request_type,
+                "universe_id": self.universe_id,
+                "instrument_ids": self.instrument_ids,
+                "content_hash": payload_map.get("content_hash"),
+                "task_type": payload_map.get("task_type"),
+                "prompt_version": payload_map.get("prompt_version") or payload_map.get("llm_prompt_version"),
+                "model_id": payload_map.get("model") or payload_map.get("model_id"),
+                "event_ontology_version": payload_map.get("event_ontology_version"),
+            }
+            encoded = json.dumps(key_payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            return f"external_request:{hashlib.sha256(encoded).hexdigest()}"
         payload = {
             "provider": self.provider,
             "request_type": self.request_type,

@@ -49,7 +49,9 @@ from .repository import (
 
 MODULE_NAME = "Event & News Intelligence Module"
 CALCULATION_VERSION = "event_news_intelligence_v1"
-DEFAULT_MODEL_ID = "deepseek/deepseek-v4-pro"
+DEFAULT_FAST_MODEL_ID = "deepseek/deepseek-v4-flash"
+DEFAULT_REASONING_MODEL_ID = "qwen/qwen3.6-35b-a3b"
+DEFAULT_MODEL_ID = DEFAULT_REASONING_MODEL_ID
 
 VALID_CONTOURS = {"event_contour", "intraday_contour"}
 VALID_HORIZONS = {"intraday", "swing", "position"}
@@ -77,10 +79,32 @@ VALID_EVENT_TYPES = {
 VALID_TASK_TYPES = {
     "event_extraction",
     "sentiment_scoring",
+    "news_classification",
+    "entity_matching",
+    "duplicate_preclassification",
+    "disclosure_classification",
+    "short_news_summarization",
+    "raw_text_relevance_filtering",
     "report_extraction",
+    "earnings_analysis",
     "dividend_extraction",
     "macro_text_analysis",
+    "complex_corporate_action_interpretation",
+    "multi_source_event_synthesis",
+    "validation_research_commentary",
+    "strategy_risk_explanation",
 }
+FAST_LLM_TASK_TYPES = {
+    "event_extraction",
+    "sentiment_scoring",
+    "news_classification",
+    "entity_matching",
+    "duplicate_preclassification",
+    "disclosure_classification",
+    "short_news_summarization",
+    "raw_text_relevance_filtering",
+}
+REASONING_LLM_TASK_TYPES = VALID_TASK_TYPES - FAST_LLM_TASK_TYPES
 MACRO_SECTOR_EVENT_TYPES = {"macro", "sector", "market_structure"}
 FORBIDDEN_LLM_FIELDS = {
     "trading_recommendation",
@@ -144,17 +168,21 @@ SOURCE_CREDIBILITY_DEFAULTS = {
     "macro_api": 0.75,
 }
 EVENT_EXTRACTION_SYSTEM_PROMPT = (
-    "You extract structured MOEX event intelligence from news, issuer disclosures, "
-    "regulatory text, macro commentary, and corporate text. Return only a strict JSON "
-    "object matching the requested envelope. Do not include free-form prose, markdown, "
-    "trading recommendations, order instructions, target positions, or risk-policy changes. "
-    "Every model score must be backed by evidence and reason_codes."
+    "Extract MOEX event JSON only. Fill instrument_ids, event_type/subtype, relevance, "
+    "materiality, sentiment, novelty, confidence, evidence, reason_codes. No buy/sell advice, "
+    "no weights, no risk-policy changes, no orders, no markdown."
+)
+REASONING_SYSTEM_PROMPT = (
+    "Extract structured MOEX report, disclosure or macro intelligence as strict JSON only. "
+    "Use source-grounded evidence for every score and interpretation. You may reason over the "
+    "document, but do not output recommendations, weights, risk-policy changes, order intents, "
+    "target positions, or free-form prose."
 )
 LLM_OUTPUT_SCHEMA_DESCRIPTION = {
     "schema_version": "string",
     "model_id": "string",
     "model_version": "string",
-    "task_type": "event_extraction | sentiment_scoring | report_extraction | dividend_extraction | macro_text_analysis",
+    "task_type": "event_extraction | sentiment_scoring | report_extraction | earnings_analysis | dividend_extraction | macro_text_analysis",
     "instrument_ids": ["string"],
     "items": [
         {
@@ -371,7 +399,7 @@ class EventNewsIntelligenceService:
         self.repository = repository or InMemoryEventNewsIntelligenceRepository()
         self.gateway = gateway
         self.event_pressure_weights = dict(event_pressure_weights or DEFAULT_EVENT_PRESSURE_WEIGHTS)
-        self.model_id = model_id or os.getenv("POLZA_LLM_MODEL") or DEFAULT_MODEL_ID
+        self.model_id = model_id or ""
 
     def run(
         self,
@@ -412,6 +440,10 @@ class EventNewsIntelligenceService:
             if not raw_text_items:
                 warnings.append("raw_text_items_missing")
                 return self._empty_result(job, started_at, "skipped", tuple(warnings), ())
+            max_items = _env_int("LLM_MAX_ITEMS_PER_RUN", 20)
+            if max_items > 0 and len(raw_text_items) > max_items:
+                warnings.append("llm_items_per_run_capped")
+                raw_text_items = raw_text_items[:max_items]
             if len(profiles) < len(event_input.instrument_ids):
                 warnings.append("instrument_profile_missing_or_inactive")
 
@@ -639,6 +671,27 @@ class EventNewsIntelligenceService:
         if self.gateway is None:
             return None, ("llm_gateway_unavailable",)
         response = self._gateway_process(request)
+        response_status = getattr(response, "status", "")
+        response_errors = tuple(getattr(response, "errors", ()) or ())
+        if response_status == "rate_limited" or "llm_throttled" in response_errors:
+            self.write_audit_record(
+                AuditRecord(
+                    module_name=self.module_name,
+                    job_id=job.job_id,
+                    severity="warning",
+                    event_type="llm_throttled",
+                    message="PolzaAI LLM request was throttled; trading contour continues without this text item.",
+                    object_type="external_request",
+                    object_ref=f"request_logs.external_request:{request.request_id}",
+                    reason_codes=("llm_throttled",),
+                    payload={
+                        "task_type": request.payload.get("task_type"),
+                        "model_id": request.payload.get("model"),
+                        "raw_text_item_id": raw_item.raw_text_item_id,
+                    },
+                )
+            )
+            return None, (f"external_request_created:{request.request_id}", "llm_throttled")
         payload = _llm_payload_from_response(response)
         if payload is None:
             return None, (f"external_request_created:{request.request_id}", "llm_response_empty")
@@ -1039,12 +1092,24 @@ class EventNewsIntelligenceService:
             "title": raw_item.title,
             "body": raw_item.body,
             "published_at": raw_item.published_at,
-            "fetched_at": raw_item.fetched_at,
             "instrument_ids": list(raw_item.instrument_ids or event_input.instrument_ids),
             "event_ontology_version": event_input.event_ontology_version,
         }
+        task_type = self.llm_task_type(raw_item)
+        content_hash = raw_item.content_hash or stable_record_id(
+            "raw_text_content",
+            {
+                "raw_text_item_id": raw_item.raw_text_item_id,
+                "title": raw_item.title,
+                "body": raw_item.body,
+                "source_url": raw_item.source_url,
+            },
+        )
+        model_id = self.model_id or polza_model_for_task(task_type)
+        system_prompt = REASONING_SYSTEM_PROMPT if task_type in REASONING_LLM_TASK_TYPES else EVENT_EXTRACTION_SYSTEM_PROMPT
         prompt_payload = {
-            "task": "Extract Event & News Intelligence Module structured_event candidates and model scores.",
+            "task": task_type,
+            "prompt_version": event_input.llm_prompt_version,
             "module_contract": {
                 "module_name": self.module_name,
                 "event_ontology_version": event_input.event_ontology_version,
@@ -1066,7 +1131,18 @@ class EventNewsIntelligenceService:
             ],
             "input": text_payload,
         }
-        idempotency_key = f"{job.idempotency_key}:llm_completion:{raw_item.raw_text_item_id}"
+        idempotency_key = ":".join(
+            (
+                job.idempotency_key,
+                "llm_completion",
+                raw_item.raw_text_item_id,
+                content_hash,
+                task_type,
+                event_input.llm_prompt_version,
+                event_input.event_ontology_version,
+                model_id,
+            )
+        )
         return ExternalRequest(
             request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
             caller_module=self.module_name,
@@ -1075,11 +1151,17 @@ class EventNewsIntelligenceService:
             universe_id=job.universe_id,
             instrument_ids=event_input.instrument_ids,
             payload={
-                "model": self.model_id,
+                "model": model_id,
+                "model_id": model_id,
+                "task_type": task_type,
+                "prompt_version": event_input.llm_prompt_version,
+                "llm_prompt_version": event_input.llm_prompt_version,
+                "event_ontology_version": event_input.event_ontology_version,
+                "content_hash": content_hash,
                 "messages": [
                     {
                         "role": "system",
-                        "content": EVENT_EXTRACTION_SYSTEM_PROMPT,
+                        "content": system_prompt,
                     },
                     {
                         "role": "user",
@@ -1088,15 +1170,30 @@ class EventNewsIntelligenceService:
                 ],
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
-                "max_completion_tokens": 2000,
-                "reasoning": {"enabled": True, "effort": "medium", "summary": "auto"},
-                "llm_prompt_version": event_input.llm_prompt_version,
+                "max_completion_tokens": 2400 if task_type in REASONING_LLM_TASK_TYPES else 1000,
+                "reasoning": {"enabled": task_type in REASONING_LLM_TASK_TYPES, "effort": "medium", "summary": "auto"},
             },
             cache_policy=CachePolicy(use_cache=True, max_age_seconds=3600, write_cache=True),
             timeout_ms=10000,
             retry_policy=RetryPolicy(max_retries=2, backoff_ms=500),
             idempotency_key=idempotency_key,
         )
+
+    def llm_task_type(self, raw_item: RawTextItem) -> str:
+        explicit = str(raw_item.source_payload.get("llm_task_type") or raw_item.source_payload.get("task_type") or "").strip()
+        if explicit in VALID_TASK_TYPES:
+            return explicit
+        text = " ".join(
+            str(value or "")
+            for value in (raw_item.source_type, raw_item.source, raw_item.title, raw_item.source_url)
+        ).lower()
+        if any(marker in text for marker in ("report", "отчет", "отчёт", "ifrs", "rsbu", "msfo", "мсфо", "financial")):
+            return "report_extraction"
+        if any(marker in text for marker in ("dividend", "дивиденд")) and len(raw_item.body or "") > 3000:
+            return "dividend_extraction"
+        if any(marker in text for marker in ("macro", "cbr", "ключев", "ruonia", "zc yc", "zcyc")):
+            return "macro_text_analysis"
+        return "event_extraction"
 
     def create_market_reaction_requests(
         self,
@@ -1438,6 +1535,18 @@ def _embedded_llm_payload(raw_item: RawTextItem) -> Mapping[str, Any] | str | No
     return None
 
 
+def polza_model_for_task(task_type: str, env: Mapping[str, str] | None = None) -> str:
+    env_map = env if env is not None else os.environ
+    fast_model = env_map.get("POLZA_FAST_MODEL") or DEFAULT_FAST_MODEL_ID
+    reasoning_model = env_map.get("POLZA_REASONING_MODEL") or DEFAULT_REASONING_MODEL_ID
+    default_model = env_map.get("POLZA_DEFAULT_MODEL") or env_map.get("POLZA_LLM_MODEL") or DEFAULT_MODEL_ID
+    if task_type in FAST_LLM_TASK_TYPES:
+        return fast_model
+    if task_type in REASONING_LLM_TASK_TYPES:
+        return reasoning_model
+    return default_model
+
+
 def _maybe_nested_llm_payload(value: Any) -> Mapping[str, Any] | str | None:
     if isinstance(value, str):
         return value
@@ -1610,3 +1719,10 @@ def _first_float(payload: Any, *keys: str) -> float | None:
         if value is not None:
             return value
     return None
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default

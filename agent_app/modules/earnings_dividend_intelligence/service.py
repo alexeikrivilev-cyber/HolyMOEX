@@ -55,7 +55,7 @@ from .repository import (
 
 MODULE_NAME = "Earnings & Dividend Intelligence Module"
 CALCULATION_VERSION = "earnings_dividend_intelligence_v1"
-DEFAULT_MODEL_ID = "deepseek/deepseek-v4-pro"
+DEFAULT_MODEL_ID = "qwen/qwen3.6-35b-a3b"
 
 VALID_CONTOURS = {"event_contour", "daily_contour"}
 VALID_HORIZONS = {"swing", "position"}
@@ -447,7 +447,7 @@ class EarningsDividendIntelligenceService:
         self.earnings_quality_weights = dict(earnings_quality_weights or DEFAULT_EARNINGS_QUALITY_WEIGHTS)
         self.report_materiality_weights = dict(report_materiality_weights or DEFAULT_REPORT_MATERIALITY_WEIGHTS)
         self.dividend_sustainability_weights = dict(dividend_sustainability_weights or DEFAULT_DIVIDEND_SUSTAINABILITY_WEIGHTS)
-        self.model_id = model_id or os.getenv("POLZA_LLM_MODEL") or DEFAULT_MODEL_ID
+        self.model_id = model_id or os.getenv("POLZA_REASONING_MODEL") or os.getenv("POLZA_DEFAULT_MODEL") or os.getenv("POLZA_LLM_MODEL") or DEFAULT_MODEL_ID
 
     def run(
         self,
@@ -1598,7 +1598,27 @@ class EarningsDividendIntelligenceService:
             "output_schema": LLM_OUTPUT_SCHEMA_DESCRIPTION,
             "input": source_payload,
         }
-        idempotency_key = f"{job.idempotency_key}:llm_extraction:{raw_item.raw_text_item_id}"
+        task_type = self.llm_task_type(raw_item)
+        content_hash = stable_record_id(
+            "raw_text_content",
+            {
+                "raw_text_item_id": raw_item.raw_text_item_id,
+                "title": raw_item.title,
+                "body": raw_item.body,
+                "source_url": raw_item.source_url,
+            },
+        )
+        idempotency_key = ":".join(
+            (
+                job.idempotency_key,
+                "llm_extraction",
+                raw_item.raw_text_item_id,
+                content_hash,
+                task_type,
+                module_input.llm_prompt_version,
+                self.model_id,
+            )
+        )
         return ExternalRequest(
             request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
             caller_module=self.module_name,
@@ -1608,6 +1628,10 @@ class EarningsDividendIntelligenceService:
             instrument_ids=module_input.instrument_ids,
             payload={
                 "model": self.model_id,
+                "model_id": self.model_id,
+                "task_type": task_type,
+                "prompt_version": module_input.llm_prompt_version,
+                "content_hash": content_hash,
                 "messages": [
                     {"role": "system", "content": REPORT_EXTRACTION_SYSTEM_PROMPT},
                     {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)},
@@ -1623,6 +1647,15 @@ class EarningsDividendIntelligenceService:
             retry_policy=RetryPolicy(max_retries=2, backoff_ms=500),
             idempotency_key=idempotency_key,
         )
+
+    def llm_task_type(self, raw_item: RawTextItem) -> str:
+        explicit = str(raw_item.source_payload.get("llm_task_type") or raw_item.source_payload.get("task_type") or "").strip()
+        if explicit in VALID_TASK_TYPES:
+            return explicit
+        text = " ".join((raw_item.source, raw_item.title or "", raw_item.body[:500] if raw_item.body else "")).lower()
+        if "dividend" in text or "дивиденд" in text:
+            return "dividend_extraction"
+        return "report_extraction"
 
     def write_structured_event(self, event: StructuredEvent) -> str:
         return self.repository.save_structured_event(event)

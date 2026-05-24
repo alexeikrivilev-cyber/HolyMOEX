@@ -257,6 +257,86 @@ def test_scheduler_skips_event_driven_risk_without_timer() -> None:
     assert entry is None
 
 
+def test_scheduler_off_market_blocks_heavy_jobs_but_allows_portfolio_and_monitoring(monkeypatch) -> None:
+    from agent_app.scheduler import AutonomousScheduler, ScheduleEntry, SchedulerConfig
+
+    monkeypatch.setenv("MARKET_SESSION_STATUS", "closed")
+    scheduler = AutonomousScheduler(SchedulerConfig(single_scheduler_instance=True))
+    decision = ScheduleEntry(
+        schedule_config_id="schedule:live_autonomous:decision:1m",
+        module_name="Decision Engine Module",
+        source="Feature Store",
+        payload_ref="schedule:live_autonomous:decision:1m",
+        interval_seconds=60,
+        run_mode="live_trading",
+    )
+    portfolio = ScheduleEntry(
+        schedule_config_id="schedule:live_autonomous:portfolio_sync:1m",
+        module_name="Portfolio State Module",
+        source="Order Store",
+        payload_ref="schedule:live_autonomous:portfolio_sync:1m",
+        interval_seconds=60,
+        run_mode="live_trading",
+    )
+    monitoring = ScheduleEntry(
+        schedule_config_id="schedule:live_autonomous:monitoring:1m",
+        module_name="Monitoring & Audit Module",
+        source="Audit Log Store",
+        payload_ref="schedule:live_autonomous:monitoring:1m",
+        interval_seconds=60,
+        run_mode="live_trading",
+    )
+
+    assert scheduler.market_session_status() == "closed"
+    assert scheduler.skip_reason(decision, market_status="closed", runtime_phase="off_market", db_schedule=True) == "off_market_heavy_trading_loop_blocked"
+    assert scheduler.skip_reason(portfolio, market_status="closed", runtime_phase="off_market", db_schedule=True) == ""
+    assert scheduler.skip_reason(monitoring, market_status="closed", runtime_phase="off_market", db_schedule=True) == ""
+
+
+def test_scheduler_market_unknown_blocks_live_trading_jobs(monkeypatch) -> None:
+    from agent_app.scheduler import AutonomousScheduler, ScheduleEntry, SchedulerConfig
+
+    monkeypatch.delenv("MARKET_SESSION_STATUS", raising=False)
+    scheduler = AutonomousScheduler(SchedulerConfig(single_scheduler_instance=True))
+    execution = ScheduleEntry(
+        schedule_config_id="schedule:live_autonomous:execution:on_approved",
+        module_name="Execution Engine Module",
+        source="Risk Control Module",
+        payload_ref="schedule:live_autonomous:execution:on_approved",
+        interval_seconds=60,
+        run_mode="live_trading",
+    )
+
+    assert scheduler.market_session_status() == "unknown"
+    assert scheduler.skip_reason(execution, market_status="unknown", runtime_phase="degraded", db_schedule=True) == "market_session_unknown_live_loop_blocked"
+
+
+def test_raw_text_fallback_disabled_in_production_and_throttled_when_enabled(monkeypatch) -> None:
+    from agent_app.scheduler import AutonomousScheduler, ScheduleEntry, SchedulerConfig
+
+    raw_text = ScheduleEntry(
+        schedule_config_id="fallback:Raw Text Store",
+        module_name="Data Intake & Routing Module",
+        source="Raw Text Store",
+        payload_ref="",
+        interval_seconds=1800,
+        run_mode="live_trading",
+    )
+    monkeypatch.setenv("APP_ENV", "production")
+    scheduler = AutonomousScheduler(SchedulerConfig(single_scheduler_instance=True, allow_llm_fallback=False))
+    assert scheduler.skip_reason(raw_text, market_status="open", runtime_phase="trading_session", db_schedule=False) == "raw_text_fallback_disabled_in_production"
+
+    scheduler = AutonomousScheduler(
+        SchedulerConfig(single_scheduler_instance=True, allow_llm_fallback=True, raw_text_fallback_interval_seconds=60)
+    )
+    assert scheduler.skip_reason(raw_text, market_status="open", runtime_phase="trading_session", db_schedule=False) == "raw_text_fallback_interval_too_low"
+
+    scheduler = AutonomousScheduler(
+        SchedulerConfig(single_scheduler_instance=True, allow_llm_fallback=True, raw_text_fallback_interval_seconds=1800)
+    )
+    assert scheduler.skip_reason(raw_text, market_status="open", runtime_phase="trading_session", db_schedule=False) == ""
+
+
 def test_scheduled_payload_ref_does_not_replace_autonomous_cycle_refs() -> None:
     from agent_app.modules.orchestration.repository import InMemoryOrchestrationRepository
     from agent_app.modules.orchestration.service import (
@@ -613,6 +693,120 @@ def test_polza_models_response_normalizes_when_models_endpoint_exists() -> None:
     assert errors == ()
 
 
+def test_polza_task_model_routing_and_llm_cache_key(monkeypatch) -> None:
+    from agent_app.modules.event_news_intelligence.repository import RawTextItem
+    from agent_app.modules.event_news_intelligence.service import EventNewsInput, EventNewsIntelligenceService, polza_model_for_task
+
+    monkeypatch.delenv("POLZA_LLM_MODEL", raising=False)
+    assert polza_model_for_task("event_extraction") == "deepseek/deepseek-v4-flash"
+    assert polza_model_for_task("report_extraction") == "qwen/qwen3.6-35b-a3b"
+
+    service = EventNewsIntelligenceService()
+    event_input = EventNewsInput(
+        routing_message_refs=(),
+        raw_text_refs=("raw_text.raw_text_item:news1",),
+        instrument_ids=("moex:SBER",),
+        event_ontology_version="event_ontology:v1",
+        llm_prompt_version="prompt:v2",
+        market_reaction_window=("1h",),
+    )
+    job = _job(module_name="Event & News Intelligence Module", run_mode="live_trading")
+
+    news = RawTextItem(
+        raw_text_item_id="news1",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        source="rbc_news",
+        source_type="news_api",
+        title="SBER announces operational update",
+        body="Short news text",
+        fetched_at="2026-05-24T09:00:00Z",
+        content_hash="hash_news",
+    )
+    report = RawTextItem(
+        raw_text_item_id="report1",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        source="issuer_report",
+        source_type="issuer_disclosure",
+        title="SBER IFRS report",
+        body="Long annual financial report",
+        fetched_at="2026-05-24T09:05:00Z",
+        content_hash="hash_report",
+        source_payload={"llm_task_type": "report_extraction"},
+    )
+
+    news_request = service.create_llm_request(news, event_input, job)
+    report_request = service.create_llm_request(report, event_input, job)
+
+    assert news_request.payload["model"] == "deepseek/deepseek-v4-flash"
+    assert report_request.payload["model"] == "qwen/qwen3.6-35b-a3b"
+    assert "No buy/sell advice" in news_request.payload["messages"][0]["content"]
+    assert news_request.payload["prompt_version"] == "prompt:v2"
+    assert news_request.payload["content_hash"] == "hash_news"
+
+    same_content_new_job = service.create_llm_request(
+        RawTextItem(
+            raw_text_item_id="news2",
+            universe_id="moex_top20_manual",
+            instrument_ids=("moex:SBER",),
+            source="rbc_news",
+            source_type="news_api",
+            title="SBER announces operational update",
+            body="Short news text",
+            fetched_at="2026-05-24T10:00:00Z",
+            content_hash="hash_news",
+        ),
+        event_input,
+        ModuleJob(
+            job_id="job_other",
+            module_name="Event & News Intelligence Module",
+            contour="event_contour",
+            trigger_type="scheduled",
+            universe_id="moex_top20_manual",
+            instrument_ids=("moex:SBER",),
+            horizons=("intraday",),
+            time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T10:00:00Z"),
+            input_refs=(),
+            config_ref="",
+            run_mode="live_trading",
+            idempotency_key="different_job_id",
+        ),
+    )
+    assert same_content_new_job.cache_key == news_request.cache_key
+    changed_prompt = EventNewsInput(
+        routing_message_refs=(),
+        raw_text_refs=("raw_text.raw_text_item:news1",),
+        instrument_ids=("moex:SBER",),
+        event_ontology_version="event_ontology:v1",
+        llm_prompt_version="prompt:v3",
+        market_reaction_window=("1h",),
+    )
+    assert service.create_llm_request(news, changed_prompt, job).cache_key != news_request.cache_key
+
+
+def test_llm_throttle_blocks_excess_calls_without_crashing(monkeypatch) -> None:
+    from agent_app.contracts.unified_objects import ExternalRequest
+    from agent_app.modules.external_request_gateway.service import ExternalRequestGatewayService
+
+    service = ExternalRequestGatewayService()
+    service._llm_call_timestamps.clear()
+    monkeypatch.setenv("LLM_ENABLED", "true")
+    monkeypatch.setenv("LLM_MAX_CALLS_PER_MINUTE", "1")
+
+    request = ExternalRequest(
+        request_id="req_llm_1",
+        caller_module="Event & News Intelligence Module",
+        provider="polza_ai",
+        request_type="llm_completion",
+        payload={"model": "deepseek/deepseek-v4-flash", "task_type": "event_extraction"},
+        idempotency_key="idem_llm_1",
+    )
+
+    assert service.apply_llm_throttle(request) is True
+    assert service.apply_llm_throttle(request) is False
+
+
 def _risk_request_job() -> ModuleJob:
     return ModuleJob(
         job_id="job_risk_edge",
@@ -850,6 +1044,107 @@ def test_live_execution_requires_explicit_safe_live_submit(monkeypatch) -> None:
 
     assert result.execution_results[0].status == "rejected"
     assert "safe_live_submit_disabled" in result.execution_results[0].errors
+
+
+def test_market_closed_blocks_execution_submit_even_when_safe_live_enabled(monkeypatch) -> None:
+    from agent_app.modules.execution_engine.repository import InMemoryExecutionEngineRepository
+    from agent_app.modules.execution_engine.service import ExecutionEngineService
+
+    class Gateway:
+        called = False
+
+        def process(self, request):
+            self.called = True
+            raise AssertionError("submit_order must not be called while market is closed")
+
+    gateway = Gateway()
+    monkeypatch.setenv("SAFE_LIVE_SUBMIT", "true")
+    monkeypatch.setenv("ARENA_GO_SANDBOX", "true")
+    monkeypatch.setenv("LIVE_READINESS_PASSED", "true")
+    repo = InMemoryExecutionEngineRepository(
+        order_intents=(
+            {
+                "order_intent_id": "order_closed",
+                "instrument_id": "SBER",
+                "side": "buy",
+                "quantity": 1,
+                "order_type": "limit",
+                "limit_price": 250,
+                "time_in_force": "day",
+                "max_slippage_bps": 10,
+                "execution_ttl_seconds": 300,
+                "decision_set_id": "decision",
+                "risk_check_id": "risk",
+                "run_mode": "live_trading",
+                "created_at": "2026-05-24T09:00:00Z",
+                "payload": {"market_session_status": "closed"},
+            },
+        ),
+        risk_check_results=(
+            {
+                "risk_check_id": "risk",
+                "decision_set_id": "decision",
+                "status": "approved",
+                "approved_order_intents": ["orders.order_intent:order_closed"],
+                "checked_at": "2026-05-24T09:00:00Z",
+                "payload": {"market_session_status": "closed"},
+            },
+        ),
+        instrument_profiles=(
+            {
+                "instrument_id": "SBER",
+                "universe_id": "moex_top20_manual",
+                "ticker": "SBER",
+                "lot_size": 1,
+                "tradable": True,
+                "execution_enabled": True,
+                "arena_go_secid": "SBER",
+                "arena_go_quantity_mode": "shares",
+            },
+        ),
+        portfolio_snapshots=(
+            {
+                "portfolio_snapshot_id": "snap",
+                "portfolio_id": "arena_go_default",
+                "universe_id": "moex_top20_manual",
+                "as_of_ts": "2026-05-24T09:00:00Z",
+                "cash": 1_000_000,
+                "equity": 1_000_000,
+                "payload": {"market_session_status": "closed"},
+            },
+        ),
+    )
+    job = ModuleJob(
+        job_id="job_execution_closed",
+        module_name="Execution Engine Module",
+        contour="execution_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T09:00:00Z"),
+        input_refs=("orders.order_intent:order_closed", "market:closed", "execution_policy:default"),
+        config_ref="execution_policy:default",
+        run_mode="live_trading",
+        idempotency_key="idem_execution_closed",
+    )
+
+    result = ExecutionEngineService(repository=repo, gateway=gateway).process(
+        {
+            "execution_request": {
+                "order_intent_refs": ["orders.order_intent:order_closed"],
+                "market_session_status_ref": "market:closed",
+                "execution_policy_id": "execution_policy:default",
+                "run_mode": "live_trading",
+                "idempotency_key": "idem_execution_closed",
+            }
+        },
+        job,
+    )
+
+    assert result.execution_results[0].status == "rejected"
+    assert "market_session_not_open" in result.execution_results[0].errors
+    assert gateway.called is False
 
 
 def test_live_execution_requires_sandbox_and_startup_readiness(monkeypatch) -> None:

@@ -56,10 +56,33 @@ EVENT_DRIVEN_TRIGGERS = {
     "dependency",
 }
 
+MARKET_SESSION_STATUSES = {"open", "closed", "premarket", "postmarket", "unknown"}
+TRADING_HEAVY_MODULES = {
+    "Decision Engine Module",
+    "Risk Control Module",
+    "Execution Engine Module",
+}
+LLM_HEAVY_MODULES = {
+    "Event & News Intelligence Module",
+    "Earnings & Dividend Intelligence Module",
+    "Fundamental & Valuation Module",
+}
+TEXT_HEAVY_SOURCES = {"Raw Text Store"}
+OFF_MARKET_ALLOWED_SOURCES = {
+    "Order Store",
+    "Request Log Store",
+    "Audit Log Store",
+    "Raw Market Data Store",
+    "Raw Macro Data Store",
+    "Selected Instruments DB",
+}
+MIN_LLM_FALLBACK_INTERVAL_SECONDS = 900.0
+
 
 @dataclass(frozen=True)
 class ScheduleEntry:
     schedule_config_id: str
+    module_name: str
     source: str
     payload_ref: str
     interval_seconds: float
@@ -81,6 +104,8 @@ class SchedulerConfig:
     single_scheduler_instance: bool = False
     schedule_id_filter: tuple[str, ...] = ()
     max_entries_per_tick: int = 0
+    allow_llm_fallback: bool = False
+    raw_text_fallback_interval_seconds: float = 1800.0
 
 
 class AutonomousScheduler:
@@ -103,6 +128,7 @@ class AutonomousScheduler:
         self._runtime_checked = False
         self._runtime_ready = True
         self._owner_id = os.getenv("SCHEDULER_OWNER_ID") or f"{socket.gethostname()}:{os.getpid()}"
+        self._last_fallback_warning_at: float = 0.0
 
     def run(self) -> int:
         self._install_signal_handlers()
@@ -117,12 +143,14 @@ class AutonomousScheduler:
     def run_once(self) -> int:
         if not self._ensure_runtime_mode():
             return 2
+        market_status = self.market_session_status()
+        runtime_phase = agent_runtime_phase(market_status)
         entries = self._scheduled_entries()
         if entries:
-            return self._run_due_entries(entries)
-        return self._run_source_fallback()
+            return self._run_due_entries(entries, market_status=market_status, runtime_phase=runtime_phase)
+        return self._run_source_fallback(market_status=market_status, runtime_phase=runtime_phase)
 
-    def _run_due_entries(self, entries: tuple[ScheduleEntry, ...]) -> int:
+    def _run_due_entries(self, entries: tuple[ScheduleEntry, ...], *, market_status: str, runtime_phase: str) -> int:
         now = time.monotonic()
         exit_code = 0
         executed_count = 0
@@ -135,6 +163,25 @@ class AutonomousScheduler:
             if last_run is not None and now - last_run < entry.interval_seconds and not self.config.once:
                 self._log_tick_event(entry, "scheduler_tick_skipped", "interval_not_due")
                 continue
+            skip_reason = self.skip_reason(entry, market_status=market_status, runtime_phase=runtime_phase, db_schedule=True)
+            if skip_reason:
+                self._log_tick_event(entry, "scheduler_tick_skipped", skip_reason, market_status=market_status, runtime_phase=runtime_phase)
+                self._audit_scheduler_warning(
+                    os.getenv("DATABASE_URL", ""),
+                    "scheduler_entry_off_market_skipped",
+                    f"Scheduler skipped {entry.schedule_config_id}: {skip_reason}.",
+                    (skip_reason, f"market_session_status:{market_status}", f"agent_runtime_phase:{runtime_phase}"),
+                    severity="warning" if market_status == "unknown" else "info",
+                    payload={
+                        "schedule_config_id": entry.schedule_config_id,
+                        "module_name": entry.module_name,
+                        "source": entry.source,
+                        "market_session_status": market_status,
+                        "agent_runtime_phase": runtime_phase,
+                    },
+                )
+                self._last_run_by_schedule[entry.schedule_config_id] = time.monotonic()
+                continue
             if not self._acquire_tick_lock(entry):
                 self._log_tick_event(entry, "scheduler_tick_skipped", "lock_not_acquired")
                 continue
@@ -146,38 +193,65 @@ class AutonomousScheduler:
                 exit_code = current
         return exit_code
 
-    def _run_source_fallback(self) -> int:
+    def _run_source_fallback(self, *, market_status: str, runtime_phase: str) -> int:
         exit_code = 0
         for source in self.config.sources:
             if self._stop_requested:
                 break
             entry = ScheduleEntry(
                 schedule_config_id=f"fallback:{source}",
+                module_name=fallback_module_name(source),
                 source=source,
                 payload_ref="",
-                interval_seconds=self.config.interval_seconds,
+                interval_seconds=(
+                    self.config.raw_text_fallback_interval_seconds
+                    if source in TEXT_HEAVY_SOURCES
+                    else self.config.interval_seconds
+                ),
                 run_mode=self.config.system_mode,
                 trigger_type=self.config.trigger_type,
             )
+            last_run = self._last_run_by_schedule.get(entry.schedule_config_id)
+            if last_run is not None and time.monotonic() - last_run < entry.interval_seconds and not self.config.once:
+                self._log_tick_event(entry, "scheduler_tick_skipped", "interval_not_due", market_status=market_status, runtime_phase=runtime_phase)
+                continue
+            skip_reason = self.skip_reason(entry, market_status=market_status, runtime_phase=runtime_phase, db_schedule=False)
+            if skip_reason:
+                self._log_tick_event(entry, "scheduler_tick_skipped", skip_reason, market_status=market_status, runtime_phase=runtime_phase)
+                if skip_reason == "raw_text_fallback_disabled_in_production":
+                    self._audit_raw_text_fallback_disabled()
+                continue
             if not self._acquire_tick_lock(entry):
                 self._log_tick_event(entry, "scheduler_tick_skipped", "lock_not_acquired")
                 continue
             self._log_tick_event(entry, "scheduler_tick_locked", "lock_acquired")
             current = self._run_entry(entry)
+            self._last_run_by_schedule[entry.schedule_config_id] = time.monotonic()
             if current != 0:
                 exit_code = current
         return exit_code
 
-    def _log_tick_event(self, entry: ScheduleEntry, event: str, reason: str) -> None:
+    def _log_tick_event(
+        self,
+        entry: ScheduleEntry,
+        event: str,
+        reason: str,
+        *,
+        market_status: str | None = None,
+        runtime_phase: str | None = None,
+    ) -> None:
         print(
             json.dumps(
                 {
                     "event": event,
                     "schedule_config_id": entry.schedule_config_id,
+                    "module_name": entry.module_name,
                     "source": entry.source,
                     "run_mode": entry.run_mode,
                     "reason": reason,
                     "owner_id": self._owner_id,
+                    "market_session_status": market_status or self.market_session_status(),
+                    "agent_runtime_phase": runtime_phase or agent_runtime_phase(market_status or self.market_session_status()),
                 },
                 ensure_ascii=False,
             ),
@@ -191,9 +265,12 @@ class AutonomousScheduler:
                 {
                     "event": "scheduler_entry_started",
                     "schedule_config_id": entry.schedule_config_id,
+                    "module_name": entry.module_name,
                     "source": entry.source,
                     "run_mode": entry.run_mode,
                     "owner_id": self._owner_id,
+                    "market_session_status": self.market_session_status(),
+                    "agent_runtime_phase": agent_runtime_phase(self.market_session_status()),
                 },
                 ensure_ascii=False,
             ),
@@ -219,6 +296,7 @@ class AutonomousScheduler:
                 {
                     "event": "scheduler_entry_finished",
                     "schedule_config_id": entry.schedule_config_id,
+                    "module_name": entry.module_name,
                     "source": entry.source,
                     "run_mode": entry.run_mode,
                     "exit_code": exit_code,
@@ -230,6 +308,50 @@ class AutonomousScheduler:
             flush=True,
         )
         return exit_code
+
+    def market_session_status(self) -> str:
+        status = str(os.getenv("MARKET_SESSION_STATUS") or "").strip().lower()
+        if status in MARKET_SESSION_STATUSES:
+            return status
+        database_url = os.getenv("DATABASE_URL", "")
+        if database_url:
+            try:
+                db_status = load_market_session_status_from_postgres(database_url)
+                if db_status in MARKET_SESSION_STATUSES:
+                    return db_status
+            except Exception:
+                pass
+        return "unknown"
+
+    def skip_reason(self, entry: ScheduleEntry, *, market_status: str, runtime_phase: str, db_schedule: bool) -> str:
+        del runtime_phase
+        if market_status != "open" and is_trading_heavy_entry(entry):
+            return "off_market_heavy_trading_loop_blocked" if market_status != "unknown" else "market_session_unknown_live_loop_blocked"
+        if market_status != "open" and is_llm_heavy_entry(entry) and entry.interval_seconds < MIN_LLM_FALLBACK_INTERVAL_SECONDS:
+            return "off_market_llm_loop_throttled"
+        if not db_schedule and entry.source in TEXT_HEAVY_SOURCES and production_env():
+            if not self.config.allow_llm_fallback:
+                return "raw_text_fallback_disabled_in_production"
+            if self.config.raw_text_fallback_interval_seconds < MIN_LLM_FALLBACK_INTERVAL_SECONDS:
+                return "raw_text_fallback_interval_too_low"
+        return ""
+
+    def _audit_raw_text_fallback_disabled(self) -> None:
+        now = time.monotonic()
+        if now - self._last_fallback_warning_at < 300:
+            return
+        self._last_fallback_warning_at = now
+        self._audit_scheduler_warning(
+            os.getenv("DATABASE_URL", ""),
+            "raw_text_fallback_disabled_in_production",
+            "Schedule config is unavailable and production Raw Text/EventNews fallback is disabled by default.",
+            ("raw_text_fallback_disabled_in_production", "explicit_allow_llm_fallback_required"),
+            payload={
+                "allow_llm_fallback": self.config.allow_llm_fallback,
+                "raw_text_fallback_interval_seconds": self.config.raw_text_fallback_interval_seconds,
+                "min_interval_seconds": MIN_LLM_FALLBACK_INTERVAL_SECONDS,
+            },
+        )
 
     def _ensure_runtime_mode(self) -> bool:
         if self._runtime_checked:
@@ -295,15 +417,17 @@ class AutonomousScheduler:
         reason_codes: tuple[str, ...],
         *,
         severity: str = "warning",
+        payload: Mapping[str, Any] | None = None,
     ) -> None:
-        payload = {
+        audit_payload = {
             "owner_id": self._owner_id,
             "single_scheduler_instance": self.config.single_scheduler_instance,
             "lock_ttl_seconds": self.config.lock_ttl_seconds,
         }
+        audit_payload.update(dict(payload or {}))
         if database_url:
             try:
-                write_scheduler_audit(database_url, event_type, message, reason_codes, severity=severity, payload=payload)
+                write_scheduler_audit(database_url, event_type, message, reason_codes, severity=severity, payload=audit_payload)
                 return
             except Exception:
                 pass
@@ -314,7 +438,7 @@ class AutonomousScheduler:
                     "severity": severity,
                     "message": message,
                     "reason_codes": list(reason_codes),
-                    "payload": payload,
+                    "payload": audit_payload,
                 },
                 ensure_ascii=False,
             )
@@ -387,6 +511,23 @@ def load_schedule_entries_from_postgres(database_url: str, *, default_run_mode: 
         if entry is not None:
             entries.append(entry)
     return tuple(entries)
+
+
+def load_market_session_status_from_postgres(database_url: str) -> str:
+    import psycopg
+
+    query = """
+        SELECT payload ->> 'market_session_status'
+          FROM portfolio.portfolio_snapshot
+         WHERE payload ? 'market_session_status'
+         ORDER BY as_of_ts DESC
+         LIMIT 1
+    """
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            row = cur.fetchone()
+    return str(row[0]).strip().lower() if row and row[0] else "unknown"
 
 
 def acquire_scheduler_tick_lock(
@@ -471,6 +612,7 @@ def schedule_entry_from_payload(
     run_mode = str(payload.get("run_mode") or default_run_mode)
     return ScheduleEntry(
         schedule_config_id=schedule_config_id,
+        module_name=module_name,
         source=source,
         payload_ref=schedule_config_id,
         interval_seconds=interval,
@@ -489,6 +631,40 @@ def schedule_source(module_name: str, payload: Mapping[str, Any]) -> str:
         if first:
             return first
     return MODULE_TO_SOURCE.get(module_name, "Audit Log Store")
+
+
+def fallback_module_name(source: str) -> str:
+    for module_name, mapped_source in MODULE_TO_SOURCE.items():
+        if mapped_source == source:
+            return module_name
+    return "Orchestration Module"
+
+
+def agent_runtime_phase(market_session_status: str) -> str:
+    status = str(market_session_status or "unknown").lower()
+    if status == "open":
+        return "trading_session"
+    if status in {"closed", "premarket", "postmarket"}:
+        return "off_market"
+    return "degraded"
+
+
+def is_trading_heavy_entry(entry: ScheduleEntry) -> bool:
+    return entry.module_name in TRADING_HEAVY_MODULES or entry.schedule_config_id.startswith(
+        (
+            "schedule:live_autonomous:decision",
+            "schedule:live_autonomous:risk",
+            "schedule:live_autonomous:execution",
+        )
+    )
+
+
+def is_llm_heavy_entry(entry: ScheduleEntry) -> bool:
+    return entry.module_name in LLM_HEAVY_MODULES or entry.source in TEXT_HEAVY_SOURCES
+
+
+def production_env() -> bool:
+    return str(os.getenv("APP_ENV") or os.getenv("ENV") or "production").strip().lower() in {"prod", "production", "server"}
 
 
 def schedule_interval_seconds(payload: Mapping[str, Any]) -> float | None:
@@ -512,6 +688,20 @@ def schedule_interval_seconds(payload: Mapping[str, Any]) -> float | None:
     unit = match.group(2)
     multiplier = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86_400.0}[unit]
     return value * multiplier
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 def _env_sources() -> tuple[str, ...]:
@@ -556,6 +746,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         single_scheduler_instance=os.getenv("SINGLE_SCHEDULER_INSTANCE", "").lower() in {"1", "true", "yes"},
         schedule_id_filter=tuple(args.schedule_id) if args.schedule_id else _env_schedule_ids(),
         max_entries_per_tick=max(0, int(args.max_entries_per_tick)),
+        allow_llm_fallback=_env_bool("ALLOW_LLM_FALLBACK", False),
+        raw_text_fallback_interval_seconds=max(0.0, _env_float("RAW_TEXT_FALLBACK_INTERVAL_SECONDS", 1800.0)),
     )
     return AutonomousScheduler(config).run()
 

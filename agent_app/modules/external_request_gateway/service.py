@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
@@ -42,6 +44,7 @@ class GatewayExecutionResult:
 
 class ExternalRequestGatewayService:
     module_name = "External Request Gateway Module"
+    _llm_call_timestamps: dict[str, deque[float]] = defaultdict(deque)
 
     def __init__(
         self,
@@ -85,6 +88,19 @@ class ExternalRequestGatewayService:
         try:
             self._validate_optional_module_job(job)
             config = self.validate_provider_access(request)
+            if not self.apply_llm_throttle(request):
+                response = self._failure_response(
+                    request=request,
+                    started_at=started_at,
+                    status="rate_limited",
+                    errors=("llm_throttled",),
+                    data={
+                        "error_code": "llm_throttled",
+                        "task_type": request.payload.get("task_type"),
+                        "model_id": request.payload.get("model") or request.payload.get("model_id"),
+                    },
+                )
+                return self._persist_and_return(request, response)
             if not self.apply_rate_limit(request):
                 response = self._failure_response(
                     request=request,
@@ -155,6 +171,30 @@ class ExternalRequestGatewayService:
 
     def apply_rate_limit(self, request: ExternalRequest) -> bool:
         return self.repository.record_rate_limit_event(request.provider, request.request_type, utc_now())
+
+    def apply_llm_throttle(self, request: ExternalRequest) -> bool:
+        if request.provider != "polza_ai" or request.request_type != "llm_completion":
+            return True
+        if not _env_bool("LLM_ENABLED", True):
+            return False
+        now = time.time()
+        key = str(request.payload.get("model") or request.payload.get("model_id") or "default")
+        timestamps = self._llm_call_timestamps[key]
+        while timestamps and now - timestamps[0] > 86_400:
+            timestamps.popleft()
+        min_gap = _env_float("LLM_MIN_SECONDS_BETWEEN_CALLS", 0.0)
+        if min_gap > 0 and timestamps and now - timestamps[-1] < min_gap:
+            return False
+        limits = (
+            (60.0, _env_int("LLM_MAX_CALLS_PER_MINUTE", 0)),
+            (3600.0, _env_int("LLM_MAX_CALLS_PER_HOUR", 60)),
+            (86_400.0, _env_int("LLM_MAX_CALLS_PER_DAY", 500)),
+        )
+        for window_seconds, limit in limits:
+            if limit > 0 and sum(1 for ts in timestamps if now - ts <= window_seconds) >= limit:
+                return False
+        timestamps.append(now)
+        return True
 
     def check_cache(self, request: ExternalRequest, started_at: float) -> ExternalResponse | None:
         if not request.cache_policy.use_cache:
@@ -400,3 +440,24 @@ class ExternalRequestGatewayService:
 
 def response_received_at_ms(value: datetime) -> int:
     return int(value.timestamp() * 1000)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default

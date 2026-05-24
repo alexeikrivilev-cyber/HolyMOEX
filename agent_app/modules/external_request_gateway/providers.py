@@ -180,8 +180,9 @@ class ProviderRequestNormalizer:
         if request.request_type != "llm_completion":
             raise ProviderNormalizationError(f"unsupported polza_ai request_type: {request.request_type}")
         payload = dict(request.payload)
-        default_model = self._env_config_value(config, "default_model_env") or "deepseek/deepseek-v4-pro"
+        default_model = self._polza_model_for_task(payload, config)
         payload.setdefault("model", default_model)
+        payload.setdefault("model_id", payload.get("model"))
         payload.setdefault("temperature", 0)
         payload.setdefault("response_format", {"type": "json_object"})
         payload.setdefault("messages", [])
@@ -315,6 +316,38 @@ class ProviderRequestNormalizer:
         if auth_scheme and not auth_value.startswith(f"{auth_scheme} "):
             auth_value = f"{auth_scheme} {auth_value}"
         return {config.auth_header: auth_value}
+
+    def _polza_model_for_task(self, payload: Mapping[str, Any], config: ProviderConfig) -> str:
+        task_type = str(payload.get("task_type") or "").strip()
+        fast_tasks = {
+            "event_extraction",
+            "sentiment_scoring",
+            "news_classification",
+            "entity_matching",
+            "duplicate_preclassification",
+            "disclosure_classification",
+            "short_news_summarization",
+            "raw_text_relevance_filtering",
+        }
+        reasoning_tasks = {
+            "report_extraction",
+            "earnings_analysis",
+            "dividend_extraction",
+            "macro_text_analysis",
+            "complex_corporate_action_interpretation",
+            "multi_source_event_synthesis",
+            "validation_research_commentary",
+            "strategy_risk_explanation",
+        }
+        if task_type in fast_tasks:
+            return self.env.get("POLZA_FAST_MODEL") or str(config.config_payload.get("fast_model") or "deepseek/deepseek-v4-flash")
+        if task_type in reasoning_tasks:
+            return self.env.get("POLZA_REASONING_MODEL") or str(config.config_payload.get("reasoning_model") or "qwen/qwen3.6-35b-a3b")
+        return (
+            self.env.get("POLZA_DEFAULT_MODEL")
+            or self._env_config_value(config, "default_model_env")
+            or str(config.config_payload.get("default_model") or "qwen/qwen3.6-35b-a3b")
+        )
 
     def _env_config_value(self, config: ProviderConfig, payload_key: str) -> str:
         env_name = config.config_payload.get(payload_key)

@@ -710,7 +710,10 @@ SAFE_LIVE_SUBMIT=false
 LIVE_READINESS_PASSED=false
 POLZA_BASE_URL=https://polza.ai/api/v1
 POLZA_API_KEY=replace_with_real_key
-POLZA_LLM_MODEL=deepseek/deepseek-v4-pro
+POLZA_FAST_MODEL=deepseek/deepseek-v4-flash
+POLZA_REASONING_MODEL=qwen/qwen3.6-35b-a3b
+POLZA_DEFAULT_MODEL=qwen/qwen3.6-35b-a3b
+POLZA_LLM_MODEL=
 LLM_DEFAULT_TEMPERATURE=0
 LLM_DEFAULT_RESPONSE_FORMAT=json_object
 ```
@@ -863,7 +866,7 @@ Normalized `arena_go_bot`:
 
 ## 18. PolzaAI LLM integration
 
-LLM-провайдер: `PolzaAI`. Основная модель задаётся через `POLZA_LLM_MODEL`; по умолчанию в конфигурации используется `deepseek/deepseek-v4-pro`. Текущий gateway реализует strict JSON `llm_completion` smoke и `GET /models` availability-check через `provider=polza_ai`, `request_type=models`. В deploy-check `GET /models` используется как основной healthcheck, а strict JSON completion остаётся fallback-проверкой провайдера.
+LLM-провайдер: `PolzaAI`. Task-specific routing имеет приоритет: лёгкие новости/классификация используют `POLZA_FAST_MODEL=deepseek/deepseek-v4-flash`, сложные отчёты/макро/reasoning используют `POLZA_REASONING_MODEL=qwen/qwen3.6-35b-a3b`, а `POLZA_DEFAULT_MODEL` служит общим fallback. `POLZA_LLM_MODEL` оставлен только для совместимости. Текущий gateway реализует strict JSON `llm_completion` smoke и `GET /models` availability-check через `provider=polza_ai`, `request_type=models`. В deploy-check `GET /models` используется как основной healthcheck, а strict JSON completion остаётся fallback-проверкой провайдера.
 
 PolzaAI вызывается только через `External Request Gateway Module`. LLM-модули не имеют права напрямую создавать HTTP-клиент к PolzaAI.
 
@@ -876,7 +879,8 @@ Gateway request для LLM:
   "provider": "polza_ai",
   "request_type": "llm_completion",
   "payload": {
-    "model": "deepseek/deepseek-v4-pro",
+    "model": "deepseek/deepseek-v4-flash",
+    "task_type": "event_extraction",
     "messages": [],
     "temperature": 0,
     "response_format": {"type": "json_object"},
@@ -1276,7 +1280,7 @@ docker compose -f docker/docker-compose.prod.yml up -d scheduler_worker
 
 `scheduler_worker` is the primary long-running process. `agent_app`, `research_worker` and `staging_runner` are optional/manual profiles and must not be used as restart-loop daemons.
 
-`migration_runner` applies migrations `001..014` and repeated runs must skip already applied migrations. Readiness is checked through:
+`migration_runner` applies migrations `001..015` and repeated runs must skip already applied migrations. Readiness is checked through:
 
 ```sql
 SELECT * FROM audit.database_readiness_check ORDER BY check_name;
@@ -1359,7 +1363,7 @@ Startup sequence:
 load env
   -> ensure /data directories
   -> start persistent local PostgreSQL
-  -> apply migrations 001..014
+  -> apply migrations 001..015
   -> validate ArenaGo token through SANDBOX_API_KEY/ARENA_GO_TOKEN
   -> resolve exact bot/portfolio from /api/bots
   -> sync positions/trades
@@ -1375,6 +1379,54 @@ In standalone root-container mode the launcher uses its own `/data/postgres` dat
 ## PolzaAI
 
 Gateway supports `polza_ai/models` through `GET ${POLZA_BASE_URL}/models`. If an environment/provider later disables that endpoint, the supported fallback healthcheck is a strict JSON `llm_completion` smoke with `response_format={"type":"json_object"}` and schema fields `schema_version`, `model_id`, `model_version`, `task_type`, `items`.
+
+Task-specific model routing has priority over the legacy `POLZA_LLM_MODEL` default:
+
+```env
+POLZA_FAST_MODEL=deepseek/deepseek-v4-flash
+POLZA_REASONING_MODEL=qwen/qwen3.6-35b-a3b
+POLZA_DEFAULT_MODEL=qwen/qwen3.6-35b-a3b
+LLM_ENABLED=true
+LLM_MAX_CALLS_PER_MINUTE=10
+LLM_MAX_CALLS_PER_HOUR=60
+LLM_MAX_CALLS_PER_DAY=500
+LLM_MAX_ITEMS_PER_RUN=20
+LLM_MIN_SECONDS_BETWEEN_CALLS=0
+ALLOW_LLM_FALLBACK=false
+RAW_TEXT_FALLBACK_INTERVAL_SECONDS=1800
+```
+
+`deepseek/deepseek-v4-flash` is used for light text tasks: `event_extraction`, `sentiment_scoring`, `news_classification`, entity/ticker matching, duplicate/novelty pre-classification, simple disclosure classification, short news summarization and raw-text relevance filtering. `qwen/qwen3.6-35b-a3b` is used for heavier reasoning tasks: `report_extraction`, `earnings_analysis`, long-report dividend extraction, `macro_text_analysis`, complex corporate actions, multi-source synthesis, validation/research commentary and strategy/risk explanations. LLM output remains strict JSON only and must not contain buy/sell recommendations, weight changes, risk-policy changes, order intents or free-form prose.
+
+The LLM cache key includes `content_hash`, `task_type`, `prompt_version`, `model_id` and `event_ontology_version`. It intentionally excludes volatile fields such as `job_id`, `fetched_at`, current timestamp and scheduler tick id.
+
+To inspect PolzaAI usage/cost:
+
+```sql
+SELECT date_trunc('minute', received_at) AS minute,
+       count(*) AS calls,
+       sum(cost_units) AS cost_units
+  FROM request_logs.external_response
+ WHERE provider = 'polza_ai'
+ GROUP BY 1
+ ORDER BY 1 DESC
+ LIMIT 60;
+```
+
+Steady-state Raw Text discovery and EventNews extraction must not run every minute. `schedule:data_intake:scheduled_external_news_discovery` and `schedule:event_news:intake` are throttled to 30 minutes by migration `015_runtime_scheduling_llm_cost_patch.sql`; earnings/fundamental text-heavy paths use 60 minutes or event-driven triggers. Initial backfill may be more active only when explicitly configured.
+
+## Market-hours gating
+
+The runtime exposes `market_session_status = open | closed | premarket | postmarket | unknown` and derives `agent_runtime_phase = trading_session | off_market | degraded`. Outside `open`, the scheduler skips heavy live `Decision Engine`, `Risk Control` and `Execution Engine` loops and throttles LLM-heavy Raw Text/EventNews jobs. Portfolio sync, health/readiness, monitoring/audit and light market/macro maintenance may continue. If session status is `unknown`, live submit is blocked and monitoring/audit should surface a warning.
+
+Production fallback Raw Text/EventNews source-loop is disabled by default when `audit.schedule_config` cannot be loaded. To enable it deliberately:
+
+```env
+ALLOW_LLM_FALLBACK=true
+RAW_TEXT_FALLBACK_INTERVAL_SECONDS=1800
+```
+
+The fallback interval must be at least 900 seconds. The scheduler writes `raw_text_fallback_disabled_in_production` when it refuses the production fallback.
 
 ## Disclosure and issuer IR
 
