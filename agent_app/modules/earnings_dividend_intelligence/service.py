@@ -728,6 +728,11 @@ class EarningsDividendIntelligenceService:
                 if fact is not None:
                     dividend_facts.append(fact)
 
+        max_llm_items = _env_int("LLM_MAX_ITEMS_PER_RUN", 20)
+        if max_llm_items > 0 and len(raw_text_items) > max_llm_items:
+            warnings.append("llm_items_per_run_capped")
+            raw_text_items = raw_text_items[:max_llm_items]
+
         for raw_item in raw_text_items:
             source_refs = (f"raw_text.raw_text_item:{raw_item.raw_text_item_id}",)
             payload = raw_item.source_payload
@@ -762,6 +767,9 @@ class EarningsDividendIntelligenceService:
 
             llm_payload = _embedded_llm_payload(raw_item)
             if llm_payload is None and self.gateway is not None and (raw_item.body or raw_item.title):
+                if not _llm_text_runtime_enabled(job):
+                    warnings.append(f"llm_text_module_disabled_in_live_runtime:{raw_item.raw_text_item_id}")
+                    continue
                 request = self.create_llm_extraction_request(raw_item, module_input, job)
                 response = self._gateway_process(request)
                 warnings.append(f"external_request_created:{request.request_id}")
@@ -1657,18 +1665,34 @@ class EarningsDividendIntelligenceService:
         if explicit in VALID_TASK_TYPES:
             return explicit
         text = " ".join((raw_item.source, raw_item.title or "", raw_item.body[:500] if raw_item.body else "")).lower()
-        if any(marker in text for marker in ("дивиденд", "дивиденды", "совет директоров", "собрание акционеров")):
+        dividend_markers = (
+            "\u0434\u0438\u0432\u0438\u0434\u0435\u043d\u0434",
+            "\u0434\u0438\u0432\u0438\u0434\u0435\u043d\u0434\u044b",
+            "\u0441\u043e\u0432\u0435\u0442 \u0434\u0438\u0440\u0435\u043a\u0442\u043e\u0440\u043e\u0432",
+            "\u0441\u043e\u0431\u0440\u0430\u043d\u0438\u0435 \u0430\u043a\u0446\u0438\u043e\u043d\u0435\u0440\u043e\u0432",
+            "record date",
+            "dividend",
+        )
+        report_markers = (
+            "\u043e\u0442\u0447\u0435\u0442",
+            "\u043e\u0442\u0447\u0451\u0442",
+            "\u043c\u0441\u0444\u043e",
+            "\u0440\u0441\u0431\u0443",
+            "\u0444\u0438\u043d\u0430\u043d\u0441\u043e\u0432\u044b\u0435 \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442\u044b",
+            "\u043e\u043f\u0435\u0440\u0430\u0446\u0438\u043e\u043d\u043d\u044b\u0435 \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442\u044b",
+            "\u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u0444\u0430\u043a\u0442",
+            "report",
+            "ifrs",
+            "rsbu",
+            "msfo",
+            "financial results",
+            "operating results",
+        )
+        if any(marker in text for marker in dividend_markers):
             return "dividend_extraction"
-        if any(marker in text for marker in ("отчет", "отчёт", "мсфо", "рсбу", "финансовые результаты", "операционные результаты", "существенный факт")):
+        if any(marker in text for marker in report_markers):
             return "report_extraction"
-        if any(marker in text for marker in ("дивиденд", "дивиденды", "совет директоров", "собрание акционеров")):
-            return "dividend_extraction"
-        if any(marker in text for marker in ("отчет", "отчёт", "мсфо", "рсбу", "финансовые результаты", "операционные результаты")):
-            return "report_extraction"
-        if "dividend" in text or "дивиденд" in text:
-            return "dividend_extraction"
         return "report_extraction"
-
     def write_structured_event(self, event: StructuredEvent) -> str:
         return self.repository.save_structured_event(event)
 
@@ -2056,6 +2080,28 @@ def _safe_polza_model(model_id: str | None, fallback: str) -> str:
     if not candidate or candidate in PROHIBITED_POLZA_MODELS:
         return fallback
     return candidate
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _llm_text_runtime_enabled(job: ModuleJob) -> bool:
+    if not _env_bool("LLM_ENABLED", True):
+        return False
+    if job.run_mode == "live_trading":
+        return _env_bool("ENABLE_LLM_TEXT_SCHEDULES", False)
+    return True
 
 
 def _coerce_timestamp(value: Any, fallback: str) -> str:

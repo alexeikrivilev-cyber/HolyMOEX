@@ -696,6 +696,22 @@ class EventNewsIntelligenceService:
         if embedded is not None:
             return self.validate_llm_output(embedded), ()
 
+        if not _llm_text_runtime_enabled(job):
+            self.write_audit_record(
+                AuditRecord(
+                    module_name=self.module_name,
+                    job_id=job.job_id,
+                    severity="warning",
+                    event_type="llm_text_request_skipped_by_runtime_guard",
+                    message="Skipped EventNews LLM request in live runtime because ENABLE_LLM_TEXT_SCHEDULES is false.",
+                    object_type="raw_text_item",
+                    object_ref=f"raw_text.raw_text_item:{raw_item.raw_text_item_id}",
+                    reason_codes=("llm_text_module_disabled_in_live_runtime",),
+                    payload={"raw_text_item_id": raw_item.raw_text_item_id, "run_mode": job.run_mode},
+                )
+            )
+            return None, ("llm_text_module_disabled_in_live_runtime",)
+
         request = self.create_llm_request(raw_item, event_input, job)
         if self.gateway is None:
             return None, ("llm_gateway_unavailable",)
@@ -1216,48 +1232,34 @@ class EventNewsIntelligenceService:
             str(value or "")
             for value in (raw_item.source_type, raw_item.source, raw_item.title, raw_item.source_url)
         ).lower()
-        text_with_body = f"{text} {(raw_item.body or '')[:1500].lower()}"
-        if any(marker in text_with_body for marker in (
-            "отчет",
-            "отчёт",
-            "мсфо",
-            "рсбу",
-            "финансовые результаты",
-            "операционные результаты",
-            "существенный факт",
-            "собрание акционеров",
-            "совет директоров",
-        )):
-            return "report_extraction"
-        if any(marker in text_with_body for marker in ("дивиденд", "дивиденды")) and len(raw_item.body or "") > 3000:
-            return "dividend_extraction"
-        if any(marker in text_with_body for marker in ("ключев", "руониа", "цб", "банк россии")):
-            return "macro_text_analysis"
+        body_text = (raw_item.body or "")[:1500].lower()
+        text_with_body = f"{text} {body_text}"
         russian_report_markers = (
-            "отчет",
-            "отчёт",
-            "мсфо",
-            "рсбу",
-            "финансовые результаты",
-            "операционные результаты",
-            "существенный факт",
-            "собрание акционеров",
-            "совет директоров",
+            "\u043e\u0442\u0447\u0435\u0442",
+            "\u043e\u0442\u0447\u0451\u0442",
+            "\u043c\u0441\u0444\u043e",
+            "\u0440\u0441\u0431\u0443",
+            "\u0444\u0438\u043d\u0430\u043d\u0441\u043e\u0432\u044b\u0435 \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442\u044b",
+            "\u043e\u043f\u0435\u0440\u0430\u0446\u0438\u043e\u043d\u043d\u044b\u0435 \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442\u044b",
+            "\u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u0444\u0430\u043a\u0442",
+            "\u0441\u043e\u0431\u0440\u0430\u043d\u0438\u0435 \u0430\u043a\u0446\u0438\u043e\u043d\u0435\u0440\u043e\u0432",
+            "\u0441\u043e\u0432\u0435\u0442 \u0434\u0438\u0440\u0435\u043a\u0442\u043e\u0440\u043e\u0432",
         )
-        if any(marker in text for marker in russian_report_markers):
+        russian_dividend_markers = ("\u0434\u0438\u0432\u0438\u0434\u0435\u043d\u0434", "\u0434\u0438\u0432\u0438\u0434\u0435\u043d\u0434\u044b")
+        russian_macro_markers = ("\u043a\u043b\u044e\u0447\u0435\u0432", "\u0440\u0443\u043e\u043d\u0438\u0430", "\u0446\u0431", "\u0431\u0430\u043d\u043a \u0440\u043e\u0441\u0441\u0438\u0438")
+        if any(marker in text_with_body for marker in russian_report_markers):
             return "report_extraction"
-        if any(marker in text for marker in ("дивиденд", "дивиденды")) and len(raw_item.body or "") > 3000:
+        if any(marker in text_with_body for marker in russian_dividend_markers) and len(raw_item.body or "") > 3000:
             return "dividend_extraction"
-        if any(marker in text for marker in ("ключев", "руониа")):
+        if any(marker in text_with_body for marker in russian_macro_markers):
             return "macro_text_analysis"
-        if any(marker in text for marker in ("report", "отчет", "отчёт", "ifrs", "rsbu", "msfo", "мсфо", "financial")):
+        if any(marker in text for marker in ("report", "ifrs", "rsbu", "msfo", "financial")):
             return "report_extraction"
-        if any(marker in text for marker in ("dividend", "дивиденд")) and len(raw_item.body or "") > 3000:
+        if "dividend" in text and len(raw_item.body or "") > 3000:
             return "dividend_extraction"
-        if any(marker in text for marker in ("macro", "cbr", "ключев", "ruonia", "zc yc", "zcyc")):
+        if any(marker in text for marker in ("macro", "cbr", "ruonia", "zc yc", "zcyc")):
             return "macro_text_analysis"
         return "event_extraction"
-
     def create_market_reaction_requests(
         self,
         event: StructuredEvent,
@@ -1796,3 +1798,18 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _llm_text_runtime_enabled(job: ModuleJob) -> bool:
+    if not _env_bool("LLM_ENABLED", True):
+        return False
+    if job.run_mode == "live_trading":
+        return _env_bool("ENABLE_LLM_TEXT_SCHEDULES", False)
+    return True

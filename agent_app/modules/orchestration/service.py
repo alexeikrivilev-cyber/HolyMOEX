@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 
@@ -16,6 +17,11 @@ from .repository import AuditRecord, OrchestrationRepository
 
 VALID_SYSTEM_MODES = {"analysis_only", "paper_trading", "live_trading", "maintenance"}
 ANALYSIS_ONLY_SKIPPED_MODULES = {"Execution Engine Module"}
+LLM_HEAVY_MODULES = {
+    "Event & News Intelligence Module",
+    "Earnings & Dividend Intelligence Module",
+    "Fundamental & Valuation Module",
+}
 
 
 class OrchestrationError(ValueError):
@@ -411,6 +417,52 @@ class OrchestrationService:
             )
             return None
 
+        skip_reason = self.module_runtime_skip_reason(job)
+        if skip_reason:
+            result = ModuleJobResult(
+                job_id=job.job_id,
+                module_name=job.module_name,
+                status="skipped",
+                started_at=utc_now().isoformat().replace("+00:00", "Z"),
+                finished_at=utc_now().isoformat().replace("+00:00", "Z"),
+                output_refs=(),
+                warnings=(skip_reason,),
+                errors=(),
+                metrics_written=0,
+                events_written=0,
+                data_quality_score=0.0,
+            )
+            self.repository.save_module_job_result(result)
+            self.repository.save_module_run(
+                job,
+                status="skipped",
+                payload={
+                    "pipeline_run_id": pipeline_run_id,
+                    "route_policy": "runtime_module_guard",
+                    "skip_reason": skip_reason,
+                    "idempotency_reused": False,
+                },
+            )
+            self.write_audit_record(
+                AuditRecord(
+                    module_name=self.module_name,
+                    job_id=job.job_id,
+                    severity="warning",
+                    event_type="module_job_skipped_by_runtime_guard",
+                    message=f"Skipped {job.module_name} by autonomous runtime guard.",
+                    object_type="module_job",
+                    object_ref=job.job_id,
+                    reason_codes=(skip_reason,),
+                    payload={
+                        "pipeline_run_id": pipeline_run_id,
+                        "module_name": job.module_name,
+                        "run_mode": job.run_mode,
+                        "enable_llm_text_schedules": _env_bool("ENABLE_LLM_TEXT_SCHEDULES", False),
+                    },
+                )
+            )
+            return result
+
         self.repository.save_module_run(
             job,
             status="running",
@@ -423,6 +475,17 @@ class OrchestrationService:
         result = self.execute_module_job(job, request, context)
         self.persist_module_job_result(job, result, pipeline_run_id)
         return result
+
+    def module_runtime_skip_reason(self, job: ModuleJob) -> str:
+        if (
+            job.run_mode == "live_trading"
+            and job.module_name in LLM_HEAVY_MODULES
+            and not _env_bool("ENABLE_LLM_TEXT_SCHEDULES", False)
+        ):
+            return "llm_text_module_disabled_in_live_runtime"
+        if job.module_name in LLM_HEAVY_MODULES and not _env_bool("LLM_ENABLED", True):
+            return "llm_disabled"
+        return ""
 
     def execute_module_job(
         self,
@@ -1036,3 +1099,10 @@ class OrchestrationService:
 
 def contextual_run_mode(context: PipelineContext) -> str:
     return context.system_mode
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}

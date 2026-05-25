@@ -1087,6 +1087,90 @@ def test_russian_event_news_routing_uses_reasoning_model() -> None:
     assert request.payload["model"] == "qwen/qwen3.6-35b-a3b"
 
 
+def test_earnings_russian_text_routes_to_dividend_or_report_model() -> None:
+    from agent_app.modules.earnings_dividend_intelligence.repository import RawTextItem
+    from agent_app.modules.earnings_dividend_intelligence.service import EarningsDividendIntelligenceService
+
+    service = EarningsDividendIntelligenceService()
+    dividend_item = RawTextItem(
+        raw_text_item_id="ru_dividend",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        source="issuer_disclosure",
+        title="Совет директоров рекомендовал дивиденды",
+        body="Собрание акционеров рассмотрит дивиденды и дату закрытия реестра.",
+        fetched_at="2026-05-24T09:00:00Z",
+    )
+    report_item = RawTextItem(
+        raw_text_item_id="ru_report",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        source="issuer_disclosure",
+        title="Отчёт МСФО и финансовые результаты",
+        body="Компания раскрыла операционные результаты и существенный факт.",
+        fetched_at="2026-05-24T09:00:00Z",
+    )
+
+    assert service.llm_task_type(dividend_item) == "dividend_extraction"
+    assert service.llm_task_type(report_item) == "report_extraction"
+    assert service.model_id == "qwen/qwen3.6-35b-a3b"
+
+
+def test_event_news_live_llm_guard_skips_gateway_when_text_schedules_disabled() -> None:
+    import os
+
+    from agent_app.modules.event_news_intelligence.repository import RawTextItem
+    from agent_app.modules.event_news_intelligence.service import EventNewsInput, EventNewsIntelligenceService
+
+    previous = os.environ.get("ENABLE_LLM_TEXT_SCHEDULES")
+    os.environ["ENABLE_LLM_TEXT_SCHEDULES"] = "false"
+
+    class Gateway:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def process(self, request):
+            self.requests.append(request)
+            return None
+
+    gateway = Gateway()
+    service = EventNewsIntelligenceService(gateway=gateway)
+    raw_item = RawTextItem(
+        raw_text_item_id="news_guard",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        source="rbc_news",
+        source_type="news_api",
+        title="SBER ordinary news",
+        body="A text item that would otherwise need LLM extraction.",
+        fetched_at="2026-05-24T09:00:00Z",
+        content_hash="hash_guard",
+    )
+    event_input = EventNewsInput(
+        routing_message_refs=(),
+        raw_text_refs=("raw_text.raw_text_item:news_guard",),
+        instrument_ids=("moex:SBER",),
+        event_ontology_version="event_ontology:v1",
+        llm_prompt_version="prompt:v2",
+        market_reaction_window=("1h",),
+    )
+    try:
+        envelope, warnings = service.load_or_request_llm_envelope(
+            raw_item,
+            event_input,
+            _job(module_name="Event & News Intelligence Module", run_mode="live_trading"),
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("ENABLE_LLM_TEXT_SCHEDULES", None)
+        else:
+            os.environ["ENABLE_LLM_TEXT_SCHEDULES"] = previous
+
+    assert envelope is None
+    assert warnings == ("llm_text_module_disabled_in_live_runtime",)
+    assert gateway.requests == []
+
+
 def test_event_news_empty_items_is_valid_no_event_result() -> None:
     from agent_app.modules.event_news_intelligence.repository import InMemoryEventNewsIntelligenceRepository
     from agent_app.modules.event_news_intelligence.service import EventNewsIntelligenceService
@@ -1519,6 +1603,350 @@ def test_risk_reducing_sell_is_not_blocked_by_positive_edge_gate() -> None:
     assert "turnover_trade_without_positive_edge" not in result.risk_check_result.risk_flags
 
 
+def test_short_opening_sell_order_is_supported_by_risk() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.02,
+        current_quantity=0.0,
+        action="sell",
+        target_quantity=-10.0,
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "approved"
+    assert len(result.order_intents) == 1
+    assert result.order_intents[0].side == "sell"
+    assert result.order_intents[0].quantity == 10.0
+    metrics = result.order_intents[0].payload["risk_metrics"]
+    assert metrics["instrument_exposure_after_trade"] > 0.0
+    assert metrics["portfolio_exposure_after_trade"] > 0.0
+
+
+def test_reduce_short_order_uses_buy_to_cover_side() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        current_quantity=-10.0,
+        action="reduce",
+        target_quantity=0.0,
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "approved"
+    assert len(result.order_intents) == 1
+    assert result.order_intents[0].side == "buy"
+    assert result.order_intents[0].quantity == 10.0
+
+
+def test_batch_risk_limits_rank_and_cap_new_long_fanout() -> None:
+    from agent_app.modules.risk_control.repository import (
+        DecisionSet,
+        FeatureVector,
+        InMemoryRiskControlRepository,
+        InstrumentLimit,
+        PortfolioLimit,
+        PortfolioSnapshot,
+        RiskPolicy,
+    )
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    policy_id = "live_policy"
+    instruments = ("moex:AAA", "moex:BBB", "moex:CCC", "moex:DDD")
+    edges = {
+        "moex:AAA": 0.02,
+        "moex:BBB": 0.05,
+        "moex:CCC": 0.04,
+        "moex:DDD": 0.03,
+    }
+    common_limits = [
+        PortfolioLimit(policy_id, "min_expected_edge_after_cost_score", 0.01, {}),
+        PortfolioLimit(policy_id, "max_portfolio_exposure_pct", 1.0, {}),
+        PortfolioLimit(policy_id, "max_sector_exposure_pct", 1.0, {}),
+        PortfolioLimit(policy_id, "max_daily_loss_rub", 50_000, {}),
+        PortfolioLimit(policy_id, "max_drawdown_limit", 0.5, {}),
+        PortfolioLimit(policy_id, "max_allowed_slippage_bps", 20, {}),
+        PortfolioLimit(policy_id, "arena_go_daily_trade_limit", 1000, {}),
+        PortfolioLimit(policy_id, "total_risk_budget", 1.0, {}),
+        PortfolioLimit(policy_id, "used_risk_budget", 0.0, {}),
+        PortfolioLimit(policy_id, "min_data_quality_score", 0.5, {}),
+        PortfolioLimit(policy_id, "portfolio_snapshot_ttl_seconds", 300, {}),
+        PortfolioLimit(policy_id, "max_risk_increasing_order_intents_per_cycle", 10, {}),
+        PortfolioLimit(policy_id, "max_new_long_order_intents_per_cycle", 2, {}),
+    ]
+    repo = InMemoryRiskControlRepository(
+        decision_sets=(
+            DecisionSet(
+                "decision_edge",
+                "request_edge",
+                "intraday",
+                tuple(
+                    {
+                        "instrument_id": instrument_id,
+                        "action": "buy",
+                        "target_quantity": 10,
+                        "expected_edge_score": edge,
+                        "expected_edge_after_cost_score": edge,
+                        "primary_reason_codes": [],
+                    }
+                    for instrument_id, edge in edges.items()
+                ),
+                "test",
+                created_at="2026-05-24T09:00:00Z",
+            ),
+        ),
+        risk_policies=(RiskPolicy(policy_id, "live", "1", "active", ("live_trading",), {"market_session_status": "open", "market_regime": "normal"}),),
+        instrument_limits=tuple(InstrumentLimit(policy_id, instrument_id, 1.0, 100_000, 20, {"arena_go_secid": instrument_id.rsplit(":", 1)[-1]}) for instrument_id in instruments),
+        portfolio_limits=tuple(common_limits),
+        portfolio_snapshots=(
+            PortfolioSnapshot(
+                "snapshot_edge",
+                "arena_go_default",
+                "moex_top20_manual",
+                "2026-05-24T09:00:00Z",
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+                0,
+                0,
+                {"market_session_status": "open", "market_regime": "normal"},
+            ),
+        ),
+        feature_vectors=tuple(
+            FeatureVector(
+                f"fv_{instrument_id}",
+                instrument_id,
+                "intraday",
+                "2026-05-24T09:00:00Z",
+                {
+                    "latest_price": {"raw_value": 100, "ttl_status": "fresh"},
+                    "spread_bps": {"raw_value": 4, "ttl_status": "fresh"},
+                    "estimated_slippage_bps": {"raw_value": 3, "ttl_status": "fresh"},
+                    "market_session_status": {"value": "open", "ttl_status": "fresh"},
+                    "market_regime": {"value": "normal", "ttl_status": "fresh"},
+                    "arena_go_secid": {"value": instrument_id.rsplit(":", 1)[-1], "ttl_status": "fresh"},
+                    "_meta": {"ttl_status": "fresh", "quality_flags": []},
+                },
+                1.0,
+                1.0,
+                "test",
+            )
+            for instrument_id in instruments
+        ),
+    )
+    repo_payload = {
+        "risk_check_request": {
+            "decision_set_id": "decision_edge",
+            "portfolio_state_ref": "portfolio.portfolio_snapshot:snapshot_edge",
+            "risk_policy_id": policy_id,
+            "market_state_ref": "features.market_state_record:market",
+            "data_quality_report_ref": "features.data_quality_record:dq",
+            "run_mode": "live_trading",
+        }
+    }
+
+    result = RiskControlService(repo).process(repo_payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "approved_with_changes"
+    assert [order.instrument_id for order in result.order_intents] == ["moex:BBB", "moex:CCC"]
+    assert "new_long_cycle_order_limit_reached" in result.risk_check_result.risk_flags
+
+
+def test_decision_engine_can_choose_short_opening_sell() -> None:
+    from agent_app.modules.decision_engine.service import DecisionEngineService, DecisionRequest
+
+    request = DecisionRequest(
+        decision_request_id="decision_short",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizon="intraday",
+        as_of_ts="2026-05-24T09:00:00Z",
+        feature_vector_refs=("features.feature_vector:fv",),
+        portfolio_state_ref="portfolio.portfolio_snapshot:snapshot",
+        weights_profile_id="weights:live_autonomous:intraday:v1",
+        run_mode="live_trading",
+        decision_mode="normal",
+    )
+    service = DecisionEngineService()
+
+    assert service.choose_action(
+        request=request,
+        expected_edge=-0.08,
+        risk_score=0.2,
+        margin=0.03,
+        reason_codes=(),
+        position=None,
+    ) == "sell"
+
+
+def test_decision_exit_overlay_closes_take_profit_and_stop_loss() -> None:
+    from agent_app.modules.decision_engine.repository import PositionState
+    from agent_app.modules.decision_engine.service import DecisionEngineService
+
+    service = DecisionEngineService()
+    long_position = PositionState("pos_long", "portfolio", "moex:SBER", "2026-05-24T09:00:00Z", 10, 100, 102, 1020, 20)
+    short_position = PositionState("pos_short", "portfolio", "moex:SBER", "2026-05-24T09:00:00Z", -10, 100, 98, -980, 20)
+    losing_position = PositionState("pos_loss", "portfolio", "moex:SBER", "2026-05-24T09:00:00Z", 10, 100, 98, 980, -20)
+
+    long_exit = service.position_exit_overlay(
+        position=long_position,
+        latest_price=102,
+        current_quantity=10,
+        expected_edge=0.0,
+        risk_score=0.2,
+    )
+    short_exit = service.position_exit_overlay(
+        position=short_position,
+        latest_price=98,
+        current_quantity=-10,
+        expected_edge=0.0,
+        risk_score=0.2,
+    )
+    stop_exit = service.position_exit_overlay(
+        position=losing_position,
+        latest_price=98,
+        current_quantity=10,
+        expected_edge=0.2,
+        risk_score=0.2,
+    )
+
+    assert long_exit is not None and long_exit[0] == "reduce"
+    assert short_exit is not None and short_exit[0] == "reduce"
+    assert stop_exit is not None and stop_exit[0] == "reduce"
+    assert "position_take_profit_triggered" in long_exit[3]
+    assert "position_take_profit_triggered" in short_exit[3]
+    assert "position_stop_loss_triggered" in stop_exit[3]
+
+
+def test_decision_engine_emits_negative_short_target_when_edge_is_negative() -> None:
+    from agent_app.modules.decision_engine.repository import (
+        FeatureVector,
+        InMemoryDecisionEngineRepository,
+        MarketStateRecord,
+        MetricWeightRule,
+        PortfolioSnapshot,
+        WeightsProfile,
+    )
+    from agent_app.modules.decision_engine.service import DecisionEngineService
+
+    repository = InMemoryDecisionEngineRepository(
+        feature_vectors=(
+            FeatureVector(
+                "fv_short",
+                "moex:SBER",
+                "intraday",
+                "2026-05-24T09:00:00Z",
+                {
+                    "latest_price": {"raw_value": 250, "confidence_score": 1.0, "ttl_status": "fresh"},
+                    "weak_signal": {"normalized_value": 0.01, "raw_value": 0.01, "confidence_score": 1.0, "ttl_status": "fresh"},
+                    "spread_bps": {"raw_value": 3, "ttl_status": "fresh"},
+                },
+                1.0,
+                1.0,
+                "test",
+            ),
+        ),
+        weights_profiles=(WeightsProfile("weights_short", "short", "1", "active", "intraday", ("live_trading",)),),
+        metric_weight_rules=(
+            MetricWeightRule("rule_weak", "weights_short", "weak_signal", "price", "intraday", "all", (), None, 1.0, "positive", "identity", 0.0, "downweight", "test"),
+        ),
+        portfolio_snapshots=(
+            PortfolioSnapshot("snapshot_short", "arena_go_default", "moex_top20_manual", "2026-05-24T09:00:00Z", 1_000_000, 1_000_000, 1_000_000, 0, 0, 0, 0, {"market_session_status": "open"}),
+        ),
+        market_state_records=(
+            MarketStateRecord(
+                "market_state_short",
+                "moex_top20_manual",
+                "2026-05-24T09:00:00Z",
+                "open",
+                "range",
+                {"risk_on_risk_off_score": 0.1, "market_context": {"market_breadth": 0.1}, "macro_context": {}},
+            ),
+        ),
+    )
+    job = ModuleJob(
+        job_id="job_short_decision",
+        module_name="Decision Engine Module",
+        contour="decision_contour",
+        trigger_type="manual",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T09:00:00Z"),
+        input_refs=("features.feature_vector:fv_short", "portfolio.portfolio_snapshot:snapshot_short"),
+        config_ref="weights_short",
+        run_mode="live_trading",
+        idempotency_key="idem_short_decision",
+    )
+    payload = {
+        "decision_request": {
+            "decision_request_id": "decision_request_short",
+            "universe_id": "moex_top20_manual",
+            "instrument_ids": ["moex:SBER"],
+            "horizon": "intraday",
+            "as_of_ts": "2026-05-24T09:00:00Z",
+            "feature_vector_refs": ["features.feature_vector:fv_short"],
+            "portfolio_state_ref": "portfolio.portfolio_snapshot:snapshot_short",
+            "weights_profile_id": "weights_short",
+            "run_mode": "live_trading",
+            "decision_mode": "normal",
+        }
+    }
+
+    result = DecisionEngineService(repository=repository).process(payload, job)
+
+    assert result.decision_records
+    decision = result.decision_records[0]
+    assert decision.action == "sell"
+    assert decision.target_position_pct < 0
+    assert decision.target_quantity < 0
+
+
+def test_broker_short_position_direction_is_signed() -> None:
+    from agent_app.modules.portfolio_state.service import BrokerSyncResult, PortfolioStateService, PortfolioUpdateRequest
+
+    service = PortfolioStateService(config={"arena_go_position_units": "shares"})
+    quantities: dict[str, float] = {}
+    payloads: dict[str, dict[str, object]] = {}
+    result = service.apply_broker_reconciliation(
+        request=PortfolioUpdateRequest(
+            portfolio_id="portfolio",
+            fill_report_refs=(),
+            broker_snapshot_ref="broker.snapshot:test",
+            price_snapshot_ref="price.snapshot:test",
+            run_mode="live_trading",
+            as_of_ts="2026-05-24T09:00:00Z",
+        ),
+        cash=1_000_000.0,
+        realized_pnl=0.0,
+        quantities=quantities,
+        average_prices={},
+        payloads=payloads,
+        broker_sync=BrokerSyncResult(
+            status="success",
+            cash_balance=1_010_000.0,
+            positions=({"secid": "SBER", "position": 10, "direction": "S", "average_price": 250},),
+            trades=(),
+            errors=(),
+            request_refs=(),
+            portfolio_id="portfolio",
+        ),
+        previous_snapshot=None,
+        lot_sizes={"moex:SBER": 1},
+    )
+
+    assert result["warnings"] == ()
+    assert result["cash"] == 1_010_000.0
+    assert quantities["moex:SBER"] == -10.0
+    assert payloads["moex:SBER"]["broker_direction"] == "s"
+
+
 def test_future_timestamp_feature_is_rejected_by_risk() -> None:
     from agent_app.modules.risk_control.service import RiskControlService
 
@@ -1620,6 +2048,14 @@ def test_live_execution_requires_explicit_safe_live_submit(monkeypatch) -> None:
 
     assert result.execution_results[0].status == "rejected"
     assert "safe_live_submit_disabled" in result.execution_results[0].errors
+
+
+def test_execution_policy_defaults_to_arena_go_lots_for_provider_submit() -> None:
+    from agent_app.modules.execution_engine.service import ExecutionPolicy
+
+    policy = ExecutionPolicy.from_mapping("execution_policy:test", {})
+
+    assert policy.arena_go_submit_quantity_units == "lots"
 
 
 def test_market_closed_blocks_execution_submit_even_when_safe_live_enabled(monkeypatch) -> None:

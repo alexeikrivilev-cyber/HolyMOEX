@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
@@ -58,6 +59,9 @@ DEFAULT_PORTFOLIO_STALE_SECONDS = 300
 DEFAULT_ORDER_TTL_SECONDS = 300
 DEFAULT_TIME_IN_FORCE = "day"
 DEFAULT_ORDER_TYPE = "limit"
+DEFAULT_MAX_RISK_INCREASING_ORDERS_PER_CYCLE = 4
+DEFAULT_MAX_NEW_LONG_ORDERS_PER_CYCLE = 3
+DEFAULT_MAX_NEW_SHORT_ORDERS_PER_CYCLE = 3
 
 
 class RiskControlError(ValueError):
@@ -355,8 +359,14 @@ class RiskControlService:
         else:
             existing_order_count = self.daily_submitted_order_count(portfolio_snapshot)
             shadow_snapshot = portfolio_snapshot
-            for decision in decision_set.decisions:
+            cycle_counters = {
+                "risk_increasing": 0,
+                "new_long": 0,
+                "new_short": 0,
+            }
+            for decision in self.prioritized_decisions(decision_set.decisions, positions_by_instrument):
                 instrument_id = str(decision.get("instrument_id") or "")
+                position_before_order = positions_by_instrument.get(instrument_id)
                 assessment = self.assess_decision(
                     request=request,
                     job=job,
@@ -373,8 +383,18 @@ class RiskControlService:
                     existing_order_count=existing_order_count,
                     pending_order_count=sum(1 for item in assessments if item.order_intent is not None),
                 )
+                assessment = self.apply_cycle_order_limits(
+                    assessment=assessment,
+                    decision_set=decision_set,
+                    decision=decision,
+                    position=position_before_order,
+                    risk_policy=risk_policy,
+                    portfolio_limits=portfolio_limits,
+                    cycle_counters=cycle_counters,
+                )
                 assessments.append(assessment)
                 if assessment.order_intent is not None and shadow_snapshot is not None:
+                    self.increment_cycle_order_counters(assessment, position_before_order, cycle_counters)
                     shadow_snapshot, positions_by_instrument = self.apply_approved_order_to_shadow_state(
                         shadow_snapshot,
                         positions_by_instrument,
@@ -438,6 +458,170 @@ class RiskControlService:
             },
         )
         return risk_check, orders, risk_event
+
+    def prioritized_decisions(
+        self,
+        decisions: tuple[Mapping[str, Any], ...],
+        positions_by_instrument: Mapping[str, PositionState],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Rank actionable decisions before applying batch risk limits.
+
+        The previous batch behavior assessed the universe in registry order, so
+        a broad set of small positive signals could all become long orders in
+        one cycle.  Risk-reducing actions still go first; risk-increasing
+        actions are then ranked by post-cost edge strength.
+        """
+
+        def sort_key(decision: Mapping[str, Any]) -> tuple[int, float, str]:
+            instrument_id = str(decision.get("instrument_id") or "")
+            action = str(decision.get("action") or "hold")
+            position = positions_by_instrument.get(instrument_id)
+            current_quantity = float(position.quantity) if position else 0.0
+            edge = _payload_float(decision, "expected_edge_after_cost_score")
+            if edge is None:
+                edge = _payload_float(decision, "expected_edge_score") or 0.0
+            if action in {"reduce", "close"} or (action == "sell" and current_quantity > 0):
+                group = 0
+                score = abs(edge)
+            elif action == "buy":
+                group = 1
+                score = edge
+            elif action == "sell":
+                group = 2
+                score = abs(min(edge, 0.0))
+            else:
+                group = 3
+                score = 0.0
+            return (group, -score, instrument_id)
+
+        return tuple(sorted(decisions, key=sort_key))
+
+    def apply_cycle_order_limits(
+        self,
+        *,
+        assessment: RiskDecisionAssessment,
+        decision_set: DecisionSet,
+        decision: Mapping[str, Any],
+        position: PositionState | None,
+        risk_policy: RiskPolicy | None,
+        portfolio_limits: tuple[PortfolioLimit, ...],
+        cycle_counters: Mapping[str, int],
+    ) -> RiskDecisionAssessment:
+        order = assessment.order_intent
+        if order is None:
+            return assessment
+
+        risk_direction = self.order_risk_direction(order, position)
+        if risk_direction == "risk_reducing":
+            return assessment
+
+        max_risk_increasing = self.cycle_limit_value(
+            risk_policy,
+            portfolio_limits,
+            "max_risk_increasing_order_intents_per_cycle",
+            "RISK_MAX_RISK_INCREASING_ORDERS_PER_CYCLE",
+            DEFAULT_MAX_RISK_INCREASING_ORDERS_PER_CYCLE,
+        )
+        max_new_long = self.cycle_limit_value(
+            risk_policy,
+            portfolio_limits,
+            "max_new_long_order_intents_per_cycle",
+            "RISK_MAX_NEW_LONG_ORDERS_PER_CYCLE",
+            DEFAULT_MAX_NEW_LONG_ORDERS_PER_CYCLE,
+        )
+        max_new_short = self.cycle_limit_value(
+            risk_policy,
+            portfolio_limits,
+            "max_new_short_order_intents_per_cycle",
+            "RISK_MAX_NEW_SHORT_ORDERS_PER_CYCLE",
+            DEFAULT_MAX_NEW_SHORT_ORDERS_PER_CYCLE,
+        )
+
+        reason: str | None = None
+        if int(cycle_counters.get("risk_increasing", 0)) >= max_risk_increasing:
+            reason = "risk_increasing_cycle_order_limit_reached"
+        elif risk_direction == "new_long" and int(cycle_counters.get("new_long", 0)) >= max_new_long:
+            reason = "new_long_cycle_order_limit_reached"
+        elif risk_direction == "new_short" and int(cycle_counters.get("new_short", 0)) >= max_new_short:
+            reason = "new_short_cycle_order_limit_reached"
+
+        if reason is None:
+            return assessment
+
+        metrics = dict(assessment.metrics)
+        metrics["cycle_limit_applied"] = 1.0
+        metrics["max_risk_increasing_order_intents_per_cycle"] = float(max_risk_increasing)
+        metrics["max_new_long_order_intents_per_cycle"] = float(max_new_long)
+        metrics["max_new_short_order_intents_per_cycle"] = float(max_new_short)
+        flags = tuple(dict.fromkeys((*assessment.flags, reason)))
+        return replace(
+            assessment,
+            status="rejected",
+            flags=flags,
+            metrics=metrics,
+            rejected_decision_ref=self.decision_ref(decision_set.decision_set_id, str(decision.get("instrument_id") or "")),
+            order_intent=None,
+        )
+
+    def increment_cycle_order_counters(
+        self,
+        assessment: RiskDecisionAssessment,
+        position: PositionState | None,
+        cycle_counters: dict[str, int],
+    ) -> None:
+        order = assessment.order_intent
+        if order is None:
+            return
+        risk_direction = self.order_risk_direction(order, position)
+        if risk_direction == "risk_reducing":
+            return
+        cycle_counters["risk_increasing"] = cycle_counters.get("risk_increasing", 0) + 1
+        if risk_direction == "new_long":
+            cycle_counters["new_long"] = cycle_counters.get("new_long", 0) + 1
+        elif risk_direction == "new_short":
+            cycle_counters["new_short"] = cycle_counters.get("new_short", 0) + 1
+
+    def order_risk_direction(self, order: OrderIntentRecord, position: PositionState | None) -> str:
+        current_quantity = float(position.quantity) if position else 0.0
+        quantity = float(order.quantity or 0.0)
+        if order.side == "buy":
+            if current_quantity < 0 and quantity <= abs(current_quantity):
+                return "risk_reducing"
+            return "new_long"
+        if order.side == "sell":
+            if current_quantity > 0 and quantity <= current_quantity:
+                return "risk_reducing"
+            return "new_short"
+        return "risk_increasing"
+
+    def order_side_for_action(self, action: str, current_quantity: float) -> str:
+        if action == "buy":
+            return "buy"
+        if action == "sell":
+            return "sell"
+        if action in {"reduce", "close"}:
+            return "buy" if float(current_quantity or 0.0) < 0 else "sell"
+        return "sell"
+
+    def cycle_limit_value(
+        self,
+        risk_policy: RiskPolicy | None,
+        portfolio_limits: tuple[PortfolioLimit, ...],
+        limit_name: str,
+        env_name: str,
+        default: int,
+    ) -> int:
+        configured = self.portfolio_limit_value(portfolio_limits, risk_policy, limit_name)
+        if configured is None:
+            env_value = os.getenv(env_name)
+            if env_value not in (None, ""):
+                try:
+                    configured = float(env_value)
+                except ValueError:
+                    configured = None
+        if configured is None:
+            configured = default
+        return max(0, int(configured))
 
     def build_missing_decision_set_result(
         self,
@@ -670,7 +854,7 @@ class RiskControlService:
                 self.decision_ref(decision_set.decision_set_id, instrument_id),
             )
 
-        side = "buy" if action == "buy" else "sell"
+        side = self.order_side_for_action(action, current_quantity)
         proposed_trade_value = requested_quantity * price
         available_cash = self.available_cash(portfolio_snapshot)
         min_expected_edge = self.portfolio_limit_value(portfolio_limits, risk_policy, "min_expected_edge_after_cost_score")
@@ -731,7 +915,12 @@ class RiskControlService:
 
         portfolio_equity = portfolio_snapshot.equity or portfolio_snapshot.cash or 0.0
         signed_trade_for_exposure = proposed_trade_value if side == "buy" else -proposed_trade_value
-        portfolio_exposure = portfolio_exposure_after_trade(portfolio_snapshot.gross_exposure, signed_trade_for_exposure, portfolio_equity)
+        portfolio_exposure = portfolio_exposure_after_trade(
+            portfolio_snapshot.gross_exposure,
+            signed_trade_for_exposure,
+            portfolio_equity,
+            current_instrument_value=current_value,
+        )
         instrument_exposure = instrument_exposure_after_trade(current_value, signed_trade_for_exposure, portfolio_equity)
         metrics["portfolio_exposure_after_trade"] = portfolio_exposure
         metrics["instrument_exposure_after_trade"] = instrument_exposure
@@ -746,7 +935,7 @@ class RiskControlService:
         if max_position_pct is None:
             return self.manual_assessment(decision_set.decision_set_id, instrument_id, action, "max_position_pct_missing")
         if instrument_exposure > max_position_pct:
-            allowed_value = max(0.0, (max_position_pct * portfolio_equity) - max(current_value, 0.0))
+            allowed_value = max(0.0, (max_position_pct * portfolio_equity) - abs(current_value))
             adjusted_quantity = floor_quantity(allowed_value / price)
             adjustments.append(self.adjustment(instrument_id, "quantity", requested_quantity, adjusted_quantity, "position_limit_check"))
             requested_quantity = adjusted_quantity
@@ -900,8 +1089,6 @@ class RiskControlService:
         current_exposure = float(portfolio_snapshot.gross_exposure or 0.0)
         current_gross_value = current_exposure * float(equity) if 0.0 <= current_exposure <= 2.0 else current_exposure
         signed_trade_value = trade_value if order.side == "buy" else -trade_value
-        new_gross_value = max(0.0, current_gross_value + signed_trade_value)
-        new_gross_exposure = new_gross_value / float(equity) if equity and equity > 0 else 0.0
 
         current_cash = float(portfolio_snapshot.cash or 0.0)
         new_cash = current_cash - trade_value if order.side == "buy" else current_cash + trade_value
@@ -912,26 +1099,27 @@ class RiskControlService:
         payload["shadow_reserved_cash_rub"] = max(0.0, current_cash - new_cash)
         payload["shadow_pending_order_count"] = int(payload.get("shadow_pending_order_count") or 0) + 1
 
-        shadow_snapshot = replace(
-            portfolio_snapshot,
-            cash=new_cash,
-            gross_exposure=new_gross_exposure,
-            payload=payload,
-        )
-
         positions_copy = dict(positions_by_instrument)
         current_position = positions_copy.get(order.instrument_id)
         current_quantity = float(current_position.quantity) if current_position is not None else 0.0
         current_value = (
             float(current_position.market_value)
             if current_position is not None and current_position.market_value is not None
-            else max(0.0, current_quantity * float(price or 0.0))
+            else current_quantity * float(price or 0.0)
         )
         signed_quantity = float(order.quantity or 0.0) if order.side == "buy" else -float(order.quantity or 0.0)
-        new_quantity = max(0.0, current_quantity + signed_quantity)
-        new_value = max(0.0, current_value + signed_trade_value)
-        average_price = (new_value / new_quantity) if new_quantity > 0 else current_position.average_price if current_position else None
+        new_quantity = current_quantity + signed_quantity
+        new_value = current_value + signed_trade_value
+        new_gross_value = max(0.0, current_gross_value - abs(current_value) + abs(new_value))
+        new_gross_exposure = new_gross_value / float(equity) if equity and equity > 0 else 0.0
+        average_price = (abs(new_value) / abs(new_quantity)) if new_quantity != 0 else current_position.average_price if current_position else None
         market_price = float(price or 0.0) if price else current_position.market_price if current_position else None
+        shadow_snapshot = replace(
+            portfolio_snapshot,
+            cash=new_cash,
+            gross_exposure=new_gross_exposure,
+            payload=payload,
+        )
         position_payload = dict(current_position.payload or {}) if current_position is not None else {}
         position_payload["shadow_pending_order_id"] = order.order_intent_id
         position_payload["shadow_position_state"] = True
@@ -1391,20 +1579,29 @@ class RiskControlService:
         target_quantity = _payload_float(decision, "target_quantity") or 0.0
         target_pct = _payload_float(decision, "target_position_pct") or 0.0
         if action == "buy":
-            if target_quantity > 0:
+            if target_quantity != 0:
                 return floor_quantity(max(0.0, target_quantity - current_quantity))
-            if equity and target_pct > 0:
+            if equity and target_pct != 0:
                 total_target_quantity = (float(equity) * target_pct) / price
                 return floor_quantity(max(0.0, total_target_quantity - current_quantity))
             return 0.0
         if action in {"sell", "close"}:
-            if 0 < target_quantity < current_quantity:
-                return floor_quantity(current_quantity - target_quantity)
-            return floor_quantity(target_quantity or current_quantity)
+            if target_quantity != 0:
+                return floor_quantity(max(0.0, current_quantity - target_quantity))
+            if target_pct < 0 and equity:
+                total_target_quantity = (float(equity) * target_pct) / price
+                return floor_quantity(max(0.0, current_quantity - total_target_quantity))
+            return floor_quantity(abs(current_quantity))
         if action == "reduce":
-            if 0 <= target_quantity < current_quantity:
-                return floor_quantity(current_quantity - target_quantity)
-            return floor_quantity(target_quantity)
+            if current_quantity > 0:
+                if target_quantity < current_quantity:
+                    return floor_quantity(current_quantity - max(target_quantity, 0.0))
+                return 0.0
+            if current_quantity < 0:
+                if target_quantity > current_quantity:
+                    return floor_quantity(abs(current_quantity - min(target_quantity, 0.0)))
+                return 0.0
+            return 0.0
         return 0.0
 
     def limit_price(self, price: float, side: str, max_slippage_bps: float) -> float:

@@ -803,7 +803,10 @@ class PortfolioStateService:
                 continue
             lot_size = self.instrument_lot_size(instrument_id, lot_sizes)
             broker_units = _float(broker_position.get("position")) or _float(broker_position.get("quantity")) or 0.0
+            direction = str(broker_position.get("direction") or broker_position.get("side") or "").strip().lower()
+            direction_sign = -1.0 if direction in {"s", "sell", "short"} else 1.0
             broker_qty = broker_units * lot_size if self.config.arena_go_position_units == "lots" else broker_units
+            broker_qty *= direction_sign
             broker_avg = _float(broker_position.get("average_price") or broker_position.get("avg_price"))
             internal_qty = quantities.get(instrument_id, 0.0)
             mismatch = broker_qty - internal_qty
@@ -828,6 +831,7 @@ class PortfolioStateService:
             payloads[instrument_id]["broker_position_closed"] = False
             payloads[instrument_id]["broker_position"] = dict(broker_position)
             payloads[instrument_id]["broker_quantity_raw"] = broker_units
+            payloads[instrument_id]["broker_direction"] = direction or None
             payloads[instrument_id]["broker_quantity_units"] = self.config.arena_go_position_units
             payloads[instrument_id]["lot_size"] = lot_size
         for instrument_id in list(quantities):

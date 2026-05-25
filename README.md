@@ -826,7 +826,7 @@ ArenaGo error mapping:
 | `ERROR: INSUFFICIENT CASH` | `insufficient_cash` | refresh portfolio, reject or reduce order |
 | `ERROR: BOT {bot_name} HAS REACHED DAILY TRADE LIMIT` | `daily_trade_limit_reached` | enable `execution_kill_switch` for bot until next trading day |
 
-Important: ArenaGo `quantity` is treated as shares/units unless platform configuration explicitly says lots. `Selected Instruments Registry Module` must store `arena_go_quantity_mode = shares | lots`. `Execution Engine Module` must convert `target_quantity` into ArenaGo `quantity` using this field.
+Important: internal `order_intent.quantity` and portfolio positions are stored in shares. For the observed ArenaGo sandbox API, `submit_order.quantity` is submitted in lots by default (`ARENA_GO_SUBMIT_QUANTITY_UNITS=lots`), so `Execution Engine Module` converts share targets through `lot_size` and `arena_go_quantity_mode`. Override to `shares` only after a broker-side contract check proves the API expects shares for the active contour.
 
 ### 17.3 Trades, positions and bots
 
@@ -1320,7 +1320,7 @@ Each schedule emits JSON stdout events `scheduler_entry_started` and `scheduler_
 
 ArenaGo token priority is `SANDBOX_API_KEY` first. `ARENA_GO_TOKEN` is only a local/dev fallback: production server startup treats missing `SANDBOX_API_KEY` as fatal unless `ALLOW_ARENA_GO_TOKEN_FALLBACK=true` is explicitly set. Logs and audit may show only a masked token source. Portfolio identity is resolved from `/api/bots` using exact `bots[].name`. `ARENA_GO_PORTFOLIO` and `ARENA_GO_BOT_NAME` may be empty; startup resolves and exports both from `/api/bots` when exactly one bot exists or when env matches a bot. `get_positions` and `get_trades` use the same exact, URL-encoded bot/portfolio name. Empty positions/trades are valid when the bot exists and `cash_balance` is available.
 
-`submit_order.quantity` is shares, not lots, for the seeded registry (`arena_go_quantity_mode=shares`). Sandbox live `submit_order` is allowed only when `SAFE_LIVE_SUBMIT=true`, `ARENA_GO_SANDBOX=true`, startup set `LIVE_READINESS_PASSED=true`, the portfolio and market data are fresh, the market is open, the instrument is valid, the order intent is from the current cycle, Risk approved it, and kill switches are off. `ERROR: MARKET CLOSED` is normalized as `market_closed`; the agent keeps syncing/monitoring and waits instead of crashing.
+Internal `order_intent.quantity` is shares, but the current sandbox submit contour uses `ARENA_GO_SUBMIT_QUANTITY_UNITS=lots` so the provider payload is lot-converted. Sandbox live `submit_order` is allowed only when `SAFE_LIVE_SUBMIT=true`, `ARENA_GO_SANDBOX=true`, startup set `LIVE_READINESS_PASSED=true`, the portfolio and market data are fresh, the market is open, the instrument is valid, the order intent is from the current cycle, Risk approved it, and kill switches are off. `ERROR: MARKET CLOSED` is normalized as `market_closed`; the agent keeps syncing/monitoring and waits instead of crashing.
 
 Allowed ArenaGo sandbox universe: `LKOH`, `SBER`, `ROSN`, `GAZP`, `VTBR`, `YDEX`, `PLZL`, `T`, `NVTK`, `X5`, `GMKN`, `MGNT`, `ALRS`, `AFLT`, `CHMF`, `NLMK`, `MOEX`, `SNGSP`, `MTSS`, `PIKK`. The agent must not trade outside this list.
 

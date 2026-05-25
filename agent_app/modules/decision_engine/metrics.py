@@ -79,6 +79,18 @@ def target_position_pct(
     return clip(raw_target, 0.0, max_position_pct)
 
 
+def signed_target_position_pct(
+    expected_edge: float,
+    risk_score: float,
+    max_position_pct: float,
+) -> float:
+    if expected_edge == 0:
+        return 0.0
+    sign = 1.0 if expected_edge > 0 else -1.0
+    raw_target = abs(float(expected_edge)) * clip(1.0 - risk_score) * float(max_position_pct)
+    return sign * clip(raw_target, 0.0, max_position_pct)
+
+
 def target_quantity(
     *,
     target_position_value: float | None,

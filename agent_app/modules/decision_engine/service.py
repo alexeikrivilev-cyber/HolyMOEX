@@ -21,6 +21,7 @@ from .metrics import (
     expected_edge_score,
     feature_contribution,
     portfolio_concentration_risk,
+    signed_target_position_pct,
     target_position_pct,
     target_quantity,
     threshold_margin,
@@ -205,6 +206,21 @@ class DecisionPolicy:
     )
     macro_breadth_weak_threshold: float = field(
         default_factory=lambda: _env_float("DECISION_MACRO_BREADTH_WEAK_THRESHOLD", 0.55)
+    )
+    allow_short_selling: bool = field(
+        default_factory=lambda: _env_bool("DECISION_ALLOW_SHORT_SELLING", True)
+    )
+    exit_overlay_enabled: bool = field(
+        default_factory=lambda: _env_bool("DECISION_EXIT_OVERLAY_ENABLED", True)
+    )
+    take_profit_pct: float = field(
+        default_factory=lambda: _env_float("DECISION_TAKE_PROFIT_PCT", 0.012)
+    )
+    stop_loss_pct: float = field(
+        default_factory=lambda: _env_float("DECISION_STOP_LOSS_PCT", 0.008)
+    )
+    take_profit_hold_edge_threshold: float = field(
+        default_factory=lambda: _env_float("DECISION_TAKE_PROFIT_HOLD_EDGE_THRESHOLD", 0.06)
     )
 
 
@@ -552,12 +568,21 @@ class DecisionEngineService:
         current_value = 0.0
         if position and position.market_value is not None:
             current_value = float(position.market_value or 0.0)
-        elif latest_price is not None and current_quantity > 0:
+        elif latest_price is not None and current_quantity != 0:
             current_value = current_quantity * latest_price
-        current_pct = clip(current_value / float(equity), 0.0, max_position_pct) if equity and equity > 0 else 0.0
-        desired_target_pct = target_position_pct(edge, risk, max_position_pct) if edge > 0 else 0.0
-        desired_target_value = float(equity or 0.0) * desired_target_pct
-        desired_target_quantity = target_quantity(target_position_value=desired_target_value, latest_price=latest_price, quantity_step=1.0)
+        current_pct = (
+            max(-max_position_pct, min(max_position_pct, current_value / float(equity)))
+            if equity and equity > 0
+            else 0.0
+        )
+        desired_target_pct = (
+            signed_target_position_pct(edge, risk, max_position_pct)
+            if edge != 0 and (edge > 0 or self.policy.allow_short_selling)
+            else 0.0
+        )
+        desired_target_value = float(equity or 0.0) * abs(desired_target_pct)
+        desired_target_abs_quantity = target_quantity(target_position_value=desired_target_value, latest_price=latest_price, quantity_step=1.0)
+        desired_target_quantity = desired_target_abs_quantity if desired_target_pct >= 0 else -desired_target_abs_quantity
         action = self.choose_action(
             request=request,
             expected_edge=edge,
@@ -566,15 +591,32 @@ class DecisionEngineService:
             reason_codes=tuple(reason_codes),
             position=position,
         )
+        exit_overlay = self.position_exit_overlay(
+            position=position,
+            latest_price=latest_price,
+            current_quantity=current_quantity,
+            expected_edge=edge,
+            risk_score=risk,
+        )
+        if exit_overlay is not None:
+            action, desired_target_pct, desired_target_quantity, exit_reasons = exit_overlay
+            reason_codes.extend(exit_reasons)
         min_rebalance_value = max(1_000.0, float(equity or 0.0) * 0.002)
         rebalance_value = abs(current_quantity - desired_target_quantity) * float(latest_price or 0.0)
         if action == "buy" and current_quantity > 0 and desired_target_quantity <= current_quantity:
+            action = "hold"
+            reason_codes.append("target_position_already_reached")
+        elif action == "sell" and desired_target_quantity >= current_quantity:
             action = "hold"
             reason_codes.append("target_position_already_reached")
         elif action == "hold" and current_quantity > 0 and desired_target_quantity < current_quantity and rebalance_value >= min_rebalance_value:
             if edge <= 0 or margin <= 0 or "macro_context_degraded" in reason_codes or risk >= self.policy.risk_reduce_threshold:
                 action = "reduce"
                 reason_codes.append("over_target_rebalance")
+        elif action == "hold" and current_quantity < 0 and desired_target_quantity > current_quantity and rebalance_value >= min_rebalance_value:
+            if edge >= 0 or margin <= 0 or "macro_context_degraded" in reason_codes or risk >= self.policy.risk_reduce_threshold:
+                action = "buy"
+                reason_codes.append("short_over_target_rebalance")
         if action == "block" and risk >= self.policy.risk_block_threshold:
             reason_codes.append("risk_score_block")
         elif action == "hold" and edge > 0 and risk >= self.policy.risk_reduce_threshold:
@@ -583,19 +625,21 @@ class DecisionEngineService:
             reason_codes.append("edge_below_threshold")
         elif action in {"reduce", "close"} and request.decision_mode == "risk_off":
             reason_codes.append("decision_mode_risk_off")
-        if action in {"buy", "reduce"}:
+        if action in {"buy", "sell", "reduce"}:
             target_pct = desired_target_pct
             quantity = desired_target_quantity
         elif action == "hold" and current_quantity > 0:
             target_pct = current_pct
             quantity = current_quantity
+        elif action == "hold" and current_quantity < 0:
+            target_pct = current_pct
+            quantity = current_quantity
         else:
             target_pct = 0.0
             quantity = 0.0
-        if action in {"sell", "reduce", "close", "block"}:
-            if action in {"sell", "close", "block"}:
-                quantity = 0.0
-                target_pct = 0.0
+        if action in {"close", "block"}:
+            quantity = 0.0
+            target_pct = 0.0
 
         decision_record_id = stable_uuid(
             {
@@ -926,9 +970,11 @@ class DecisionEngineService:
             return "block"
         current_quantity = position.quantity if position else 0.0
         if request.decision_mode == "risk_off":
-            return "reduce" if current_quantity > 0 else "hold"
+            return "reduce" if current_quantity != 0 else "hold"
         if request.decision_mode == "reduce_only":
             if expected_edge < -self.policy.action_threshold and current_quantity > 0:
+                return "reduce"
+            if expected_edge > self.policy.action_threshold and current_quantity < 0:
                 return "reduce"
             return "hold"
         if margin <= 0:
@@ -936,8 +982,65 @@ class DecisionEngineService:
         if expected_edge > 0:
             return "buy" if risk_score < self.policy.risk_reduce_threshold else "hold"
         if expected_edge < 0:
-            return "sell" if current_quantity > 0 else "hold"
+            if current_quantity > 0:
+                return "sell"
+            return "sell" if self.policy.allow_short_selling and risk_score < self.policy.risk_reduce_threshold else "hold"
         return "hold"
+
+    def position_exit_overlay(
+        self,
+        *,
+        position: PositionState | None,
+        latest_price: float | None,
+        current_quantity: float,
+        expected_edge: float,
+        risk_score: float,
+    ) -> tuple[str, float, float, tuple[str, ...]] | None:
+        if not self.policy.exit_overlay_enabled or position is None or current_quantity == 0:
+            return None
+        price = float(latest_price or position.market_price or 0.0)
+        average_price = float(position.average_price or 0.0)
+        if price <= 0 or average_price <= 0:
+            return None
+        signed_pnl_pct = (price - average_price) / average_price
+        if current_quantity < 0:
+            signed_pnl_pct = (average_price - price) / average_price
+
+        if signed_pnl_pct <= -abs(self.policy.stop_loss_pct):
+            return (
+                "reduce",
+                0.0,
+                0.0,
+                (
+                    "position_stop_loss_triggered",
+                    f"position_unrealized_pnl_pct:{signed_pnl_pct:.6f}",
+                ),
+            )
+        if signed_pnl_pct >= abs(self.policy.take_profit_pct):
+            hold_threshold = abs(self.policy.take_profit_hold_edge_threshold)
+            if (current_quantity > 0 and expected_edge < hold_threshold) or (
+                current_quantity < 0 and expected_edge > -hold_threshold
+            ):
+                return (
+                    "reduce",
+                    0.0,
+                    0.0,
+                    (
+                        "position_take_profit_triggered",
+                        f"position_unrealized_pnl_pct:{signed_pnl_pct:.6f}",
+                    ),
+                )
+        if risk_score >= self.policy.risk_reduce_threshold and current_quantity != 0:
+            return (
+                "reduce",
+                0.0,
+                0.0,
+                (
+                    "position_risk_reduce_triggered",
+                    f"position_unrealized_pnl_pct:{signed_pnl_pct:.6f}",
+                ),
+            )
+        return None
 
     def blocking_reason_codes(self, reason_codes: tuple[str, ...]) -> tuple[str, ...]:
         """Return only hard-block reasons.
@@ -1178,6 +1281,13 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _payload_mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
