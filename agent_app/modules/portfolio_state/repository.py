@@ -196,6 +196,9 @@ class PortfolioStateRepository(Protocol):
     ) -> Mapping[str, RawMarketPriceRecord]:
         ...
 
+    def get_instrument_lot_sizes(self, instrument_ids: tuple[str, ...]) -> Mapping[str, int]:
+        ...
+
     def get_previous_snapshot(self, portfolio_id: str, as_of_ts: str) -> PortfolioSnapshotRecord | None:
         ...
 
@@ -290,6 +293,17 @@ class InMemoryPortfolioStateRepository:
             if current is None or (price.price_ts, price.source_ref) > (current.price_ts, current.source_ref):
                 latest[price.instrument_id] = price
         return latest
+
+    def get_instrument_lot_sizes(self, instrument_ids: tuple[str, ...]) -> Mapping[str, int]:
+        requested = set(instrument_ids)
+        lot_sizes: dict[str, int] = {}
+        for price in self.market_prices:
+            if requested and price.instrument_id not in requested:
+                continue
+            lot_size = _optional_int(price.payload.get("lot_size"))
+            if lot_size and lot_size > 0:
+                lot_sizes[price.instrument_id] = lot_size
+        return lot_sizes
 
     def get_previous_snapshot(self, portfolio_id: str, as_of_ts: str) -> PortfolioSnapshotRecord | None:
         as_of = parse_utc_iso(as_of_ts)
@@ -459,6 +473,34 @@ class PostgresPortfolioStateRepository:
             prices[record.instrument_id] = record
         return prices
 
+    def get_instrument_lot_sizes(self, instrument_ids: tuple[str, ...]) -> Mapping[str, int]:
+        if not instrument_ids:
+            return {}
+        tickers = tuple(sorted({_instrument_ticker(instrument_id) for instrument_id in instrument_ids if instrument_id}))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT instrument_id, ticker, lot_size
+                      FROM registry.instrument_profile
+                     WHERE instrument_id = ANY(%s)
+                        OR ticker = ANY(%s)
+                    """,
+                    (list(instrument_ids), list(tickers)),
+                )
+                rows = cur.fetchall()
+        lot_sizes: dict[str, int] = {}
+        for instrument_id, ticker, lot_size in rows:
+            parsed = _optional_int(lot_size)
+            if parsed is None or parsed <= 0:
+                continue
+            instrument_text = str(instrument_id or "")
+            ticker_text = str(ticker or "")
+            for key in (instrument_text, ticker_text, f"moex:{ticker_text}" if ticker_text else ""):
+                if key:
+                    lot_sizes[key] = parsed
+        return lot_sizes
+
     def get_previous_snapshot(self, portfolio_id: str, as_of_ts: str) -> PortfolioSnapshotRecord | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -617,6 +659,13 @@ def ref_tail(ref: str | None) -> str:
     return value.rsplit(":", 1)[-1] if ":" in value else value
 
 
+def _instrument_ticker(instrument_id: str | None) -> str:
+    text = str(instrument_id or "").strip()
+    if ":" in text:
+        text = text.rsplit(":", 1)[-1]
+    return text.upper()
+
+
 def _fill_report_from_row(row: tuple[Any, ...]) -> FillReportRecord:
     return FillReportRecord(
         fill_report_id=str(row[0]),
@@ -691,6 +740,15 @@ def _optional_float(value: Any) -> float | None:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 

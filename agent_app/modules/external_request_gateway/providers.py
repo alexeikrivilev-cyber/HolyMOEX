@@ -56,6 +56,7 @@ ARENA_GO_ERROR_CODES = {
     "ERROR: NOT VALID SECID": "invalid_instrument",
     "ERROR: INSUFFICIENT CASH": "insufficient_cash",
 }
+PROHIBITED_POLZA_MODELS = {"deepseek/" + "deepseek-v4" + "-pro"}
 
 
 @dataclass(frozen=True)
@@ -182,7 +183,8 @@ class ProviderRequestNormalizer:
         payload = dict(request.payload)
         default_model = self._polza_model_for_task(payload, config)
         payload.setdefault("model", default_model)
-        payload.setdefault("model_id", payload.get("model"))
+        payload["model"] = _safe_polza_model(str(payload.get("model") or ""), default_model)
+        payload["model_id"] = _safe_polza_model(str(payload.get("model_id") or payload.get("model") or ""), default_model)
         payload.setdefault("temperature", 0)
         payload.setdefault("response_format", {"type": "json_object"})
         payload.setdefault("messages", [])
@@ -340,13 +342,19 @@ class ProviderRequestNormalizer:
             "strategy_risk_explanation",
         }
         if task_type in fast_tasks:
-            return self.env.get("POLZA_FAST_MODEL") or str(config.config_payload.get("fast_model") or "deepseek/deepseek-v4-flash")
+            return _safe_polza_model(
+                self.env.get("POLZA_FAST_MODEL") or str(config.config_payload.get("fast_model") or ""),
+                "deepseek/deepseek-v4-flash",
+            )
         if task_type in reasoning_tasks:
-            return self.env.get("POLZA_REASONING_MODEL") or str(config.config_payload.get("reasoning_model") or "qwen/qwen3.6-35b-a3b")
-        return (
+            return _safe_polza_model(
+                self.env.get("POLZA_REASONING_MODEL") or str(config.config_payload.get("reasoning_model") or ""),
+                "qwen/qwen3.6-35b-a3b",
+            )
+        return _safe_polza_model(
             self.env.get("POLZA_DEFAULT_MODEL")
-            or self._env_config_value(config, "default_model_env")
-            or str(config.config_payload.get("default_model") or "qwen/qwen3.6-35b-a3b")
+            or str(config.config_payload.get("default_model") or ""),
+            "qwen/qwen3.6-35b-a3b",
         )
 
     def _env_config_value(self, config: ProviderConfig, payload_key: str) -> str:
@@ -1033,6 +1041,13 @@ def _moex_interval(timeframe: str) -> str:
 def _strip_moex_prefix(value: str) -> str:
     text = str(value or "")
     return text.split(":", 1)[1] if text.startswith("moex:") else text
+
+
+def _safe_polza_model(model_id: str | None, fallback: str) -> str:
+    candidate = str(model_id or "").strip()
+    if not candidate or candidate in PROHIBITED_POLZA_MODELS:
+        return fallback
+    return candidate
 
 
 def _tracking_id(headers: Mapping[str, str]) -> str:

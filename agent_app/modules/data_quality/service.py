@@ -17,6 +17,7 @@ from .metrics import (
     data_quality_score,
     duplicate_record_count,
     expired_record_count,
+    future_timestamp_count,
     missing_field_count,
     outlier_count,
     quality_flags_from_counts,
@@ -332,7 +333,9 @@ class DataQualityService:
         missing_fields = missing_field_count(records, request.critical_fields)
         stale_by_freshness = stale_record_count(records, now, request.required_freshness_seconds)
         expired_by_ttl = expired_record_count(records, now)
+        future_count = future_timestamp_count(records, now, tolerance_seconds=300)
         stale_count = max(stale_by_freshness, expired_by_ttl)
+        effective_stale_count = stale_count + future_count
         duplicates = duplicate_record_count(records, request.input_refs)
         outliers = outlier_count(records, threshold=OUTLIER_Z_THRESHOLD)
         conflicts = source_conflict_count(records, tolerance=SOURCE_CONFLICT_TOLERANCE)
@@ -342,7 +345,7 @@ class DataQualityService:
             _rate(missing_records, max(1, expected_records)),
             _rate(missing_fields, expected_field_count),
         )
-        stale_rate = _rate(stale_count, max(1, len(records)))
+        stale_rate = _rate(effective_stale_count, max(1, len(records)))
         outlier_rate = _rate(outliers, max(1, len(records)))
         conflict_rate = _rate(conflicts, max(1, len(records)))
 
@@ -355,6 +358,7 @@ class DataQualityService:
         flags = quality_flags_from_counts(
             missing_count=missing_fields + missing_records,
             stale_count=stale_count,
+            future_count=future_count,
             duplicate_count=duplicates,
             outliers=outliers,
             conflicts=conflicts,
@@ -368,10 +372,13 @@ class DataQualityService:
             missing_records=missing_records,
             missing_fields=missing_fields,
             stale_count=stale_count,
+            future_count=future_count,
             conflicts=conflicts,
         )
         freshness_status = "fresh"
-        if expired_by_ttl:
+        if future_count:
+            freshness_status = "invalid"
+        elif expired_by_ttl:
             freshness_status = "expired"
         elif stale_count:
             freshness_status = "stale"
@@ -380,6 +387,7 @@ class DataQualityService:
             "data_quality_score": score,
             "coverage_ratio": coverage,
             "stale_record_count": stale_count,
+            "future_timestamp_count": future_count,
             "missing_field_count": missing_fields,
             "outlier_count": outliers,
             "source_conflict_count": conflicts,
@@ -475,6 +483,7 @@ class DataQualityService:
         missing_records: int,
         missing_fields: int,
         stale_count: int,
+        future_count: int,
         conflicts: int,
     ) -> tuple[str, ...]:
         errors: list[str] = []
@@ -487,6 +496,8 @@ class DataQualityService:
             )
         if missing_fields:
             errors.append(f"missing_critical_fields:{missing_fields}")
+        if future_count:
+            errors.append(f"future_timestamp_blocks_{request.check_level}:{future_count}")
         if conflicts:
             errors.append(f"source_conflicts_detected:{conflicts}")
         if request.check_level in {"decision", "execution"} and stale_count:

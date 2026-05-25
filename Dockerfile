@@ -29,9 +29,9 @@ COPY --from=python_runtime /etc/ssl/certs /etc/ssl/certs
 
 WORKDIR /app
 COPY agent_app /app/agent_app
-COPY scripts/start_autonomous.sh /app/scripts/start_autonomous.sh
-RUN sed -i 's/\r$//' /app/scripts/start_autonomous.sh \
-    && chmod +x /app/scripts/start_autonomous.sh
+COPY scripts /app/scripts
+RUN find /app/scripts -type f -name "*.sh" -exec sed -i 's/\r$//' {} \; \
+    && find /app/scripts -type f -name "*.sh" -exec chmod +x {} \;
 
 VOLUME ["/data"]
 

@@ -20,6 +20,33 @@ export RUN_MODE="${RUN_MODE:-live_trading}"
 export ARENA_GO_SANDBOX="${ARENA_GO_SANDBOX:-true}"
 export SAFE_LIVE_SUBMIT="${SAFE_LIVE_SUBMIT:-false}"
 export SINGLE_SCHEDULER_INSTANCE="${SINGLE_SCHEDULER_INSTANCE:-true}"
+export POLZA_FAST_MODEL="${POLZA_FAST_MODEL:-deepseek/deepseek-v4-flash}"
+export POLZA_REASONING_MODEL="${POLZA_REASONING_MODEL:-qwen/qwen3.6-35b-a3b}"
+export POLZA_DEFAULT_MODEL="${POLZA_DEFAULT_MODEL:-qwen/qwen3.6-35b-a3b}"
+export LLM_MAX_ITEMS_PER_RUN="${LLM_MAX_ITEMS_PER_RUN:-3}"
+export LLM_MAX_CALLS_PER_MINUTE="${LLM_MAX_CALLS_PER_MINUTE:-2}"
+export LLM_MAX_CALLS_PER_HOUR="${LLM_MAX_CALLS_PER_HOUR:-30}"
+export LLM_MAX_CALLS_PER_DAY="${LLM_MAX_CALLS_PER_DAY:-200}"
+export LLM_MIN_SECONDS_BETWEEN_CALLS="${LLM_MIN_SECONDS_BETWEEN_CALLS:-2}"
+export ENABLE_LLM_TEXT_SCHEDULES="${ENABLE_LLM_TEXT_SCHEDULES:-false}"
+export MARKET_DATA_FETCH_RAW_TRADES="${MARKET_DATA_FETCH_RAW_TRADES:-false}"
+export LIQUIDITY_FETCH_RAW_TRADES="${LIQUIDITY_FETCH_RAW_TRADES:-false}"
+export PIPELINE_LOOKBACK_MINUTES="${PIPELINE_LOOKBACK_MINUTES:-240}"
+
+LEGACY_EXPENSIVE_POLZA_MODEL="deepseek/deepseek-v4""-pro"
+if [ "${POLZA_LLM_MODEL:-}" = "$LEGACY_EXPENSIVE_POLZA_MODEL" ]; then
+  echo "warning: ignoring legacy expensive POLZA_LLM_MODEL; task routing uses POLZA_FAST_MODEL/POLZA_REASONING_MODEL/POLZA_DEFAULT_MODEL"
+  unset POLZA_LLM_MODEL
+fi
+
+if [ "$SYSTEM_MODE" = "automatic_live_trading" ] && [ "$RUN_MODE" != "live_trading" ]; then
+  if [ "${ALLOW_NON_LIVE_RUNTIME:-}" = "true" ] || [ "${ALLOW_NON_LIVE_RUNTIME:-}" = "1" ]; then
+    echo "warning: automatic_live_trading is running with RUN_MODE=$RUN_MODE because ALLOW_NON_LIVE_RUNTIME is set"
+  else
+    echo "warning: overriding RUN_MODE=$RUN_MODE to live_trading for automatic_live_trading runtime"
+    export RUN_MODE="live_trading"
+  fi
+fi
 
 mkdir -p "$PGDATA" "$RUNTIME_DIR" "$LOG_DIR" "$DATA_DIR/audit" "$DATA_DIR/request_logs"
 chown -R postgres:postgres "$DATA_DIR"
@@ -85,7 +112,7 @@ python -m agent_app.server_startup --runtime-env-file "$RUNTIME_ENV_FILE"
 
 if [ -f "$RUNTIME_ENV_FILE" ]; then
   . "$RUNTIME_ENV_FILE"
-  export ARENA_GO_BOT_NAME ARENA_GO_PORTFOLIO LIVE_READINESS_PASSED
+  export ARENA_GO_BOT_NAME ARENA_GO_PORTFOLIO LIVE_READINESS_PASSED STARTUP_MARKET_SESSION_STATUS STARTUP_AGENT_RUNTIME_PHASE
 fi
 
 if [ "${HOLYMOEX_STARTUP_ONCE:-}" = "true" ] || [ "${HOLYMOEX_STARTUP_ONCE:-}" = "1" ]; then

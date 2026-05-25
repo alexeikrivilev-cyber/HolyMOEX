@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from agent_app.contracts.unified_objects import ModuleJob, ModuleJobResult
@@ -10,6 +10,7 @@ from agent_app.contracts.unified_objects.module_job import (
     to_utc_iso,
     utc_now,
 )
+from agent_app.runtime_calendar import current_market_session
 
 from .metrics import (
     daily_loss_usage,
@@ -353,26 +354,33 @@ class RiskControlService:
                 )
         else:
             existing_order_count = self.daily_submitted_order_count(portfolio_snapshot)
+            shadow_snapshot = portfolio_snapshot
             for decision in decision_set.decisions:
                 instrument_id = str(decision.get("instrument_id") or "")
-                assessments.append(
-                    self.assess_decision(
-                        request=request,
-                        job=job,
-                        decision_set=decision_set,
-                        decision=decision,
-                        risk_check_id=risk_check_id,
-                        risk_policy=risk_policy,
-                        portfolio_limits=portfolio_limits,
-                        instrument_limit=limits_by_instrument.get(instrument_id),
-                        portfolio_snapshot=portfolio_snapshot,
-                        position=positions_by_instrument.get(instrument_id),
-                        feature_vector=features_by_instrument.get(instrument_id),
-                        as_of_ts=as_of_ts,
-                        existing_order_count=existing_order_count,
-                        pending_order_count=sum(1 for item in assessments if item.order_intent is not None),
-                    )
+                assessment = self.assess_decision(
+                    request=request,
+                    job=job,
+                    decision_set=decision_set,
+                    decision=decision,
+                    risk_check_id=risk_check_id,
+                    risk_policy=risk_policy,
+                    portfolio_limits=portfolio_limits,
+                    instrument_limit=limits_by_instrument.get(instrument_id),
+                    portfolio_snapshot=shadow_snapshot,
+                    position=positions_by_instrument.get(instrument_id),
+                    feature_vector=features_by_instrument.get(instrument_id),
+                    as_of_ts=as_of_ts,
+                    existing_order_count=existing_order_count,
+                    pending_order_count=sum(1 for item in assessments if item.order_intent is not None),
                 )
+                assessments.append(assessment)
+                if assessment.order_intent is not None and shadow_snapshot is not None:
+                    shadow_snapshot, positions_by_instrument = self.apply_approved_order_to_shadow_state(
+                        shadow_snapshot,
+                        positions_by_instrument,
+                        assessment.order_intent,
+                        assessment.metrics,
+                    )
 
         all_flags = tuple(dict.fromkeys((*global_flags, *(flag for item in assessments for flag in item.flags))))
         adjustments = tuple(item for assessment in assessments for item in assessment.adjustments)
@@ -670,9 +678,9 @@ class RiskControlService:
         expected_edge_after_cost = self.expected_edge_after_cost_score(decision, feature_vector)
         metrics["expected_edge_score"] = expected_edge
         metrics["expected_edge_after_cost_score"] = expected_edge_after_cost
-        if min_expected_edge is not None and expected_edge_after_cost < min_expected_edge:
+        if side == "buy" and min_expected_edge is not None and expected_edge_after_cost < min_expected_edge:
             flags.append("expected_edge_after_cost_below_threshold")
-        if "turnover_mandate_urgency" in tuple(decision.get("primary_reason_codes") or ()):
+        if side == "buy" and "turnover_mandate_urgency" in tuple(decision.get("primary_reason_codes") or ()):
             metrics["turnover_driven_expected_edge_after_cost"] = expected_edge_after_cost
             if expected_edge_after_cost <= 0:
                 flags.append("turnover_trade_without_positive_edge")
@@ -692,15 +700,22 @@ class RiskControlService:
             projected_daily_turnover = current_daily_turnover + proposed_trade_value
             metrics["projected_daily_turnover_rub"] = projected_daily_turnover
             metrics["max_daily_turnover_rub"] = max_daily_turnover
+            daily_turnover_mode = self.daily_turnover_limit_mode(portfolio_limits, risk_policy)
+            metrics["daily_turnover_limit_monitor_only"] = 1.0 if daily_turnover_mode == "monitor_only" else 0.0
+            if max_daily_turnover > 0:
+                metrics["daily_turnover_limit_usage"] = projected_daily_turnover / max_daily_turnover
             if projected_daily_turnover > max_daily_turnover:
-                allowed_value = max(0.0, max_daily_turnover - current_daily_turnover)
-                adjusted_quantity = floor_quantity(allowed_value / price)
-                adjustments.append(self.adjustment(instrument_id, "quantity", requested_quantity, adjusted_quantity, "max_daily_turnover"))
-                requested_quantity = adjusted_quantity
-                proposed_trade_value = requested_quantity * price
-                flags.append("max_daily_turnover_adjusted")
-                if requested_quantity <= 0:
-                    flags.append("max_daily_turnover_failed")
+                if daily_turnover_mode == "monitor_only":
+                    flags.append("max_daily_turnover_soft_warning")
+                else:
+                    allowed_value = max(0.0, max_daily_turnover - current_daily_turnover)
+                    adjusted_quantity = floor_quantity(allowed_value / price)
+                    adjustments.append(self.adjustment(instrument_id, "quantity", requested_quantity, adjusted_quantity, "max_daily_turnover"))
+                    requested_quantity = adjusted_quantity
+                    proposed_trade_value = requested_quantity * price
+                    flags.append("max_daily_turnover_adjusted")
+                    if requested_quantity <= 0:
+                        flags.append("max_daily_turnover_failed")
 
         max_order_value = self.max_order_value_rub(instrument_limit, risk_policy, portfolio_limits)
         if max_order_value is None:
@@ -787,6 +802,10 @@ class RiskControlService:
         if existing_order_count + pending_order_count + 1 > daily_limit:
             flags.append("arena_go_daily_trade_limit_exceeded")
 
+        metrics["proposed_trade_value_rub"] = proposed_trade_value
+        metrics["approved_quantity"] = requested_quantity
+        metrics["available_cash_after_trade"] = available_cash - proposed_trade_value if side == "buy" else available_cash + proposed_trade_value
+
         if requested_quantity <= 0:
             flags.append("adjusted_quantity_non_positive")
 
@@ -846,6 +865,7 @@ class RiskControlService:
                     f"features.feature_vector:{feature_vector.feature_vector_id}",
                     *_string_tuple(feature_vector.features.get("_meta", {}).get("source_refs") if isinstance(feature_vector.features.get("_meta"), Mapping) else ()),
                 ),
+                "market_session_status": market_session_status,
                 "risk_metrics": metrics,
             },
         )
@@ -859,6 +879,85 @@ class RiskControlService:
             adjustments=tuple(adjustments),
             order_intent=order,
         )
+
+    def apply_approved_order_to_shadow_state(
+        self,
+        portfolio_snapshot: PortfolioSnapshot,
+        positions_by_instrument: Mapping[str, PositionState],
+        order: OrderIntentRecord,
+        metrics: Mapping[str, float],
+    ) -> tuple[PortfolioSnapshot, dict[str, PositionState]]:
+        price = order.limit_price or _payload_float(order.payload.get("risk_metrics", {}), "reference_price") or 0.0
+        trade_value = _payload_float(metrics, "proposed_trade_value_rub")
+        if trade_value is None:
+            trade_value = max(0.0, float(order.quantity or 0.0) * float(price or 0.0))
+        equity = (
+            portfolio_snapshot.equity
+            or portfolio_snapshot.cash
+            or portfolio_snapshot.initial_capital_rub
+            or 0.0
+        )
+        current_exposure = float(portfolio_snapshot.gross_exposure or 0.0)
+        current_gross_value = current_exposure * float(equity) if 0.0 <= current_exposure <= 2.0 else current_exposure
+        signed_trade_value = trade_value if order.side == "buy" else -trade_value
+        new_gross_value = max(0.0, current_gross_value + signed_trade_value)
+        new_gross_exposure = new_gross_value / float(equity) if equity and equity > 0 else 0.0
+
+        current_cash = float(portfolio_snapshot.cash or 0.0)
+        new_cash = current_cash - trade_value if order.side == "buy" else current_cash + trade_value
+        payload = dict(portfolio_snapshot.payload or {})
+        current_turnover = _payload_float(payload, "gross_turnover_rub_1d") or 0.0
+        payload["gross_turnover_rub_1d"] = current_turnover + trade_value
+        payload["cash_after_pending_orders"] = new_cash
+        payload["shadow_reserved_cash_rub"] = max(0.0, current_cash - new_cash)
+        payload["shadow_pending_order_count"] = int(payload.get("shadow_pending_order_count") or 0) + 1
+
+        shadow_snapshot = replace(
+            portfolio_snapshot,
+            cash=new_cash,
+            gross_exposure=new_gross_exposure,
+            payload=payload,
+        )
+
+        positions_copy = dict(positions_by_instrument)
+        current_position = positions_copy.get(order.instrument_id)
+        current_quantity = float(current_position.quantity) if current_position is not None else 0.0
+        current_value = (
+            float(current_position.market_value)
+            if current_position is not None and current_position.market_value is not None
+            else max(0.0, current_quantity * float(price or 0.0))
+        )
+        signed_quantity = float(order.quantity or 0.0) if order.side == "buy" else -float(order.quantity or 0.0)
+        new_quantity = max(0.0, current_quantity + signed_quantity)
+        new_value = max(0.0, current_value + signed_trade_value)
+        average_price = (new_value / new_quantity) if new_quantity > 0 else current_position.average_price if current_position else None
+        market_price = float(price or 0.0) if price else current_position.market_price if current_position else None
+        position_payload = dict(current_position.payload or {}) if current_position is not None else {}
+        position_payload["shadow_pending_order_id"] = order.order_intent_id
+        position_payload["shadow_position_state"] = True
+        if current_position is not None:
+            positions_copy[order.instrument_id] = replace(
+                current_position,
+                quantity=new_quantity,
+                average_price=average_price,
+                market_price=market_price,
+                market_value=new_value,
+                payload=position_payload,
+            )
+        else:
+            positions_copy[order.instrument_id] = PositionState(
+                position_state_id=f"shadow:{portfolio_snapshot.portfolio_id}:{order.instrument_id}",
+                portfolio_id=portfolio_snapshot.portfolio_id,
+                instrument_id=order.instrument_id,
+                as_of_ts=portfolio_snapshot.as_of_ts,
+                quantity=new_quantity,
+                average_price=average_price,
+                market_price=market_price,
+                market_value=new_value,
+                unrealized_pnl=0.0,
+                payload=position_payload,
+            )
+        return shadow_snapshot, positions_copy
 
     def result_status(
         self,
@@ -1072,6 +1171,14 @@ class RiskControlService:
             ttl_status = str(payload.get("ttl_status") or "fresh")
             if ttl_status != "fresh":
                 flags.append(f"stale_feature_blocked:{metric_name}")
+            quality_flags = {str(flag) for flag in (payload.get("quality_flags") or ())}
+            if "future_timestamp" in quality_flags:
+                flags.append(f"future_timestamp_blocked:{metric_name}")
+        meta = feature_vector.features.get("_meta")
+        if isinstance(meta, Mapping):
+            meta_flags = {str(flag) for flag in (meta.get("quality_flags") or ())}
+            if "future_timestamp" in meta_flags or str(meta.get("ttl_status") or "") == "invalid":
+                flags.append("future_timestamp_blocked:feature_vector")
         return tuple(dict.fromkeys(flags))
 
 
@@ -1149,6 +1256,49 @@ class RiskControlService:
                     return value
         return None
 
+    def daily_turnover_limit_mode(
+        self,
+        portfolio_limits: tuple[PortfolioLimit, ...],
+        risk_policy: RiskPolicy | None,
+    ) -> str:
+        """Return whether daily turnover is a hard cap or an audit-only soft limit.
+
+        The live autonomous mandate targets enough gross turnover over the stage
+        window, but a per-day turnover ceiling should not become an accidental
+        "no more trades today" kill switch when positive-edge sandbox orders are
+        available.  Other policies keep the historical hard-cap behavior unless
+        they explicitly opt in to monitor-only mode.
+        """
+
+        aliases = ("max_daily_turnover_rub", "daily_turnover_limit_rub")
+        for limit in portfolio_limits:
+            if limit.limit_name in aliases:
+                mode = _rule_text(limit.payload, "limit_mode") or _rule_text(limit.payload, "enforcement_mode")
+                if mode:
+                    normalized = mode.strip().lower().replace("-", "_")
+                    if normalized in {"monitor_only", "soft", "soft_warn", "audit_only", "warning"}:
+                        return "monitor_only"
+                    if normalized in {"hard", "hard_cap", "block"}:
+                        return "hard"
+                hard_block = _rule_value(limit.payload, "hard_block_enabled")
+                if isinstance(hard_block, bool) and not hard_block:
+                    return "monitor_only"
+
+        if risk_policy is not None:
+            for key in ("daily_turnover_limit_mode", "max_daily_turnover_mode", "max_daily_turnover_limit_mode"):
+                mode = _rule_text(risk_policy.rules, key)
+                if mode:
+                    normalized = mode.strip().lower().replace("-", "_")
+                    if normalized in {"monitor_only", "soft", "soft_warn", "audit_only", "warning"}:
+                        return "monitor_only"
+                    if normalized in {"hard", "hard_cap", "block"}:
+                        return "hard"
+            hard_block = _rule_value(risk_policy.rules, "max_daily_turnover_hard_block_enabled")
+            if isinstance(hard_block, bool) and not hard_block:
+                return "monitor_only"
+
+        return "hard"
+
     def latest_price(self, feature_vector: FeatureVector, position: PositionState | None) -> float | None:
         for metric_name in ("latest_price", "market_price", "close_price", "last_price", "price"):
             value = _feature_numeric(feature_vector.features, metric_name)
@@ -1175,6 +1325,7 @@ class RiskControlService:
             _feature_text(feature_vector.features, "market_session_status"),
             _rule_text(risk_policy.rules, "market_session_status"),
             _rule_text(portfolio_snapshot.payload, "market_session_status"),
+            current_market_session().market_session_status,
         ):
             if source:
                 return source.strip().lower()
@@ -1241,9 +1392,10 @@ class RiskControlService:
         target_pct = _payload_float(decision, "target_position_pct") or 0.0
         if action == "buy":
             if target_quantity > 0:
-                return floor_quantity(target_quantity)
+                return floor_quantity(max(0.0, target_quantity - current_quantity))
             if equity and target_pct > 0:
-                return floor_quantity((float(equity) * target_pct) / price)
+                total_target_quantity = (float(equity) * target_pct) / price
+                return floor_quantity(max(0.0, total_target_quantity - current_quantity))
             return 0.0
         if action in {"sell", "close"}:
             if 0 < target_quantity < current_quantity:

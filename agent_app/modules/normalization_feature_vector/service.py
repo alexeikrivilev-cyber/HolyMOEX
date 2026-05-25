@@ -55,6 +55,31 @@ INPUT_FIELDS = {
 }
 PERMANENT_TTL_SECONDS = 0
 DEFAULT_STALE_POLICY = "block_decision"
+NATURAL_UNIT_METRICS = {
+    "recovery_ratio",
+    "gap_risk_score",
+    "jump_risk_score",
+    "volatility_risk_score",
+    "liquidity_risk_score",
+    "volatility_percentile",
+    "intraday_range_percentile",
+    "market_breadth",
+    "risk_on_risk_off_score",
+    "macro_pressure_score",
+    "sector_pressure_score",
+    "sector_strength_rank",
+    "churn_penalty_score",
+    "turnover_deficit_score",
+    "trade_urgency_score",
+}
+SIGNED_RATIO_BOUNDS = {
+    "intraday_return": 0.03,
+    "market_return_1d": 0.03,
+    "currency_return_1d": 0.05,
+    "currency_return_5d": 0.08,
+    "oil_return_1d": 0.06,
+    "oil_return_5d": 0.12,
+}
 
 
 class NormalizationFeatureVectorError(ValueError):
@@ -446,7 +471,9 @@ class NormalizationFeatureVectorService:
                     profiles_by_instrument=profiles_by_instrument,
                 ),
             )
-        normalized_value = historical_rank
+        normalized_value = self.metric_specific_normalized_value(source_record)
+        if normalized_value is None:
+            normalized_value = historical_rank
         if normalized_value is None and metric_zscore is not None:
             normalized_value = signed_to_unit(metric_zscore, profile.zscore_bound)
         if normalized_value is None:
@@ -456,6 +483,10 @@ class NormalizationFeatureVectorService:
 
         ttl_status = check_ttl_status(source_record, as_of_ts)
         data_quality_score = _data_quality_score_for_feature(source_record, data_quality_by_ref)
+        data_quality_flags = _data_quality_flags_for_feature(source_record, data_quality_by_ref)
+        if "future_timestamp" in data_quality_flags:
+            ttl_status = "invalid"
+            data_quality_score = min(data_quality_score, 0.0)
         confidence = _clip01(source_record.confidence_score * data_quality_score)
         if ttl_status == "stale" and profile.stale_policy == "downweight":
             confidence = _clip01(confidence * 0.5)
@@ -474,6 +505,7 @@ class NormalizationFeatureVectorService:
             ttl_status=ttl_status,
             confidence_score=confidence,
             data_quality_score=data_quality_score,
+            data_quality_flags=data_quality_flags,
             profile=profile,
             as_of_ts=as_of_ts,
         )
@@ -491,6 +523,17 @@ class NormalizationFeatureVectorService:
             confidence_score=confidence,
         )
 
+    def metric_specific_normalized_value(self, source_record: FeatureRecord) -> float | None:
+        metric_name = str(source_record.metric_name)
+        if source_record.raw_value is None:
+            return None
+        if metric_name in NATURAL_UNIT_METRICS:
+            return _clip01(source_record.raw_value)
+        signed_bound = SIGNED_RATIO_BOUNDS.get(metric_name)
+        if signed_bound is not None:
+            return signed_to_unit(source_record.raw_value, signed_bound)
+        return None
+
     def build_normalized_feature_record(
         self,
         *,
@@ -505,6 +548,7 @@ class NormalizationFeatureVectorService:
         ttl_status: str,
         confidence_score: float,
         data_quality_score: float,
+        data_quality_flags: tuple[str, ...],
         profile: NormalizationProfile,
         as_of_ts: str,
     ) -> FeatureRecord:
@@ -521,6 +565,7 @@ class NormalizationFeatureVectorService:
             dict.fromkeys(
                 (
                     *source_record.quality_flags,
+                    *data_quality_flags,
                     f"ttl_status:{ttl_status}",
                     "normalized_feature_record",
                 )
@@ -577,9 +622,14 @@ class NormalizationFeatureVectorService:
         feature_items = {
             candidate.source_record.metric_name: {
                 "normalized_value": candidate.normalized_record.normalized_value,
+                "raw_value": candidate.source_record.raw_value,
                 "confidence_score": candidate.confidence_score,
                 "ttl_status": candidate.ttl_status,
                 "source_feature_id": candidate.normalized_record.feature_id,
+                "source_refs": list(candidate.normalized_record.source_refs),
+                "quality_flags": list(candidate.normalized_record.quality_flags),
+                "data_quality_score": candidate.data_quality_score,
+                "calculation_version": candidate.normalized_record.calculation_version,
             }
             for candidate in sorted(candidates, key=lambda item: item.source_record.metric_name)
             if candidate.normalized_record.normalized_value is not None
@@ -596,13 +646,41 @@ class NormalizationFeatureVectorService:
         )
         quality_scores = tuple(candidate.data_quality_score for candidate in candidates)
         data_quality_score = sum(quality_scores) / len(quality_scores) if quality_scores else 0.0
+        available_feature_count = len(feature_items)
+        source_refs = tuple(
+            dict.fromkeys(
+                ref
+                for candidate in candidates
+                for ref in candidate.normalized_record.source_refs
+            )
+        )
+        quality_flags = tuple(
+            dict.fromkeys(
+                flag
+                for candidate in candidates
+                for flag in candidate.normalized_record.quality_flags
+            )
+        )
+        meta_ttl_status = "invalid" if "future_timestamp" in quality_flags else (
+            "expired" if any(candidate.ttl_status == "expired" for candidate in candidates) else (
+                "stale" if any(candidate.ttl_status == "stale" for candidate in candidates) else "fresh"
+            )
+        )
+        feature_items["_meta"] = {
+            "coverage_ratio": coverage_ratio(available_feature_count, len(required_feature_names)),
+            "data_quality_score": _clip01(data_quality_score),
+            "source_refs": list(source_refs),
+            "ttl_status": meta_ttl_status,
+            "quality_flags": list(quality_flags),
+            "calculation_version": profile.build_version,
+        }
         return FeatureVector(
             feature_vector_id=vector_id,
             instrument_id=instrument_id,
             horizon=horizon,
             as_of_ts=as_of_ts,
             features=feature_items,
-            coverage_ratio=coverage_ratio(len(feature_items), len(required_feature_names)),
+            coverage_ratio=coverage_ratio(available_feature_count, len(required_feature_names)),
             data_quality_score=_clip01(data_quality_score),
             build_version=profile.build_version,
         )
@@ -760,11 +838,36 @@ def _data_quality_score_for_feature(
     feature_record: FeatureRecord,
     data_quality_by_ref: Mapping[str, DataQualityRecord],
 ) -> float:
-    for key in (f"features.feature_record:{feature_record.feature_id}", feature_record.feature_id):
+    keys = (
+        f"features.feature_record:{feature_record.feature_id}",
+        feature_record.feature_id,
+        *feature_record.source_refs,
+        *(_ref_tail(ref) for ref in feature_record.source_refs),
+    )
+    scores: list[float] = []
+    for key in keys:
         record = data_quality_by_ref.get(key)
         if record is not None and record.quality_score is not None:
-            return _clip01(record.quality_score)
-    return 1.0
+            scores.append(_clip01(record.quality_score))
+    return min(scores) if scores else 1.0
+
+
+def _data_quality_flags_for_feature(
+    feature_record: FeatureRecord,
+    data_quality_by_ref: Mapping[str, DataQualityRecord],
+) -> tuple[str, ...]:
+    keys = (
+        f"features.feature_record:{feature_record.feature_id}",
+        feature_record.feature_id,
+        *feature_record.source_refs,
+        *(_ref_tail(ref) for ref in feature_record.source_refs),
+    )
+    flags: list[str] = []
+    for key in keys:
+        record = data_quality_by_ref.get(key)
+        if record is not None:
+            flags.extend(record.quality_flags)
+    return tuple(dict.fromkeys(flags))
 
 
 def _ref_tail(ref: str) -> str:

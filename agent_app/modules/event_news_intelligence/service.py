@@ -52,6 +52,7 @@ CALCULATION_VERSION = "event_news_intelligence_v1"
 DEFAULT_FAST_MODEL_ID = "deepseek/deepseek-v4-flash"
 DEFAULT_REASONING_MODEL_ID = "qwen/qwen3.6-35b-a3b"
 DEFAULT_MODEL_ID = DEFAULT_REASONING_MODEL_ID
+PROHIBITED_POLZA_MODELS = {"deepseek/" + "deepseek-v4" + "-pro"}
 
 VALID_CONTOURS = {"event_contour", "intraday_contour"}
 VALID_HORIZONS = {"intraday", "swing", "position"}
@@ -318,8 +319,6 @@ class LlmEnvelope:
         items = payload.get("items")
         if not isinstance(items, list):
             raise EventNewsIntelligenceError("LLM output items must be a list")
-        if not items:
-            raise EventNewsIntelligenceError("LLM output items must not be empty")
         if any(not isinstance(item, Mapping) for item in items):
             raise EventNewsIntelligenceError("LLM output items must contain only JSON objects")
         confidence_score = _optional_float(payload.get("confidence_score"))
@@ -399,7 +398,7 @@ class EventNewsIntelligenceService:
         self.repository = repository or InMemoryEventNewsIntelligenceRepository()
         self.gateway = gateway
         self.event_pressure_weights = dict(event_pressure_weights or DEFAULT_EVENT_PRESSURE_WEIGHTS)
-        self.model_id = model_id or ""
+        self.model_id = _safe_polza_model(model_id, "")
 
     def run(
         self,
@@ -473,12 +472,19 @@ class EventNewsIntelligenceService:
             feature_refs = tuple(self.write_feature_record(record) for record in feature_records)
             output_refs = event_refs + reaction_refs + feature_refs
 
-            if not structured_events:
+            no_event_only = bool(raw_text_items) and not structured_events and "no_event_found" in warnings
+            if not structured_events and not no_event_only:
                 warnings.append("structured_event_not_extracted")
             if structured_events and not feature_records:
                 warnings.append("feature_records_not_written")
 
-            status = "success" if structured_events and feature_records and not warnings else "partial_success" if output_refs else "skipped"
+            status = (
+                "success"
+                if structured_events and feature_records and not warnings
+                else "partial_success"
+                if output_refs or no_event_only
+                else "skipped"
+            )
             return EventNewsExecutionResult(
                 module_job_result=self._module_job_result(
                     job=job,
@@ -590,6 +596,29 @@ class EventNewsIntelligenceService:
                 )
             )
             return ("llm_output_missing",), (), (), ()
+
+        if not envelope.items:
+            self.write_audit_record(
+                AuditRecord(
+                    module_name=self.module_name,
+                    job_id=job.job_id,
+                    severity="info",
+                    event_type="llm_no_event_found",
+                    message="Validated LLM envelope contained no material events for this raw text item",
+                    object_type="raw_text_item",
+                    object_ref=source_ref,
+                    reason_codes=tuple(dict.fromkeys(("no_event_found", *envelope.reason_codes))),
+                    payload={
+                        "raw_text_item_id": raw_item.raw_text_item_id,
+                        "task_type": envelope.task_type,
+                        "model_id": envelope.model_id,
+                        "confidence_score": envelope.confidence_score,
+                        "warnings": list(envelope.warnings),
+                        "processed_status": "no_event_found",
+                    },
+                )
+            )
+            return tuple(dict.fromkeys(("no_event_found", *envelope.warnings))), (), (), ()
 
         structured_events: list[StructuredEvent] = []
         feature_records: list[FeatureRecord] = []
@@ -1187,6 +1216,40 @@ class EventNewsIntelligenceService:
             str(value or "")
             for value in (raw_item.source_type, raw_item.source, raw_item.title, raw_item.source_url)
         ).lower()
+        text_with_body = f"{text} {(raw_item.body or '')[:1500].lower()}"
+        if any(marker in text_with_body for marker in (
+            "отчет",
+            "отчёт",
+            "мсфо",
+            "рсбу",
+            "финансовые результаты",
+            "операционные результаты",
+            "существенный факт",
+            "собрание акционеров",
+            "совет директоров",
+        )):
+            return "report_extraction"
+        if any(marker in text_with_body for marker in ("дивиденд", "дивиденды")) and len(raw_item.body or "") > 3000:
+            return "dividend_extraction"
+        if any(marker in text_with_body for marker in ("ключев", "руониа", "цб", "банк россии")):
+            return "macro_text_analysis"
+        russian_report_markers = (
+            "отчет",
+            "отчёт",
+            "мсфо",
+            "рсбу",
+            "финансовые результаты",
+            "операционные результаты",
+            "существенный факт",
+            "собрание акционеров",
+            "совет директоров",
+        )
+        if any(marker in text for marker in russian_report_markers):
+            return "report_extraction"
+        if any(marker in text for marker in ("дивиденд", "дивиденды")) and len(raw_item.body or "") > 3000:
+            return "dividend_extraction"
+        if any(marker in text for marker in ("ключев", "руониа")):
+            return "macro_text_analysis"
         if any(marker in text for marker in ("report", "отчет", "отчёт", "ifrs", "rsbu", "msfo", "мсфо", "financial")):
             return "report_extraction"
         if any(marker in text for marker in ("dividend", "дивиденд")) and len(raw_item.body or "") > 3000:
@@ -1537,14 +1600,21 @@ def _embedded_llm_payload(raw_item: RawTextItem) -> Mapping[str, Any] | str | No
 
 def polza_model_for_task(task_type: str, env: Mapping[str, str] | None = None) -> str:
     env_map = env if env is not None else os.environ
-    fast_model = env_map.get("POLZA_FAST_MODEL") or DEFAULT_FAST_MODEL_ID
-    reasoning_model = env_map.get("POLZA_REASONING_MODEL") or DEFAULT_REASONING_MODEL_ID
-    default_model = env_map.get("POLZA_DEFAULT_MODEL") or env_map.get("POLZA_LLM_MODEL") or DEFAULT_MODEL_ID
+    fast_model = _safe_polza_model(env_map.get("POLZA_FAST_MODEL"), DEFAULT_FAST_MODEL_ID)
+    reasoning_model = _safe_polza_model(env_map.get("POLZA_REASONING_MODEL"), DEFAULT_REASONING_MODEL_ID)
+    default_model = _safe_polza_model(env_map.get("POLZA_DEFAULT_MODEL"), DEFAULT_MODEL_ID)
     if task_type in FAST_LLM_TASK_TYPES:
         return fast_model
     if task_type in REASONING_LLM_TASK_TYPES:
         return reasoning_model
     return default_model
+
+
+def _safe_polza_model(model_id: str | None, fallback: str) -> str:
+    candidate = str(model_id or "").strip()
+    if not candidate or candidate in PROHIBITED_POLZA_MODELS:
+        return fallback
+    return candidate
 
 
 def _maybe_nested_llm_payload(value: Any) -> Mapping[str, Any] | str | None:

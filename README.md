@@ -714,6 +714,14 @@ POLZA_FAST_MODEL=deepseek/deepseek-v4-flash
 POLZA_REASONING_MODEL=qwen/qwen3.6-35b-a3b
 POLZA_DEFAULT_MODEL=qwen/qwen3.6-35b-a3b
 POLZA_LLM_MODEL=
+LLM_MAX_ITEMS_PER_RUN=3
+LLM_MAX_CALLS_PER_MINUTE=2
+LLM_MAX_CALLS_PER_HOUR=30
+LLM_MIN_SECONDS_BETWEEN_CALLS=2
+ENABLE_LLM_TEXT_SCHEDULES=false
+MARKET_DATA_FETCH_RAW_TRADES=false
+LIQUIDITY_FETCH_RAW_TRADES=false
+PIPELINE_LOOKBACK_MINUTES=240
 LLM_DEFAULT_TEMPERATURE=0
 LLM_DEFAULT_RESPONSE_FORMAT=json_object
 ```
@@ -1065,7 +1073,6 @@ turnover_target_status
 `Risk Control Module` enforces:
 
 ```text
-max_daily_turnover_rub
 max_single_order_value_rub
 max_trade_count_per_day
 max_position_pct
@@ -1078,6 +1085,12 @@ min_expected_edge_after_cost_score
 min_liquidity_threshold
 stale data / stale portfolio / market session / kill switch gates
 ```
+
+`max_daily_turnover_rub` is retained as a monitoring/audit signal for live
+autonomous sandbox mode, not as a hard "stop trading today" cap. The gross
+turnover mandate remains a mandatory constraint, but positive post-cost edge,
+liquidity, exposure, loss/drawdown, market-session and current-cycle risk gates
+decide whether a new order can proceed.
 
 ## 25. Runtime requirement
 
@@ -1230,7 +1243,7 @@ expected_edge_after_cost_score > min_expected_edge_after_cost_score
 
 ```text
 fresh PostgreSQL volume
-  -> apply migrations 001..013
+  -> apply migrations 001..018
   -> database_readiness_check
   -> metric_weights_readiness_check
   -> live_trading_readiness_check
@@ -1280,7 +1293,7 @@ docker compose -f docker/docker-compose.prod.yml up -d scheduler_worker
 
 `scheduler_worker` is the primary long-running process. `agent_app`, `research_worker` and `staging_runner` are optional/manual profiles and must not be used as restart-loop daemons.
 
-`migration_runner` applies migrations `001..015` and repeated runs must skip already applied migrations. Readiness is checked through:
+`migration_runner` applies migrations `001..018` and repeated runs must skip already applied migrations. Readiness is checked through:
 
 ```sql
 SELECT * FROM audit.database_readiness_check ORDER BY check_name;
@@ -1349,6 +1362,18 @@ docker stop holymoex
 docker start holymoex
 ```
 
+Controlled full-pipeline proof without real submit:
+
+```bash
+docker exec \
+  -e CONTROLLED_PIPELINE_MARKET_OPEN_OVERRIDE=true \
+  -e SAFE_LIVE_SUBMIT=false \
+  -e EXECUTION_PROVIDER=mock \
+  holymoex /app/scripts/controlled_full_pipeline.sh
+```
+
+This writes current-cycle `feature_record`, `feature_vector`, `decision_set`, `decision_record`, `risk_check_result`, `order_intent`, mock `execution_result/fill_report`, `portfolio_snapshot`, monitoring and `audit.module_job_result` records for 1-3 allowed instruments. It remains `RUN_MODE=live_trading` and never calls ArenaGo `submit_order`.
+
 Pre-deploy check:
 
 ```bash
@@ -1363,7 +1388,7 @@ Startup sequence:
 load env
   -> ensure /data directories
   -> start persistent local PostgreSQL
-  -> apply migrations 001..015
+  -> apply migrations 001..018
   -> validate ArenaGo token through SANDBOX_API_KEY/ARENA_GO_TOKEN
   -> resolve exact bot/portfolio from /api/bots
   -> sync positions/trades
@@ -1380,25 +1405,35 @@ In standalone root-container mode the launcher uses its own `/data/postgres` dat
 
 Gateway supports `polza_ai/models` through `GET ${POLZA_BASE_URL}/models`. If an environment/provider later disables that endpoint, the supported fallback healthcheck is a strict JSON `llm_completion` smoke with `response_format={"type":"json_object"}` and schema fields `schema_version`, `model_id`, `model_version`, `task_type`, `items`.
 
-Task-specific model routing has priority over the legacy `POLZA_LLM_MODEL` default:
+Task-specific model routing has priority. `POLZA_LLM_MODEL` is kept only as an empty compatibility placeholder and is ignored by server runtime if it points to an expensive legacy model:
 
 ```env
 POLZA_FAST_MODEL=deepseek/deepseek-v4-flash
 POLZA_REASONING_MODEL=qwen/qwen3.6-35b-a3b
 POLZA_DEFAULT_MODEL=qwen/qwen3.6-35b-a3b
 LLM_ENABLED=true
-LLM_MAX_CALLS_PER_MINUTE=10
-LLM_MAX_CALLS_PER_HOUR=60
-LLM_MAX_CALLS_PER_DAY=500
-LLM_MAX_ITEMS_PER_RUN=20
-LLM_MIN_SECONDS_BETWEEN_CALLS=0
+LLM_MAX_CALLS_PER_MINUTE=2
+LLM_MAX_CALLS_PER_HOUR=30
+LLM_MAX_CALLS_PER_DAY=200
+LLM_MAX_ITEMS_PER_RUN=3
+LLM_MIN_SECONDS_BETWEEN_CALLS=2
 ALLOW_LLM_FALLBACK=false
+ENABLE_LLM_TEXT_SCHEDULES=false
 RAW_TEXT_FALLBACK_INTERVAL_SECONDS=1800
+MARKET_DATA_FETCH_RAW_TRADES=false
+LIQUIDITY_FETCH_RAW_TRADES=false
+PIPELINE_LOOKBACK_MINUTES=240
 ```
 
 `deepseek/deepseek-v4-flash` is used for light text tasks: `event_extraction`, `sentiment_scoring`, `news_classification`, entity/ticker matching, duplicate/novelty pre-classification, simple disclosure classification, short news summarization and raw-text relevance filtering. `qwen/qwen3.6-35b-a3b` is used for heavier reasoning tasks: `report_extraction`, `earnings_analysis`, long-report dividend extraction, `macro_text_analysis`, complex corporate actions, multi-source synthesis, validation/research commentary and strategy/risk explanations. LLM output remains strict JSON only and must not contain buy/sell recommendations, weight changes, risk-policy changes, order intents or free-form prose.
 
 The LLM cache key includes `content_hash`, `task_type`, `prompt_version`, `model_id` and `event_ontology_version`. It intentionally excludes volatile fields such as `job_id`, `fetched_at`, current timestamp and scheduler tick id.
+
+Validated EventNews envelopes with `"items": []` are treated as a successful `no_event_found` result for irrelevant text. They are audited and are not retried as schema failures.
+
+In the autonomous live loop, MOEX candle/index data and ArenaGo portfolio sync are the primary realtime inputs. The default realtime lookback is `PIPELINE_LOOKBACK_MINUTES=240`, so candle feature modules have enough recent history instead of querying a zero-width instant. MOEX raw trade tape fetch is opt-in via `MARKET_DATA_FETCH_RAW_TRADES=true` and `LIQUIDITY_FETCH_RAW_TRADES=true`; by default it is disabled so the scheduler can reach feature vector, decision, risk and execution instead of blocking on heavy `/trades` backfill. LLM-heavy text schedules require `ENABLE_LLM_TEXT_SCHEDULES=true` in production; this prevents startup/restart fan-out while leaving non-LLM data intake and trading modules active.
+
+Russian routing markers are supported for reports/dividends/disclosures, including `отчет`, `отчёт`, `дивиденды`, `совет директоров`, `МСФО`, `РСБУ`, `финансовые результаты`, `операционные результаты`, `собрание акционеров` and `существенный факт`.
 
 To inspect PolzaAI usage/cost:
 

@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import timedelta
 from typing import Sequence
 
 from agent_app.contracts.unified_objects import TimeRange
+from agent_app.contracts.unified_objects.module_job import to_utc_iso, utc_now
 from agent_app.modules.orchestration.repository import (
     InMemoryOrchestrationRepository,
     PostgresOrchestrationRepository,
@@ -64,7 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         universe_id=args.universe_id,
         instrument_ids=tuple(args.instrument_id),
         horizons=tuple(args.horizon) if args.horizon else ("intraday", "swing", "position"),
-        time_range=TimeRange.instant(),
+        time_range=_default_time_range(args.system_mode),
         system_mode=args.system_mode,
     )
     pipeline_run = service.run_pipeline(request, context)
@@ -72,6 +74,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _default_time_range(system_mode: str) -> TimeRange:
+    now = utc_now()
+    default_minutes = 240 if system_mode == "live_trading" else 1440
+    try:
+        lookback_minutes = int(os.getenv("PIPELINE_LOOKBACK_MINUTES", str(default_minutes)))
+    except ValueError:
+        lookback_minutes = default_minutes
+    lookback_minutes = max(1, lookback_minutes)
+    return TimeRange(
+        from_ts=to_utc_iso(now - timedelta(minutes=lookback_minutes)),
+        to_ts=to_utc_iso(now),
+        timezone="UTC",
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
-

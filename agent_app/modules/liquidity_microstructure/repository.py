@@ -84,6 +84,37 @@ class RawTrade:
 
 
 @dataclass(frozen=True)
+class RawCandle:
+    raw_candle_id: str
+    instrument_id: str
+    universe_id: str
+    timeframe: str
+    close_ts: str
+    close_price: float | None
+    high_price: float | None = None
+    low_price: float | None = None
+    volume: float | None = None
+    turnover: float | None = None
+    provider: str = ""
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "RawCandle":
+        return cls(
+            raw_candle_id=str(payload.get("raw_candle_id") or payload.get("id") or ""),
+            instrument_id=str(payload.get("instrument_id") or ""),
+            universe_id=str(payload.get("universe_id") or ""),
+            timeframe=str(payload.get("timeframe") or ""),
+            close_ts=str(payload.get("close_ts") or ""),
+            close_price=_optional_float(payload.get("close_price")),
+            high_price=_optional_float(payload.get("high_price")),
+            low_price=_optional_float(payload.get("low_price")),
+            volume=_optional_float(payload.get("volume")),
+            turnover=_optional_float(payload.get("turnover")),
+            provider=str(payload.get("provider") or ""),
+        )
+
+
+@dataclass(frozen=True)
 class FeatureRecord:
     feature_id: str
     instrument_id: str
@@ -200,6 +231,15 @@ class LiquidityMicrostructureRepository(Protocol):
     ) -> tuple[RawTrade, ...]:
         ...
 
+    def list_candles(
+        self,
+        universe_id: str,
+        instrument_ids: tuple[str, ...],
+        from_ts: str,
+        to_ts: str,
+    ) -> tuple[RawCandle, ...]:
+        ...
+
     def list_active_metric_weights(
         self,
         horizon: str,
@@ -223,6 +263,7 @@ class InMemoryLiquidityMicrostructureRepository:
         profiles: tuple[Mapping[str, Any] | InstrumentProfile, ...] = (),
         orderbooks: tuple[Mapping[str, Any] | RawOrderBook, ...] = (),
         trades: tuple[Mapping[str, Any] | RawTrade, ...] = (),
+        candles: tuple[Mapping[str, Any] | RawCandle, ...] = (),
         active_weights: Mapping[tuple[str, tuple[str, ...]], Mapping[str, float]] | None = None,
     ) -> None:
         self.profiles = tuple(
@@ -236,6 +277,10 @@ class InMemoryLiquidityMicrostructureRepository:
         self.trades = tuple(
             trade if isinstance(trade, RawTrade) else RawTrade.from_mapping(trade)
             for trade in trades
+        )
+        self.candles = tuple(
+            candle if isinstance(candle, RawCandle) else RawCandle.from_mapping(candle)
+            for candle in candles
         )
         self.active_weights = dict(active_weights or {})
         self.feature_records: list[FeatureRecord] = []
@@ -308,6 +353,26 @@ class InMemoryLiquidityMicrostructureRepository:
             and from_dt <= parse_utc_iso(trade.trade_ts) <= to_dt
         ]
         return tuple(sorted(trades, key=lambda item: (item.instrument_id, item.trade_ts)))
+
+    def list_candles(
+        self,
+        universe_id: str,
+        instrument_ids: tuple[str, ...],
+        from_ts: str,
+        to_ts: str,
+    ) -> tuple[RawCandle, ...]:
+        requested = set(instrument_ids)
+        from_dt = parse_utc_iso(from_ts)
+        to_dt = parse_utc_iso(to_ts)
+        candles = [
+            candle
+            for candle in self.candles
+            if candle.universe_id == universe_id
+            and candle.instrument_id in requested
+            and candle.close_ts
+            and from_dt <= parse_utc_iso(candle.close_ts) <= to_dt
+        ]
+        return tuple(sorted(candles, key=lambda item: (item.instrument_id, item.timeframe, item.close_ts)))
 
     def list_active_metric_weights(
         self,
@@ -490,6 +555,52 @@ class PostgresLiquidityMicrostructureRepository:
                 side=_optional_text(row[6]),
                 trade_value=_optional_float(row[7]),
                 provider=row[8] or "",
+            )
+            for row in rows
+        )
+
+    def list_candles(
+        self,
+        universe_id: str,
+        instrument_ids: tuple[str, ...],
+        from_ts: str,
+        to_ts: str,
+    ) -> tuple[RawCandle, ...]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT raw_candle_id, instrument_id, universe_id, timeframe,
+                           close_ts, close_price, high_price, low_price,
+                           volume, turnover, provider
+                      FROM raw_market.raw_candle
+                     WHERE universe_id = %s
+                       AND instrument_id = ANY(%s)
+                       AND close_ts IS NOT NULL
+                       AND close_ts BETWEEN %s AND %s
+                     ORDER BY instrument_id, timeframe, close_ts
+                    """,
+                    (
+                        universe_id,
+                        list(instrument_ids),
+                        parse_utc_iso(from_ts),
+                        parse_utc_iso(to_ts),
+                    ),
+                )
+                rows = cur.fetchall()
+        return tuple(
+            RawCandle(
+                raw_candle_id=str(row[0]),
+                instrument_id=row[1] or "",
+                universe_id=row[2] or "",
+                timeframe=row[3] or "",
+                close_ts=_iso(row[4]),
+                close_price=_optional_float(row[5]),
+                high_price=_optional_float(row[6]),
+                low_price=_optional_float(row[7]),
+                volume=_optional_float(row[8]),
+                turnover=_optional_float(row[9]),
+                provider=row[10] or "",
             )
             for row in rows
         )

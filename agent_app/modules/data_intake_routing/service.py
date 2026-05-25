@@ -743,6 +743,10 @@ class DataIntakeRoutingService:
             routing_latencies: list[int] = []
 
             for raw_payload in raw_payloads:
+                raw_payload, source_type_warnings = self._raw_payload_with_valid_source(raw_payload, intake_request)
+                warnings.extend(source_type_warnings)
+                if raw_payload is None:
+                    continue
                 raw_item = RawTextItem.from_dict(
                     raw_payload,
                     universe_id=intake_request.universe_id,
@@ -1487,6 +1491,9 @@ class DataIntakeRoutingService:
         intake_request: DataIntakeRequest,
     ) -> tuple[list[Mapping[str, Any]], list[str]]:
         warnings: list[str] = []
+        if response.provider == "polza_ai":
+            warnings.append(f"llm_response_not_raw_text_source:{response.request_id}")
+            return [], warnings
         if response.status not in {"success", "partial_success"}:
             warnings.append(f"external_response_not_success:{response.request_id}:{response.status}")
             return [], warnings
@@ -1520,10 +1527,16 @@ class DataIntakeRoutingService:
             payloads = []
             for item in items:
                 if isinstance(item, Mapping):
+                    item_source_type = str(item.get("source_type") or source_type)
+                    if item_source_type not in VALID_SOURCE_TYPES:
+                        warnings.append(
+                            f"external_item_invalid_source_type_coerced:{response.request_id}:{item_source_type}"
+                        )
+                        item_source_type = source_type if source_type in VALID_SOURCE_TYPES else "news_api"
                     payloads.append(
                         {
                             **dict(item),
-                            "source_type": item.get("source_type") or source_type,
+                            "source_type": item_source_type,
                             "source_ref": item.get("source_ref") or response.data_ref or response.request_id,
                             "universe_id": item.get("universe_id") or intake_request.universe_id,
                             "instrument_ids": item.get("instrument_ids") or default_instrument_ids,
@@ -1532,10 +1545,14 @@ class DataIntakeRoutingService:
                     )
             return payloads, warnings
         if any(key in data for key in ("title", "headline", "body", "text", "content", "url", "source_url")):
+            data_source_type = str(data.get("source_type") or source_type)
+            if data_source_type not in VALID_SOURCE_TYPES:
+                warnings.append(f"external_item_invalid_source_type_coerced:{response.request_id}:{data_source_type}")
+                data_source_type = source_type if source_type in VALID_SOURCE_TYPES else "news_api"
             return [
                 {
                     **data,
-                    "source_type": data.get("source_type") or source_type,
+                    "source_type": data_source_type,
                     "source_ref": data.get("source_ref") or response.data_ref or response.request_id,
                     "universe_id": data.get("universe_id") or intake_request.universe_id,
                     "instrument_ids": data.get("instrument_ids") or default_instrument_ids,
@@ -1544,6 +1561,22 @@ class DataIntakeRoutingService:
             ], warnings
         warnings.append(f"external_response_has_no_text_items:{response.request_id}")
         return [], warnings
+
+    def _raw_payload_with_valid_source(
+        self,
+        raw_payload: Mapping[str, Any],
+        intake_request: DataIntakeRequest,
+    ) -> tuple[Mapping[str, Any] | None, tuple[str, ...]]:
+        payload = dict(raw_payload)
+        source_type = str(payload.get("source_type") or payload.get("source") or "").strip()
+        if source_type in VALID_SOURCE_TYPES:
+            return payload, ()
+        if source_type == "polza_ai" or str(payload.get("provider") or "").strip() == "polza_ai" or payload.get("model_id"):
+            return None, (f"llm_raw_text_payload_skipped:{source_type or 'polza_ai'}",)
+        fallback_source_type = next((item for item in intake_request.source_types if item in VALID_SOURCE_TYPES), "news_api")
+        payload["source_type"] = fallback_source_type
+        payload.setdefault("source", source_type or fallback_source_type)
+        return payload, (f"raw_text_payload_invalid_source_type_coerced:{source_type or 'missing'}:{fallback_source_type}",)
 
     def _raw_payloads_from_refs(self, input_refs: tuple[str, ...]) -> list[Mapping[str, Any]]:
         payloads: list[Mapping[str, Any]] = []

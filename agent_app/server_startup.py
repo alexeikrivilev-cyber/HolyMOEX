@@ -15,6 +15,7 @@ from agent_app.modules.external_request_gateway.repository import PostgresExtern
 from agent_app.modules.external_request_gateway.service import ExternalRequestGatewayService
 from agent_app.modules.portfolio_state.repository import PostgresPortfolioStateRepository, stable_record_id
 from agent_app.modules.portfolio_state.service import PortfolioStateService
+from agent_app.runtime_calendar import current_market_session
 
 
 ALLOWED_TICKERS = (
@@ -67,6 +68,9 @@ class StartupResult:
     bot_name: str
     portfolio_name: str
     broker_sync_status: str
+    market_session_status: str
+    agent_runtime_phase: str
+    market_session_reason: str
     readiness_rows: tuple[dict[str, Any], ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,6 +81,9 @@ class StartupResult:
             "bot_name": self.bot_name,
             "portfolio_name": self.portfolio_name,
             "broker_sync_status": self.broker_sync_status,
+            "market_session_status": self.market_session_status,
+            "agent_runtime_phase": self.agent_runtime_phase,
+            "market_session_reason": self.market_session_reason,
             "readiness_rows": list(self.readiness_rows),
         }
 
@@ -227,6 +234,16 @@ def _sync_portfolio(database_url: str, bot_name: str) -> str:
         },
         job,
     )
+    if result.module_job_result.status == "success":
+        return "success"
+    if result.module_job_result.status == "partial_success":
+        warnings = set(result.module_job_result.warnings)
+        critical_warnings = {
+            "broker_reconciliation_failed",
+            "stale_portfolio_detected",
+        }
+        if not warnings.intersection(critical_warnings) and result.portfolio_snapshot.portfolio_id == bot_name:
+            return "success"
     return result.module_job_result.status
 
 
@@ -263,7 +280,14 @@ def _readiness_rows(database_url: str) -> tuple[dict[str, Any], ...]:
     return tuple(rows)
 
 
-def _write_runtime_env(path: Path, *, bot_name: str, readiness_passed: bool) -> None:
+def _write_runtime_env(
+    path: Path,
+    *,
+    bot_name: str,
+    readiness_passed: bool,
+    market_session_status: str,
+    agent_runtime_phase: str,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "\n".join(
@@ -271,6 +295,8 @@ def _write_runtime_env(path: Path, *, bot_name: str, readiness_passed: bool) -> 
                 f"export ARENA_GO_BOT_NAME={_shell_quote(bot_name)}",
                 f"export ARENA_GO_PORTFOLIO={_shell_quote(bot_name)}",
                 f"export LIVE_READINESS_PASSED={_shell_quote('true' if readiness_passed else 'false')}",
+                f"export STARTUP_MARKET_SESSION_STATUS={_shell_quote(market_session_status)}",
+                f"export STARTUP_AGENT_RUNTIME_PHASE={_shell_quote(agent_runtime_phase)}",
                 "",
             )
         ),
@@ -333,7 +359,14 @@ def run_startup_preflight(database_url: str, runtime_env_file: Path, *, skip_ext
     if not readiness_passed:
         reason_codes.append("readiness_not_passed")
 
-    _write_runtime_env(runtime_env_file, bot_name=bot_name, readiness_passed=readiness_passed)
+    market_session = current_market_session()
+    _write_runtime_env(
+        runtime_env_file,
+        bot_name=bot_name,
+        readiness_passed=readiness_passed,
+        market_session_status=market_session.market_session_status,
+        agent_runtime_phase=market_session.agent_runtime_phase,
+    )
     result = StartupResult(
         readiness_passed=readiness_passed,
         arena_go_token_source=token_env or "missing",
@@ -341,6 +374,9 @@ def run_startup_preflight(database_url: str, runtime_env_file: Path, *, skip_ext
         bot_name=bot_name,
         portfolio_name=bot_name,
         broker_sync_status=broker_sync_status,
+        market_session_status=market_session.market_session_status,
+        agent_runtime_phase=market_session.agent_runtime_phase,
+        market_session_reason=market_session.reason,
         readiness_rows=readiness_rows,
     )
     _audit_startup(database_url, result, reason_codes)

@@ -3,6 +3,12 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+if command -v cygpath >/dev/null 2>&1; then
+  DOCKER_ROOT_DIR="$(cygpath -w "$ROOT_DIR")"
+  export MSYS2_ARG_CONV_EXCL="*"
+else
+  DOCKER_ROOT_DIR="$ROOT_DIR"
+fi
 
 IMAGE="${IMAGE:-holymoex:server}"
 PY_IMAGE="${PY_IMAGE:-python:3.11-slim}"
@@ -67,7 +73,8 @@ secret_scan() {
 
   if grep -RInE '(SANDBOX_API_KEY|ARENA_GO_TOKEN|POLZA_API_KEY)=([A-Za-z0-9_./+=:-]{20,})' \
       --exclude-dir=.git --exclude-dir=.pytest_cache --exclude-dir=__pycache__ --exclude-dir=data \
-      --exclude='api_keys.local.env' --exclude='*.local.env' .; then
+      --exclude='api_keys.local.env' --exclude='*.local.env' . \
+      | grep -Ev 'replace_with_|your_|example_|<.*>'; then
     echo "possible committed secret found" >&2
     exit 1
   fi
@@ -97,7 +104,7 @@ python_checks() {
     PYTHONPATH=. python -m unittest discover -s tests -p "test*.py" -v
     PYTHONPATH=. python -m pytest -q
   else
-    docker run --rm -v "$ROOT_DIR:/work" -w /work -e PYTHONPATH=/work "$PY_IMAGE" \
+    docker run --rm -v "$DOCKER_ROOT_DIR:/work" -w /work -e PYTHONPATH=/work "$PY_IMAGE" \
       sh -lc "pip install --no-cache-dir -r requirements-dev.txt >/tmp/holy_dev_deps_install.log && python -m compileall -q agent_app tests && python -m unittest discover -s tests -p 'test*.py' -v && python -m pytest -q"
   fi
 }
@@ -135,7 +142,7 @@ root_restart_smoke() {
     -e SAFE_LIVE_SUBMIT=false \
     -e POSTGRES_PASSWORD=moex_agent_password \
     -v "$SMOKE_VOLUME:/data" "$IMAGE" >"$first_log"
-  grep -q "apply 014_automatic_live_sandbox_runtime.sql" "$first_log"
+  grep -q "apply 018_portfolio_identity_readiness_refinement.sql" "$first_log"
   grep -q '"readiness_passed": true' "$first_log"
 
   docker run --rm "${docker_env_args[@]}" \
@@ -144,7 +151,7 @@ root_restart_smoke() {
     -e SAFE_LIVE_SUBMIT=false \
     -e POSTGRES_PASSWORD=moex_agent_password \
     -v "$SMOKE_VOLUME:/data" "$IMAGE" >"$second_log"
-  grep -q "skip 014_automatic_live_sandbox_runtime.sql" "$second_log"
+  grep -q "skip 018_portfolio_identity_readiness_refinement.sql" "$second_log"
   grep -q '"readiness_passed": true' "$second_log"
 }
 
@@ -210,8 +217,8 @@ migration_readiness_and_staging() {
     -e DATABASE_URL="$db_url" "$IMAGE" python -m agent_app.storage.postgres.apply_migrations >/tmp/holy_migrations_1.log
   docker run --rm --network "$PG_NETWORK" "${docker_env_args[@]}" \
     -e DATABASE_URL="$db_url" "$IMAGE" python -m agent_app.storage.postgres.apply_migrations >/tmp/holy_migrations_2.log
-  grep -q "apply 014_automatic_live_sandbox_runtime.sql" /tmp/holy_migrations_1.log
-  grep -q "skip 014_automatic_live_sandbox_runtime.sql" /tmp/holy_migrations_2.log
+  grep -q "apply 018_portfolio_identity_readiness_refinement.sql" /tmp/holy_migrations_1.log
+  grep -q "skip 018_portfolio_identity_readiness_refinement.sql" /tmp/holy_migrations_2.log
 
   for view in audit.database_readiness_check audit.metric_weights_readiness_check audit.live_trading_readiness_check audit.allowed_universe_readiness_check; do
     local fails
@@ -222,6 +229,8 @@ migration_readiness_and_staging() {
   docker run --rm --network "$PG_NETWORK" "${docker_env_args[@]}" \
     -e DATABASE_URL="$db_url" \
     -e SAFE_LIVE_SUBMIT=false \
+    -e CONTROLLED_PIPELINE_MARKET_OPEN_OVERRIDE=true \
+    -e EXECUTION_PROVIDER=mock \
     "$IMAGE" python -m agent_app.staging_runner --instrument-cap 2 --max-news-items 1 >"$TMP_DIR/staging.log"
   grep -q "controlled_staging_completed" "$TMP_DIR/staging.log" || \
     docker exec "$PG_CONTAINER" psql -U moex_agent -d moex_agent -At -c \

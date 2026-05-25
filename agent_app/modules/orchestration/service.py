@@ -811,6 +811,7 @@ class OrchestrationService:
         horizon = horizons[0] if horizons else "intraday"
         as_of_ts = job.time_range.to_ts
         run_mode = job.run_mode
+        portfolio_id = __import__("os").getenv("ARENA_GO_PORTFOLIO") or __import__("os").getenv("ARENA_GO_BOT_NAME") or "arena_go_default"
         risk_policy_id = (
             "risk_policy:live_autonomous_turnover:v1"
             if run_mode == "live_trading"
@@ -823,6 +824,8 @@ class OrchestrationService:
         )
         feature_vector_ref = self._latest_input_ref(job.input_refs, "features.feature_vector", "features.feature_vector:latest")
         feature_record_ref = self._latest_input_ref(job.input_refs, "features.feature_record", "features.feature_record:latest")
+        feature_vector_refs = self._input_refs_by_prefix(job.input_refs, "features.feature_vector", (feature_vector_ref,))
+        feature_record_refs = self._input_refs_by_prefix(job.input_refs, "features.feature_record", (feature_record_ref,))
         portfolio_snapshot_ref = self._latest_input_ref(job.input_refs, "portfolio.portfolio_snapshot", "portfolio.portfolio_snapshot:latest")
         # Risk must check the decision set produced in the current cycle.
         # Falling back to decisions.decision_set:latest could approve stale orders.
@@ -966,7 +969,7 @@ class OrchestrationService:
                     "instrument_ids": list(instrument_ids),
                     "horizons": list(horizons),
                     "as_of_ts": as_of_ts,
-                    "feature_refs": [feature_record_ref],
+                    "feature_refs": list(feature_record_refs),
                     "normalization_profile_id": "normalization:live_autonomous:v1" if run_mode == "live_trading" else "normalization:product_baseline:v1",
                 }
             },
@@ -977,7 +980,7 @@ class OrchestrationService:
                     "instrument_ids": list(instrument_ids),
                     "horizon": horizon,
                     "as_of_ts": as_of_ts,
-                    "feature_vector_refs": [feature_vector_ref],
+                    "feature_vector_refs": list(feature_vector_refs),
                     "portfolio_state_ref": portfolio_snapshot_ref,
                     "weights_profile_id": weights_profile_id,
                     "run_mode": run_mode,
@@ -1005,7 +1008,7 @@ class OrchestrationService:
             },
             "Portfolio State Module": {
                 "portfolio_update_request": {
-                    "portfolio_id": "arena_go_default",
+                    "portfolio_id": portfolio_id,
                     "fill_report_refs": list(fill_report_refs),
                     "broker_snapshot_ref": "broker.snapshot:scheduled",
                     "price_snapshot_ref": "price.snapshot:scheduled",

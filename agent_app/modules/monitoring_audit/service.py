@@ -10,6 +10,7 @@ from agent_app.contracts.unified_objects.module_job import (
     to_utc_iso,
     utc_now,
 )
+from agent_app.runtime_calendar import current_market_session
 
 from . import metrics
 from .repository import (
@@ -324,7 +325,23 @@ class MonitoringAuditService:
         module_statuses = self.module_statuses(event, snapshot.audit_records)
         alerts, sla_breaches, warnings = self.detect_alerts(event, computed, snapshot, now_ts)
         computed["alert_count"] = metrics.alert_count(len(alerts))
-        system_status = self.system_status(event, module_statuses, alerts)
+        coverage = self.monitoring_event_coverage(event, snapshot.audit_records)
+        acceptance_criteria = {
+            "all_modules_emit_monitoring_events": not coverage["missing_modules"],
+            "decision_replay_possible": bool(snapshot.decision_records),
+            "critical_alerts_generated": any(alert["severity"] == "critical" for alert in alerts),
+            "request_costs_tracked": computed["llm_cost_units"] >= 0.0,
+            "kill_switch_audited": any(alert.get("kill_switch_audited") for alert in alerts) or event.severity != "critical",
+            "health_report_available": True,
+        }
+        health_reason_codes = self.health_reason_codes(
+            job=job,
+            snapshot=snapshot,
+            computed=computed,
+            coverage=coverage,
+            acceptance_criteria=acceptance_criteria,
+        )
+        system_status = self.system_status(event, module_statuses, alerts, health_reason_codes)
         health_report_id = stable_record_id(
             "health_report",
             {
@@ -341,21 +358,15 @@ class MonitoringAuditService:
             "module_statuses": module_statuses,
             "active_alerts": [alert["alert_id"] for alert in alerts],
             "sla_breaches": sla_breaches,
+            "reason_codes": health_reason_codes,
         }
-        coverage = self.monitoring_event_coverage(event, snapshot.audit_records)
         health_payload = {
             "health_report": health_report,
             "metrics": computed,
             "event": self.event_payload(event),
             "monitoring_event_coverage": coverage,
-            "acceptance_criteria": {
-                "all_modules_emit_monitoring_events": not coverage["missing_modules"],
-                "decision_replay_possible": bool(snapshot.decision_records),
-                "critical_alerts_generated": any(alert["severity"] == "critical" for alert in alerts),
-                "request_costs_tracked": computed["llm_cost_units"] >= 0.0,
-                "kill_switch_audited": any(alert.get("kill_switch_audited") for alert in alerts) or event.severity != "critical",
-                "health_report_available": True,
-            },
+            "acceptance_criteria": acceptance_criteria,
+            "reason_codes": health_reason_codes,
             "source_module": self.module_name,
             "calculation_version": CALCULATION_VERSION,
             "timestamp": now_ts,
@@ -783,6 +794,7 @@ class MonitoringAuditService:
         event: MonitoringEvent,
         module_statuses: Mapping[str, str],
         alerts: list[Mapping[str, Any]],
+        reason_codes: tuple[str, ...] = (),
     ) -> str:
         if event.event_type == "system" and event.severity == "critical":
             return "stopped"
@@ -790,6 +802,10 @@ class MonitoringAuditService:
             return "critical"
         if any(status == "failed" for status in module_statuses.values()):
             return "critical"
+        if "off_market_no_current_decision_chain" in reason_codes:
+            return "off_market"
+        if reason_codes:
+            return "degraded"
         if alerts or any(status == "degraded" for status in module_statuses.values()):
             return "degraded"
         return "healthy"
@@ -800,6 +816,53 @@ class MonitoringAuditService:
         if status == "degraded":
             return "warning"
         return "info"
+
+    def health_reason_codes(
+        self,
+        *,
+        job: ModuleJob,
+        snapshot: MonitoringSnapshot,
+        computed: Mapping[str, Any],
+        coverage: Mapping[str, Any],
+        acceptance_criteria: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        reason_codes: list[str] = []
+        market_status = current_market_session().market_session_status
+        raw_counts = computed.get("raw_counts") if isinstance(computed.get("raw_counts"), Mapping) else {}
+        if not acceptance_criteria.get("decision_replay_possible"):
+            reason_codes.append("decision_replay_not_possible")
+        if job.run_mode == "live_trading":
+            if not snapshot.decision_records:
+                reason_codes.append("decision_records_missing")
+            if not snapshot.execution_results:
+                reason_codes.append("execution_results_missing")
+            if not snapshot.portfolio_snapshots:
+                reason_codes.append("portfolio_snapshot_missing")
+            if not raw_counts.get("decision_records"):
+                reason_codes.append("current_window_decision_chain_missing")
+            if market_status in {"closed", "premarket", "postmarket"} and {
+                "decision_replay_not_possible",
+                "decision_records_missing",
+                "execution_results_missing",
+            }.issubset(set(reason_codes)):
+                reason_codes.append("off_market_no_current_decision_chain")
+            elif market_status == "unknown":
+                reason_codes.append("market_session_unknown")
+        missing_modules = set(str(item) for item in (coverage.get("missing_modules") or ()))
+        critical_modules = {
+            "Market Data Metrics Module",
+            "Liquidity & Microstructure Module",
+            "Volatility & Risk Metrics Module",
+            "Market Context Module",
+            "Normalization & Feature Vector Module",
+            "Decision Engine Module",
+            "Risk Control Module",
+            "Execution Engine Module",
+            "Portfolio State Module",
+        }
+        if missing_modules & critical_modules:
+            reason_codes.append("critical_module_monitoring_coverage_missing")
+        return tuple(dict.fromkeys(reason_codes))
 
     def latest_record_timestamps(
         self,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -459,6 +460,24 @@ class MarketDataMetricsService:
         market_values = tuple(item.value for item in market_index_values if item.value is not None)
         sector_values = tuple(item.value for item in sector_index_values if item.value is not None)
 
+        latest_intraday = intraday_candles[-1] if intraday_candles else None
+        latest_daily = daily_candles[-1] if daily_candles else None
+        latest_price = (
+            float(latest_intraday.close_price)
+            if latest_intraday is not None and latest_intraday.close_price is not None
+            else float(latest_daily.close_price)
+            if latest_daily is not None and latest_daily.close_price is not None
+            else None
+        )
+        self._append_metric(
+            values,
+            "latest_price",
+            "raw_metric",
+            latest_price,
+            "rub",
+            source_refs,
+        )
+
         return_1d = compute_returns(daily_prices, 1)
         return_5d = compute_returns(daily_prices, 5)
         return_20d = compute_returns(daily_prices, 20)
@@ -681,7 +700,8 @@ class MarketDataMetricsService:
         if metrics_input.sector_index_ref and (not sector_index_values or _index_values_stale(sector_index_values, job)):
             requests.append(self._index_market_request(job, metrics_input.sector_index_ref))
         if (
-            any(timeframe in metrics_input.timeframes for timeframe in INTRADAY_TIMEFRAME_PRIORITY)
+            _env_bool("MARKET_DATA_FETCH_RAW_TRADES", False)
+            and any(timeframe in metrics_input.timeframes for timeframe in INTRADAY_TIMEFRAME_PRIORITY)
             and (not trades or _trades_stale(trades, job))
         ):
             for profile in profiles:
@@ -1004,6 +1024,13 @@ def _required_float(value: float | None) -> float:
 def _stable_hash(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _ref_tail(ref: str) -> str:

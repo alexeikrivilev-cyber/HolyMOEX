@@ -20,7 +20,11 @@ def portfolio_exposure_after_trade(
     proposed_trade_value: float | None,
     portfolio_equity: float | None,
 ) -> float:
-    return max(0.0, safe_ratio(float(current_gross_exposure or 0.0) + float(proposed_trade_value or 0.0), portfolio_equity))
+    if portfolio_equity is None or portfolio_equity <= 0:
+        return 0.0
+    current = float(current_gross_exposure or 0.0)
+    current_value = current * float(portfolio_equity) if 0.0 <= current <= 2.0 else current
+    return max(0.0, safe_ratio(current_value + float(proposed_trade_value or 0.0), portfolio_equity))
 
 
 def instrument_exposure_after_trade(

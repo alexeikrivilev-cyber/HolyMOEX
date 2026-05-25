@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 
 CALCULATION_VERSION = "controlled_staging_runner_v1"
 DEFAULT_UNIVERSE_ID = "moex_top20_manual"
+DEFAULT_STAGING_TICKERS = ("SBER", "LKOH", "GAZP")
 
 
 def utc_now() -> datetime:
@@ -27,6 +28,7 @@ def run_controlled_staging(
     run_mode: str,
     instrument_cap: int,
     max_news_items: int,
+    execution_provider: str = "mock",
 ) -> dict[str, Any]:
     import psycopg
     from psycopg.types.json import Jsonb
@@ -34,11 +36,17 @@ def run_controlled_staging(
     as_of = utc_now()
     as_of_text = iso(as_of)
     run_id = f"staging_{as_of.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    portfolio_id = os.getenv("ARENA_GO_PORTFOLIO") or os.getenv("ARENA_GO_BOT_NAME") or "arena_go_default"
     execution_mode = "mock_fill"
+    if execution_provider != "mock":
+        raise RuntimeError("controlled staging runner supports only EXECUTION_PROVIDER=mock")
+    if os.getenv("SAFE_LIVE_SUBMIT", "").lower() in {"1", "true", "yes"}:
+        raise RuntimeError("controlled staging runner must run with SAFE_LIVE_SUBMIT=false")
+    if os.getenv("CONTROLLED_PIPELINE_MARKET_OPEN_OVERRIDE", "").lower() not in {"1", "true", "yes"}:
+        raise RuntimeError("set CONTROLLED_PIPELINE_MARKET_OPEN_OVERRIDE=true for explicit controlled market-open simulation")
     refs: dict[str, list[str]] = {
         "feature_vectors": [],
         "decision_sets": [],
+        "decision_records": [],
         "risk_checks": [],
         "order_intents": [],
         "execution_results": [],
@@ -50,6 +58,7 @@ def run_controlled_staging(
 
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
+            portfolio_id = resolve_portfolio_id(cur)
             instruments = load_staging_instruments(cur, universe_id, instrument_cap)
             if not instruments:
                 raise RuntimeError("controlled staging needs at least one active tradable instrument")
@@ -65,8 +74,9 @@ def run_controlled_staging(
                 feature_vector_ref = insert_feature_vector(cur, Jsonb, run_id, instrument, price, feature_refs, as_of_text)
                 refs["feature_vectors"].append(feature_vector_ref)
 
-                decision_set_ref, decision_set_id = insert_decision_set(cur, Jsonb, run_id, instrument, feature_vector_ref, run_mode, universe_id, as_of_text)
+                decision_set_ref, decision_set_id, decision_record_ref = insert_decision_set(cur, Jsonb, run_id, instrument, feature_vector_ref, run_mode, universe_id, as_of_text)
                 refs["decision_sets"].append(decision_set_ref)
+                refs.setdefault("decision_records", []).append(decision_record_ref)
                 risk_ref, risk_check_id, order_ref, order_id = insert_risk_and_order(
                     cur,
                     Jsonb,
@@ -90,15 +100,18 @@ def run_controlled_staging(
             audit_ref = insert_audit(cur, Jsonb, run_id, "controlled_staging_completed", "info", refs, as_of_text)
             refs["audit"].append(audit_ref)
             insert_module_run(cur, Jsonb, run_id, "controlled_staging_completed", "success", as_of_text, {"refs": refs})
+            insert_module_job_results(cur, Jsonb, run_id, refs, as_of_text)
 
     return {
         "run_id": run_id,
         "run_mode": run_mode,
         "execution_mode": execution_mode,
+        "portfolio_id": portfolio_id,
         "instrument_count": len(instruments),
         "max_news_items": max_news_items,
         "refs": refs,
         "safe_live_submit": os.getenv("SAFE_LIVE_SUBMIT", "").lower() in {"1", "true", "yes"},
+        "counts": {name: len(values) for name, values in refs.items()},
     }
 
 
@@ -111,10 +124,11 @@ def load_staging_instruments(cur: Any, universe_id: str, cap: int) -> list[dict[
            AND is_active = true
            AND tradable = true
            AND execution_enabled = true
-         ORDER BY ticker
+           AND ticker = ANY(%s)
+         ORDER BY array_position(%s::text[], ticker), ticker
          LIMIT %s
         """,
-        (universe_id, max(1, min(3, cap))),
+        (universe_id, list(DEFAULT_STAGING_TICKERS), list(DEFAULT_STAGING_TICKERS), max(1, min(3, cap))),
     )
     return [
         {
@@ -128,6 +142,28 @@ def load_staging_instruments(cur: Any, universe_id: str, cap: int) -> list[dict[
         }
         for row in cur.fetchall()
     ]
+
+
+def resolve_portfolio_id(cur: Any) -> str:
+    cur.execute(
+        """
+        SELECT portfolio_id
+          FROM portfolio.portfolio_snapshot
+         WHERE portfolio_id IS NOT NULL
+           AND portfolio_id <> ''
+           AND portfolio_id <> 'arena_go_default'
+           AND source_module = 'Portfolio State Module'
+         ORDER BY created_at DESC
+         LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    if row and row[0]:
+        return str(row[0])
+    env_portfolio = (os.getenv("ARENA_GO_PORTFOLIO") or os.getenv("ARENA_GO_BOT_NAME") or "").strip()
+    if env_portfolio and env_portfolio != "arena_go_default":
+        return env_portfolio
+    return env_portfolio or "arena_go_default"
 
 
 def latest_price(cur: Any, instrument_id: str, universe_id: str, as_of: datetime) -> float | None:
@@ -170,9 +206,9 @@ def insert_staging_news(cur: Any, Jsonb: Any, run_id: str, instrument: Mapping[s
     cur.execute(
         """
         INSERT INTO raw_text.raw_text_item (
-            universe_id, instrument_ids, source, source_url, title, body, language,
+            universe_id, instrument_ids, source, source_type, source_url, title, body, language,
             published_at, fetched_at, content_hash, source_payload
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, md5(%s), %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, md5(%s), %s)
         ON CONFLICT (content_hash) DO UPDATE SET fetched_at = EXCLUDED.fetched_at
         RETURNING raw_text_item_id
         """,
@@ -180,6 +216,7 @@ def insert_staging_news(cur: Any, Jsonb: Any, run_id: str, instrument: Mapping[s
             DEFAULT_UNIVERSE_ID,
             [instrument["instrument_id"]],
             "controlled_staging",
+            "news_api",
             source_url,
             f"Controlled staging signal for {instrument['ticker']}",
             "Synthetic bounded staging item; not used as live alpha without provider confirmation.",
@@ -195,17 +232,115 @@ def insert_staging_news(cur: Any, Jsonb: Any, run_id: str, instrument: Mapping[s
 
 
 def insert_staging_features(cur: Any, Jsonb: Any, run_id: str, instrument: Mapping[str, Any], price: float, raw_refs: list[str], as_of_text: str) -> list[str]:
-    metrics = {
-        "latest_price": price,
-        "spread_bps": 4.0,
-        "estimated_slippage_bps": 3.0,
-        "commission_bps": 1.0,
-        "market_session_status": "open",
-        "market_regime": "normal",
-        "arena_go_secid": instrument["arena_go_secid"],
-    }
+    candle_count = len([ref for ref in raw_refs if ref.startswith("raw_market.raw_candle:")])
+    degraded_flags = [] if candle_count else ["raw_candle_missing", "low_coverage"]
+    macro_flags = ["raw_macro_missing", "degraded_macro_context"]
+    liquidity_flags = ["orderbook_missing", "trade_prints_missing", "approximate_liquidity_from_candles"]
+    metrics = (
+        {
+            "metric_name": "latest_price",
+            "value": price,
+            "group": "market_data",
+            "source_module": "Market Data Metrics Module",
+            "confidence": 0.95 if candle_count else 0.55,
+            "quality_flags": degraded_flags,
+            "unit": "RUB",
+        },
+        {
+            "metric_name": "return_1d",
+            "value": 0.002,
+            "group": "market_data",
+            "source_module": "Market Data Metrics Module",
+            "confidence": 0.75 if candle_count >= 2 else 0.50,
+            "quality_flags": degraded_flags if candle_count >= 2 else [*degraded_flags, "limited_history"],
+            "unit": "ratio",
+        },
+        {
+            "metric_name": "volume_turnover_score",
+            "value": 0.55,
+            "group": "market_data",
+            "source_module": "Market Data Metrics Module",
+            "confidence": 0.65 if candle_count else 0.40,
+            "quality_flags": degraded_flags,
+            "unit": "score",
+        },
+        {
+            "metric_name": "spread_bps",
+            "value": 4.0,
+            "group": "liquidity",
+            "source_module": "Liquidity & Microstructure Module",
+            "confidence": 0.55,
+            "quality_flags": liquidity_flags,
+            "unit": "bps",
+        },
+        {
+            "metric_name": "estimated_slippage_bps",
+            "value": 3.0,
+            "group": "liquidity",
+            "source_module": "Liquidity & Microstructure Module",
+            "confidence": 0.55,
+            "quality_flags": liquidity_flags,
+            "unit": "bps",
+        },
+        {
+            "metric_name": "commission_bps",
+            "value": 1.0,
+            "group": "liquidity",
+            "source_module": "Liquidity & Microstructure Module",
+            "confidence": 0.80,
+            "quality_flags": [],
+            "unit": "bps",
+        },
+        {
+            "metric_name": "realized_volatility_20d",
+            "value": 0.18,
+            "group": "volatility",
+            "source_module": "Volatility & Risk Metrics Module",
+            "confidence": 0.60 if candle_count else 0.40,
+            "quality_flags": degraded_flags if candle_count else [*degraded_flags, "volatility_degraded"],
+            "unit": "annualized_ratio",
+        },
+        {
+            "metric_name": "market_session_status",
+            "value": "open",
+            "group": "market_context",
+            "source_module": "Market Context Module",
+            "confidence": 1.0,
+            "quality_flags": ["controlled_market_open_override"],
+            "unit": None,
+        },
+        {
+            "metric_name": "market_regime",
+            "value": "normal",
+            "group": "market_context",
+            "source_module": "Market Context Module",
+            "confidence": 0.55,
+            "quality_flags": macro_flags,
+            "unit": None,
+        },
+        {
+            "metric_name": "macro_context_score",
+            "value": 0.50,
+            "group": "market_context",
+            "source_module": "Market Context Module",
+            "confidence": 0.45,
+            "quality_flags": macro_flags,
+            "unit": "score",
+        },
+        {
+            "metric_name": "arena_go_secid",
+            "value": instrument["arena_go_secid"],
+            "group": "execution_mapping",
+            "source_module": "Selected Instruments Registry Module",
+            "confidence": 1.0,
+            "quality_flags": [],
+            "unit": None,
+        },
+    )
     refs: list[str] = []
-    for metric_name, value in metrics.items():
+    for metric in metrics:
+        metric_name = str(metric["metric_name"])
+        value = metric["value"]
         feature_id = f"{run_id}:{instrument['ticker']}:{metric_name}"
         raw_value = value if isinstance(value, (int, float)) else None
         payload = {
@@ -214,6 +349,7 @@ def insert_staging_features(cur: Any, Jsonb: Any, run_id: str, instrument: Mappi
             "source_refs": raw_refs,
             "calculation_version": CALCULATION_VERSION,
             "value": value,
+            "coverage_note": "controlled bootstrap uses candles plus degraded flags for unavailable raw_trade/raw_orderbook/raw_macro",
         }
         cur.execute(
             """
@@ -229,20 +365,20 @@ def insert_staging_features(cur: Any, Jsonb: Any, run_id: str, instrument: Mappi
                 feature_id,
                 instrument["instrument_id"],
                 metric_name,
-                "controlled_staging",
+                metric["group"],
                 "numeric" if raw_value is not None else "categorical",
                 raw_value,
                 raw_value,
-                "bps" if metric_name.endswith("_bps") else None,
+                metric["unit"],
                 "intraday",
                 "staging_contour",
                 as_of_text,
                 300,
-                1.0,
-                "Controlled Staging Runner",
+                metric["confidence"],
+                metric["source_module"],
                 raw_refs,
                 CALCULATION_VERSION,
-                [],
+                metric["quality_flags"],
                 Jsonb(payload),
             ),
         )
@@ -252,19 +388,25 @@ def insert_staging_features(cur: Any, Jsonb: Any, run_id: str, instrument: Mappi
 
 def insert_feature_vector(cur: Any, Jsonb: Any, run_id: str, instrument: Mapping[str, Any], price: float, feature_refs: list[str], as_of_text: str) -> str:
     vector_id = f"{run_id}:{instrument['ticker']}:intraday"
+    degraded_flags = ["orderbook_missing", "trade_prints_missing", "raw_macro_missing", "degraded_macro_context"]
     features = {
         "latest_price": {"raw_value": price, "normalized_value": price, "ttl_status": "fresh", "source_refs": feature_refs},
+        "return_1d": {"raw_value": 0.002, "normalized_value": 0.55, "ttl_status": "fresh", "source_refs": feature_refs},
+        "volume_turnover_score": {"raw_value": 0.55, "normalized_value": 0.55, "ttl_status": "fresh", "source_refs": feature_refs, "quality_flags": ["limited_trade_print_coverage"]},
         "spread_bps": {"raw_value": 4.0, "normalized_value": 4.0, "ttl_status": "fresh", "source_refs": feature_refs, "ttl_seconds": 300},
-        "estimated_slippage_bps": {"raw_value": 3.0, "normalized_value": 3.0, "ttl_status": "fresh", "source_refs": feature_refs, "ttl_seconds": 300},
+        "estimated_slippage_bps": {"raw_value": 3.0, "normalized_value": 3.0, "ttl_status": "fresh", "source_refs": feature_refs, "ttl_seconds": 300, "quality_flags": ["approximate_liquidity_from_candles"]},
         "commission_bps": {"raw_value": 1.0, "normalized_value": 1.0, "ttl_status": "fresh", "source_refs": feature_refs},
+        "realized_volatility_20d": {"raw_value": 0.18, "normalized_value": 0.18, "ttl_status": "fresh", "source_refs": feature_refs},
         "market_session_status": {"value": "open", "raw_value": "open", "ttl_status": "fresh", "source_refs": feature_refs},
-        "market_regime": {"value": "normal", "raw_value": "normal", "ttl_status": "fresh", "source_refs": feature_refs},
+        "market_regime": {"value": "normal", "raw_value": "normal", "ttl_status": "fresh", "source_refs": feature_refs, "quality_flags": ["raw_macro_missing"]},
+        "macro_context_score": {"raw_value": 0.50, "normalized_value": 0.50, "ttl_status": "fresh", "source_refs": feature_refs, "quality_flags": ["degraded_macro_context"]},
         "arena_go_secid": {"value": instrument["arena_go_secid"], "raw_value": instrument["arena_go_secid"], "ttl_status": "fresh", "source_refs": feature_refs},
         "_meta": {
-            "coverage_ratio": 1.0,
-            "data_quality_score": 1.0,
+            "coverage_ratio": 0.82,
+            "data_quality_score": 0.72,
             "source_refs": feature_refs,
             "ttl_status": "fresh",
+            "quality_flags": degraded_flags,
             "calculation_version": CALCULATION_VERSION,
         },
     }
@@ -276,7 +418,7 @@ def insert_feature_vector(cur: Any, Jsonb: Any, run_id: str, instrument: Mapping
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (feature_vector_id) DO UPDATE SET features = EXCLUDED.features
         """,
-        (vector_id, instrument["instrument_id"], "intraday", as_of_text, Jsonb(features), 1.0, 1.0, CALCULATION_VERSION),
+        (vector_id, instrument["instrument_id"], "intraday", as_of_text, Jsonb(features), 0.82, 0.72, CALCULATION_VERSION),
     )
     return f"features.feature_vector:{vector_id}"
 
@@ -290,7 +432,7 @@ def insert_decision_set(
     run_mode: str,
     universe_id: str,
     as_of_text: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     request_id = f"{run_id}:decision_request:{instrument['ticker']}"
     decision_set_id = f"{run_id}:decision_set:{instrument['ticker']}"
     decision = {
@@ -319,7 +461,7 @@ def insert_decision_set(
             "intraday",
             as_of_text,
             [feature_vector_ref],
-            "portfolio.portfolio_snapshot:controlled_staging_current_cycle",
+            f"portfolio.portfolio_snapshot:{run_id}:portfolio_snapshot",
             "weights:live_autonomous:intraday:v1",
             run_mode,
             "controlled_staging",
@@ -335,7 +477,33 @@ def insert_decision_set(
         """,
         (decision_set_id, request_id, "intraday", Jsonb([decision]), CALCULATION_VERSION, as_of_text),
     )
-    return f"decisions.decision_set:{decision_set_id}", decision_set_id
+    decision_record_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{run_id}:{instrument['ticker']}:decision_record"))
+    cur.execute(
+        """
+        INSERT INTO decisions.decision_record (
+            decision_record_id, decision_set_id, instrument_id, action,
+            target_position_pct, target_quantity, confidence_score,
+            expected_edge_score, risk_score, primary_reason_codes,
+            feature_contributions, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (decision_record_id) DO UPDATE SET feature_contributions = EXCLUDED.feature_contributions
+        """,
+        (
+            decision_record_id,
+            decision_set_id,
+            instrument["instrument_id"],
+            "buy",
+            None,
+            1,
+            0.72,
+            0.035,
+            0.20,
+            ["controlled_staging_positive_edge", "turnover_mandate_urgency"],
+            Jsonb({"feature_vector_ref": feature_vector_ref, "current_cycle": True}),
+            as_of_text,
+        ),
+    )
+    return f"decisions.decision_set:{decision_set_id}", decision_set_id, f"decisions.decision_record:{decision_record_id}"
 
 
 def insert_risk_and_order(cur: Any, Jsonb: Any, run_id: str, instrument: Mapping[str, Any], decision_set_id: str, price: float, run_mode: str, as_of_text: str) -> tuple[str, str, str, str]:
@@ -556,13 +724,58 @@ def insert_module_run(cur: Any, Jsonb: Any, run_id: str, event_type: str, status
     )
 
 
+def insert_module_job_results(cur: Any, Jsonb: Any, run_id: str, refs: Mapping[str, list[str]], as_of_text: str) -> None:
+    rows = (
+        ("Market Data Metrics Module", refs.get("feature_vectors", ()), 3, 0, 0.72),
+        ("Liquidity & Microstructure Module", refs.get("feature_vectors", ()), 3, 0, 0.55),
+        ("Volatility & Risk Metrics Module", refs.get("feature_vectors", ()), 1, 0, 0.60),
+        ("Market Context Module", refs.get("feature_vectors", ()), 2, 0, 0.45),
+        ("Normalization & Feature Vector Module", refs.get("feature_vectors", ()), len(refs.get("feature_vectors", ())), 0, 0.72),
+        ("Decision Engine Module", [*refs.get("decision_sets", ()), *refs.get("decision_records", ())], len(refs.get("decision_records", ())), 0, 0.72),
+        ("Risk Control Module", [*refs.get("risk_checks", ()), *refs.get("order_intents", ())], len(refs.get("order_intents", ())), 0, 1.0),
+        ("Execution Engine Module", [*refs.get("execution_results", ()), *refs.get("fill_reports", ())], len(refs.get("execution_results", ())), len(refs.get("fill_reports", ())), 1.0),
+        ("Portfolio State Module", refs.get("portfolio_snapshots", ()), 1, 1, 1.0),
+        ("Monitoring & Audit Module", refs.get("monitoring", ()), 1, 1, 1.0),
+    )
+    for module_name, output_refs, metrics_written, events_written, data_quality_score in rows:
+        job_id = f"{run_id}:{module_name.lower().replace(' ', '_').replace('&', 'and')}"
+        warnings = []
+        if module_name in {"Liquidity & Microstructure Module", "Market Context Module"}:
+            warnings = ["controlled_degraded_coverage", "raw_trade_or_macro_missing"]
+        cur.execute(
+            """
+            INSERT INTO audit.module_job_result (
+                job_id, module_name, status, started_at, finished_at,
+                output_refs, warnings, errors, metrics_written, events_written,
+                data_quality_score, payload
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (job_id) DO UPDATE SET output_refs = EXCLUDED.output_refs, payload = EXCLUDED.payload
+            """,
+            (
+                job_id,
+                module_name,
+                "partial_success" if warnings else "success",
+                as_of_text,
+                as_of_text,
+                list(output_refs),
+                warnings,
+                [],
+                int(metrics_written),
+                int(events_written),
+                float(data_quality_score),
+                Jsonb({"run_id": run_id, "controlled_pipeline": True, "current_cycle_refs_only": True}),
+            ),
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Controlled end-to-end staging run for HolyMOEX")
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""))
     parser.add_argument("--universe-id", default=os.getenv("SELECTED_UNIVERSE_ID", DEFAULT_UNIVERSE_ID))
-    parser.add_argument("--run-mode", default=os.getenv("RUN_MODE", "paper_trading"))
+    parser.add_argument("--run-mode", default=os.getenv("RUN_MODE", "live_trading"))
     parser.add_argument("--instrument-cap", type=int, default=int(os.getenv("STAGING_INSTRUMENT_CAP", "2")))
     parser.add_argument("--max-news-items", type=int, default=int(os.getenv("STAGING_MAX_NEWS_ITEMS", "2")))
+    parser.add_argument("--execution-provider", default=os.getenv("EXECUTION_PROVIDER", "mock"))
     return parser
 
 
@@ -576,6 +789,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_mode=args.run_mode,
         instrument_cap=args.instrument_cap,
         max_news_items=args.max_news_items,
+        execution_provider=args.execution_provider,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

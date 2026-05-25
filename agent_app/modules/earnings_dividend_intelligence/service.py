@@ -56,6 +56,7 @@ from .repository import (
 MODULE_NAME = "Earnings & Dividend Intelligence Module"
 CALCULATION_VERSION = "earnings_dividend_intelligence_v1"
 DEFAULT_MODEL_ID = "qwen/qwen3.6-35b-a3b"
+PROHIBITED_POLZA_MODELS = {"deepseek/" + "deepseek-v4" + "-pro"}
 
 VALID_CONTOURS = {"event_contour", "daily_contour"}
 VALID_HORIZONS = {"swing", "position"}
@@ -447,7 +448,10 @@ class EarningsDividendIntelligenceService:
         self.earnings_quality_weights = dict(earnings_quality_weights or DEFAULT_EARNINGS_QUALITY_WEIGHTS)
         self.report_materiality_weights = dict(report_materiality_weights or DEFAULT_REPORT_MATERIALITY_WEIGHTS)
         self.dividend_sustainability_weights = dict(dividend_sustainability_weights or DEFAULT_DIVIDEND_SUSTAINABILITY_WEIGHTS)
-        self.model_id = model_id or os.getenv("POLZA_REASONING_MODEL") or os.getenv("POLZA_DEFAULT_MODEL") or os.getenv("POLZA_LLM_MODEL") or DEFAULT_MODEL_ID
+        self.model_id = _safe_polza_model(
+            model_id or os.getenv("POLZA_REASONING_MODEL") or os.getenv("POLZA_DEFAULT_MODEL"),
+            DEFAULT_MODEL_ID,
+        )
 
     def run(
         self,
@@ -1653,6 +1657,14 @@ class EarningsDividendIntelligenceService:
         if explicit in VALID_TASK_TYPES:
             return explicit
         text = " ".join((raw_item.source, raw_item.title or "", raw_item.body[:500] if raw_item.body else "")).lower()
+        if any(marker in text for marker in ("дивиденд", "дивиденды", "совет директоров", "собрание акционеров")):
+            return "dividend_extraction"
+        if any(marker in text for marker in ("отчет", "отчёт", "мсфо", "рсбу", "финансовые результаты", "операционные результаты", "существенный факт")):
+            return "report_extraction"
+        if any(marker in text for marker in ("дивиденд", "дивиденды", "совет директоров", "собрание акционеров")):
+            return "dividend_extraction"
+        if any(marker in text for marker in ("отчет", "отчёт", "мсфо", "рсбу", "финансовые результаты", "операционные результаты")):
+            return "report_extraction"
         if "dividend" in text or "дивиденд" in text:
             return "dividend_extraction"
         return "report_extraction"
@@ -2037,6 +2049,13 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
 def _strip_moex_prefix(value: str) -> str:
     text = str(value or "")
     return text.split(":", 1)[1] if text.startswith("moex:") else text
+
+
+def _safe_polza_model(model_id: str | None, fallback: str) -> str:
+    candidate = str(model_id or "").strip()
+    if not candidate or candidate in PROHIBITED_POLZA_MODELS:
+        return fallback
+    return candidate
 
 
 def _coerce_timestamp(value: Any, fallback: str) -> str:

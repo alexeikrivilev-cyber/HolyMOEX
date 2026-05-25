@@ -93,9 +93,14 @@ def target_quantity(
 
 
 def portfolio_concentration_risk(gross_exposure: float | None, equity: float | None) -> float:
-    if gross_exposure is None or equity is None or equity <= 0:
+    if gross_exposure is None:
         return 0.0
-    return clip(float(gross_exposure) / float(equity))
+    exposure = float(gross_exposure)
+    if 0.0 <= exposure <= 2.0:
+        return clip(exposure)
+    if equity is None or equity <= 0:
+        return 0.0
+    return clip(exposure / float(equity))
 
 
 def data_quality_penalty(data_quality_score: float | None) -> float:

@@ -6,6 +6,7 @@ from .repository import (
     InMemoryLiquidityMicrostructureRepository,
     InstrumentProfile,
     PostgresLiquidityMicrostructureRepository,
+    RawCandle,
     RawOrderBook,
     RawTrade,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "LiquidityMicrostructureInput",
     "LiquidityMicrostructureService",
     "PostgresLiquidityMicrostructureRepository",
+    "RawCandle",
     "RawOrderBook",
     "RawTrade",
 ]

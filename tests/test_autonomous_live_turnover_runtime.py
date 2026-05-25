@@ -257,10 +257,32 @@ def test_scheduler_skips_event_driven_risk_without_timer() -> None:
     assert entry is None
 
 
+def test_scheduler_supports_direct_module_only_text_schedules() -> None:
+    from agent_app.scheduler import schedule_entry_from_payload, schedule_priority
+
+    text_entry = schedule_entry_from_payload(
+        schedule_config_id="schedule:event_news:intake",
+        module_name="Event & News Intelligence Module",
+        payload={"source": "Raw Text Store", "interval_seconds": 1800, "direct_module_only": True},
+        default_run_mode="live_trading",
+    )
+    trading_entry = schedule_entry_from_payload(
+        schedule_config_id="schedule:live_autonomous:portfolio_sync:1m",
+        module_name="Portfolio State Module",
+        payload={"source": "Order Store", "interval_seconds": 60, "direct_module_only": True},
+        default_run_mode="live_trading",
+    )
+
+    assert text_entry is not None
+    assert text_entry.direct_module_only is True
+    assert trading_entry is not None
+    assert schedule_priority(trading_entry) < schedule_priority(text_entry)
+
+
 def test_scheduler_off_market_blocks_heavy_jobs_but_allows_portfolio_and_monitoring(monkeypatch) -> None:
     from agent_app.scheduler import AutonomousScheduler, ScheduleEntry, SchedulerConfig
 
-    monkeypatch.setenv("MARKET_SESSION_STATUS", "closed")
+    monkeypatch.setenv("MARKET_SESSION_STATUS_OVERRIDE", "closed")
     scheduler = AutonomousScheduler(SchedulerConfig(single_scheduler_instance=True))
     decision = ScheduleEntry(
         schedule_config_id="schedule:live_autonomous:decision:1m",
@@ -286,17 +308,60 @@ def test_scheduler_off_market_blocks_heavy_jobs_but_allows_portfolio_and_monitor
         interval_seconds=60,
         run_mode="live_trading",
     )
+    orchestration = ScheduleEntry(
+        schedule_config_id="schedule:orchestration:service",
+        module_name="Orchestration Module",
+        source="Audit Log Store",
+        payload_ref="schedule:orchestration:service",
+        interval_seconds=60,
+        run_mode="live_trading",
+    )
+    market_data = ScheduleEntry(
+        schedule_config_id="schedule:live_autonomous:market_data:1m",
+        module_name="Market Data Metrics Module",
+        source="Raw Market Data Store",
+        payload_ref="schedule:live_autonomous:market_data:1m",
+        interval_seconds=60,
+        run_mode="live_trading",
+    )
+    derivatives = ScheduleEntry(
+        schedule_config_id="schedule:derivatives_positioning:daily",
+        module_name="Derivatives & Positioning Module",
+        source="Raw Market Data Store",
+        payload_ref="schedule:derivatives_positioning:daily",
+        interval_seconds=86400,
+        run_mode="live_trading",
+    )
 
     assert scheduler.market_session_status() == "closed"
     assert scheduler.skip_reason(decision, market_status="closed", runtime_phase="off_market", db_schedule=True) == "off_market_heavy_trading_loop_blocked"
+    assert scheduler.skip_reason(market_data, market_status="closed", runtime_phase="off_market", db_schedule=True) == "off_market_scheduled_loop_blocked"
+    assert scheduler.skip_reason(derivatives, market_status="closed", runtime_phase="off_market", db_schedule=True) == "off_market_scheduled_loop_blocked"
+    assert scheduler.skip_reason(orchestration, market_status="closed", runtime_phase="off_market", db_schedule=True) == "off_market_scheduled_loop_blocked"
     assert scheduler.skip_reason(portfolio, market_status="closed", runtime_phase="off_market", db_schedule=True) == ""
     assert scheduler.skip_reason(monitoring, market_status="closed", runtime_phase="off_market", db_schedule=True) == ""
+
+
+def test_scheduler_live_runtime_overrides_legacy_paper_schedule(monkeypatch) -> None:
+    from agent_app.scheduler import schedule_entry_from_payload
+
+    monkeypatch.delenv("ALLOW_NON_LIVE_RUNTIME", raising=False)
+
+    entry = schedule_entry_from_payload(
+        schedule_config_id="schedule:market_context:global",
+        module_name="Market Context Module",
+        payload={"run_mode": "paper_trading", "frequency": "60s"},
+        default_run_mode="live_trading",
+    )
+
+    assert entry is not None
+    assert entry.run_mode == "live_trading"
 
 
 def test_scheduler_market_unknown_blocks_live_trading_jobs(monkeypatch) -> None:
     from agent_app.scheduler import AutonomousScheduler, ScheduleEntry, SchedulerConfig
 
-    monkeypatch.delenv("MARKET_SESSION_STATUS", raising=False)
+    monkeypatch.setenv("MARKET_SESSION_STATUS_OVERRIDE", "unknown")
     scheduler = AutonomousScheduler(SchedulerConfig(single_scheduler_instance=True))
     execution = ScheduleEntry(
         schedule_config_id="schedule:live_autonomous:execution:on_approved",
@@ -309,6 +374,24 @@ def test_scheduler_market_unknown_blocks_live_trading_jobs(monkeypatch) -> None:
 
     assert scheduler.market_session_status() == "unknown"
     assert scheduler.skip_reason(execution, market_status="unknown", runtime_phase="degraded", db_schedule=True) == "market_session_unknown_live_loop_blocked"
+
+
+def test_runtime_calendar_closes_weekends_and_opens_regular_session(monkeypatch) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from agent_app.runtime_calendar import current_market_session
+
+    monkeypatch.delenv("MARKET_SESSION_STATUS_OVERRIDE", raising=False)
+    sunday = current_market_session(datetime(2026, 5, 24, 12, 0, tzinfo=ZoneInfo("Europe/Moscow")))
+    monday_open = current_market_session(datetime(2026, 5, 25, 12, 0, tzinfo=ZoneInfo("Europe/Moscow")))
+    monday_after_close = current_market_session(datetime(2026, 5, 25, 19, 10, tzinfo=ZoneInfo("Europe/Moscow")))
+
+    assert sunday.market_session_status == "closed"
+    assert sunday.agent_runtime_phase == "off_market"
+    assert monday_open.market_session_status == "open"
+    assert monday_open.agent_runtime_phase == "trading_session"
+    assert monday_after_close.market_session_status == "postmarket"
 
 
 def test_raw_text_fallback_disabled_in_production_and_throttled_when_enabled(monkeypatch) -> None:
@@ -523,6 +606,125 @@ def test_data_intake_postgres_timestamp_accepts_rss_pubdate() -> None:
     assert parsed.isoformat().startswith("2026-05-24T11:06:32")
 
 
+def test_data_intake_does_not_store_polza_llm_response_as_raw_text() -> None:
+    from agent_app.contracts.unified_objects import ExternalResponse
+    from agent_app.modules.data_intake_routing.service import DataIntakeRequest, DataIntakeRoutingService
+
+    service = DataIntakeRoutingService()
+    request = DataIntakeRequest(
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        source_types=("rbc_news",),
+        discovery_mode="scheduled",
+        per_instrument_discovery=True,
+        time_range={"from_ts": "2026-05-24T09:00:00Z", "to_ts": "2026-05-24T09:05:00Z"},
+        routing_targets=("Event & News Intelligence Module",),
+    )
+    response = ExternalResponse(
+        request_id="polza_response_not_source",
+        provider="polza_ai",
+        status="success",
+        data_ref="request_logs.external_response:polza_response_not_source",
+        received_at="2026-05-24T09:01:00Z",
+        latency_ms=1,
+        data={"items": [{"source_type": "polza_ai", "title": "LLM envelope", "body": "{}"}]},
+    )
+
+    payloads, warnings = service._raw_payloads_from_external_response(response, request)
+
+    assert payloads == []
+    assert warnings == ["llm_response_not_raw_text_source:polza_response_not_source"]
+
+
+def test_data_intake_skips_polza_raw_payload_before_validation() -> None:
+    from agent_app.modules.data_intake_routing.service import DataIntakeRequest, DataIntakeRoutingService
+
+    service = DataIntakeRoutingService()
+    request = DataIntakeRequest(
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        source_types=("rbc_news",),
+        discovery_mode="scheduled",
+        per_instrument_discovery=True,
+        time_range={"from_ts": "2026-05-24T09:00:00Z", "to_ts": "2026-05-24T09:05:00Z"},
+        routing_targets=("Event & News Intelligence Module",),
+    )
+
+    payload, warnings = service._raw_payload_with_valid_source(
+        {"source_type": "polza_ai", "title": "LLM output", "body": "{}", "model_id": "qwen/qwen3.6-35b-a3b"},
+        request,
+    )
+
+    assert payload is None
+    assert warnings == ("llm_raw_text_payload_skipped:polza_ai",)
+
+
+def test_data_intake_repository_ignores_legacy_polza_raw_text_rows() -> None:
+    from agent_app.modules.data_intake_routing.repository import _raw_text_item_from_row
+
+    row = (
+        "00000000-0000-0000-0000-000000000001",
+        "moex_top20_manual",
+        ["moex:SBER"],
+        "polza_ai",
+        "polza_ai",
+        None,
+        "LLM output",
+        "{}",
+        "en",
+        None,
+        None,
+        "hash",
+        {"source_type": "polza_ai"},
+        None,
+        None,
+        None,
+        None,
+        None,
+        0.0,
+        [],
+        [],
+        [],
+    )
+
+    assert _raw_text_item_from_row(row) is None
+
+
+def test_data_intake_repository_maps_legacy_controlled_staging_rows() -> None:
+    from agent_app.modules.data_intake_routing.repository import _raw_text_item_from_row
+
+    row = (
+        "00000000-0000-0000-0000-000000000002",
+        "moex_top20_manual",
+        ["moex:SBER"],
+        "controlled_staging",
+        "controlled_staging",
+        "https://holy-moex.local/staging/test",
+        "Controlled staging signal",
+        "Synthetic bounded staging item.",
+        "en",
+        None,
+        None,
+        "hash_controlled",
+        {"source": "controlled_staging"},
+        None,
+        None,
+        None,
+        None,
+        None,
+        0.0,
+        [],
+        [],
+        [],
+    )
+
+    item = _raw_text_item_from_row(row)
+
+    assert item is not None
+    assert item.source_type == "news_api"
+    assert item.source == "controlled_staging"
+
+
 def test_data_intake_migration_allows_source_missing_endpoint_skip_reason() -> None:
     from pathlib import Path
 
@@ -651,7 +853,7 @@ def test_portfolio_sync_resolves_arena_go_portfolio_from_bots_name() -> None:
     result = service.process(
         {
             "portfolio_update_request": {
-                "portfolio_id": "ROMASHKA_misis_guap_udgu_izhgtu",
+                "portfolio_id": "arena_go_default",
                 "fill_report_refs": [],
                 "broker_snapshot_ref": "broker:seed",
                 "price_snapshot_ref": "price:seed",
@@ -666,7 +868,74 @@ def test_portfolio_sync_resolves_arena_go_portfolio_from_bots_name() -> None:
     assert ("get_positions", "ROMASHKA_misis_guap_udgu_izhgtu") in seen
     assert ("get_trades", "ROMASHKA_misis_guap_udgu_izhgtu") in seen
     assert result.portfolio_snapshot is not None
+    assert result.portfolio_snapshot.portfolio_id == "ROMASHKA_misis_guap_udgu_izhgtu"
     assert result.portfolio_snapshot.cash == 1_000_000
+
+
+def test_successful_live_broker_sync_refreshes_stale_previous_snapshot() -> None:
+    from agent_app.contracts.unified_objects import ExternalResponse
+
+    class Gateway:
+        def process(self, external_request):
+            data = {
+                "get_bots": {"bots": [{"name": "ROMASHKA_misis_guap_udgu_izhgtu", "cash_balance": 1_000_000}]},
+                "get_positions": {"positions": []},
+                "get_trades": {"trades": []},
+            }[external_request.request_type]
+            return ExternalResponse(
+                request_id=external_request.request_id,
+                provider="arena_go",
+                status="success",
+                data_ref=f"request_logs.external_response:{external_request.request_id}",
+                received_at="2026-05-24T09:00:00Z",
+                latency_ms=1,
+                data=data,
+            )
+
+    repository = InMemoryPortfolioStateRepository(
+        portfolio_snapshots=(
+            {
+                "portfolio_snapshot_id": "old_snapshot",
+                "portfolio_id": "ROMASHKA_misis_guap_udgu_izhgtu",
+                "universe_id": "moex_top20_manual",
+                "as_of_ts": "2026-05-24T08:00:00Z",
+                "initial_capital_rub": 1_000_000,
+                "cash": 1_000_000,
+                "equity": 1_000_000,
+                "gross_exposure": 0,
+                "net_exposure": 0,
+                "realized_pnl": 0,
+                "unrealized_pnl": 0,
+                "source_module": "Portfolio State Module",
+                "source_refs": (),
+                "payload": {},
+            },
+        )
+    )
+    service = PortfolioStateService(
+        repository=repository,
+        gateway=Gateway(),
+        config={"arena_go_bot_name": "ROMASHKA_misis_guap_udgu_izhgtu", "arena_go_portfolio": "ROMASHKA_misis_guap_udgu_izhgtu"},
+    )
+
+    result = service.process(
+        {
+            "portfolio_update_request": {
+                "portfolio_id": "arena_go_default",
+                "fill_report_refs": [],
+                "broker_snapshot_ref": "broker:seed",
+                "price_snapshot_ref": "price:seed",
+                "run_mode": "live_trading",
+                "as_of_ts": "2026-05-24T09:00:00Z",
+            }
+        },
+        _job(run_mode="live_trading"),
+    )
+
+    assert result.module_job_result.status == "success"
+    assert result.portfolio_snapshot is not None
+    assert result.portfolio_snapshot.payload["ttl_status"] == "fresh"
+    assert result.portfolio_snapshot.payload["portfolio_state_stale_or_inconsistent"] is False
 
 
 def test_polza_models_response_normalizes_when_models_endpoint_exists() -> None:
@@ -684,11 +953,11 @@ def test_polza_models_response_normalizes_when_models_endpoint_exists() -> None:
 
     status, data, warnings, errors = normalize_provider_response(
         request,
-        ProviderHttpResponse(status_code=200, body={"data": [{"id": "deepseek/deepseek-v4-pro"}]}),
+        ProviderHttpResponse(status_code=200, body={"data": [{"id": "qwen/qwen3.6-35b-a3b"}]}),
     )
 
     assert status == "success"
-    assert data["models"][0]["id"] == "deepseek/deepseek-v4-pro"
+    assert data["models"][0]["id"] == "qwen/qwen3.6-35b-a3b"
     assert warnings == ()
     assert errors == ()
 
@@ -700,6 +969,9 @@ def test_polza_task_model_routing_and_llm_cache_key(monkeypatch) -> None:
     monkeypatch.delenv("POLZA_LLM_MODEL", raising=False)
     assert polza_model_for_task("event_extraction") == "deepseek/deepseek-v4-flash"
     assert polza_model_for_task("report_extraction") == "qwen/qwen3.6-35b-a3b"
+    monkeypatch.setenv("POLZA_LLM_MODEL", "deepseek/" + "deepseek-v4" + "-pro")
+    monkeypatch.delenv("POLZA_DEFAULT_MODEL", raising=False)
+    assert polza_model_for_task("unknown_task") == "qwen/qwen3.6-35b-a3b"
 
     service = EventNewsIntelligenceService()
     event_input = EventNewsInput(
@@ -785,6 +1057,101 @@ def test_polza_task_model_routing_and_llm_cache_key(monkeypatch) -> None:
     assert service.create_llm_request(news, changed_prompt, job).cache_key != news_request.cache_key
 
 
+def test_russian_event_news_routing_uses_reasoning_model() -> None:
+    from agent_app.modules.event_news_intelligence.repository import RawTextItem
+    from agent_app.modules.event_news_intelligence.service import EventNewsInput, EventNewsIntelligenceService
+
+    service = EventNewsIntelligenceService()
+    event_input = EventNewsInput(
+        routing_message_refs=(),
+        raw_text_refs=("raw_text.raw_text_item:ru_report",),
+        instrument_ids=("moex:SBER",),
+        event_ontology_version="event_ontology:v1",
+        llm_prompt_version="prompt:v2",
+        market_reaction_window=("1h",),
+    )
+    item = RawTextItem(
+        raw_text_item_id="ru_report",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        source="issuer_disclosure",
+        source_type="issuer_disclosure",
+        title="Сбер опубликовал отчёт МСФО и финансовые результаты",
+        body="Совет директоров рассмотрел дивиденды и существенный факт.",
+        fetched_at="2026-05-24T09:00:00Z",
+        content_hash="hash_ru_report",
+    )
+    request = service.create_llm_request(item, event_input, _job(module_name="Event & News Intelligence Module", run_mode="live_trading"))
+
+    assert request.payload["task_type"] == "report_extraction"
+    assert request.payload["model"] == "qwen/qwen3.6-35b-a3b"
+
+
+def test_event_news_empty_items_is_valid_no_event_result() -> None:
+    from agent_app.modules.event_news_intelligence.repository import InMemoryEventNewsIntelligenceRepository
+    from agent_app.modules.event_news_intelligence.service import EventNewsIntelligenceService
+
+    raw_item = {
+        "raw_text_item_id": "no_event",
+        "universe_id": "moex_top20_manual",
+        "instrument_ids": ("moex:SBER",),
+        "source": "rbc_news",
+        "source_type": "news_api",
+        "title": "Market digest",
+        "body": "No material issuer-specific information.",
+        "fetched_at": "2026-05-24T09:00:00Z",
+        "content_hash": "hash_no_event",
+        "source_payload": {
+            "llm_output": {
+                "schema_version": "event_news:v1",
+                "model_id": "deepseek/deepseek-v4-flash",
+                "model_version": "test",
+                "task_type": "event_extraction",
+                "instrument_ids": ["moex:SBER"],
+                "items": [],
+                "confidence_score": 0.9,
+                "evidence": [],
+                "reason_codes": ["no_material_event"],
+                "warnings": ["no_event_found"],
+            }
+        },
+    }
+    repo = InMemoryEventNewsIntelligenceRepository(raw_text_items=(raw_item,))
+    service = EventNewsIntelligenceService(repository=repo)
+    job = ModuleJob(
+        job_id="job_event_no_event",
+        module_name="Event & News Intelligence Module",
+        contour="event_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T08:00:00Z", to_ts="2026-05-24T10:00:00Z"),
+        input_refs=("raw_text.raw_text_item:no_event",),
+        config_ref="",
+        run_mode="live_trading",
+        idempotency_key="idem_event_no_event",
+    )
+    result = service.process(
+        {
+            "event_news_input": {
+                "routing_message_refs": [],
+                "raw_text_refs": ["raw_text.raw_text_item:no_event"],
+                "instrument_ids": ["moex:SBER"],
+                "event_ontology_version": "event_ontology:v1",
+                "llm_prompt_version": "prompt:v2",
+                "market_reaction_window": ["1h"],
+            }
+        },
+        job,
+    )
+
+    assert result.module_job_result.status == "partial_success"
+    assert result.module_job_result.events_written == 0
+    assert "no_event_found" in result.module_job_result.warnings
+    assert {record.event_type for record in repo.audit_records} == {"llm_no_event_found"}
+
+
 def test_llm_throttle_blocks_excess_calls_without_crashing(monkeypatch) -> None:
     from agent_app.contracts.unified_objects import ExternalRequest
     from agent_app.modules.external_request_gateway.service import ExternalRequestGatewayService
@@ -805,6 +1172,100 @@ def test_llm_throttle_blocks_excess_calls_without_crashing(monkeypatch) -> None:
 
     assert service.apply_llm_throttle(request) is True
     assert service.apply_llm_throttle(request) is False
+
+
+def test_data_quality_flags_future_timestamp_as_blocking() -> None:
+    from datetime import timedelta
+
+    from agent_app.contracts.unified_objects.module_job import to_utc_iso, utc_now
+    from agent_app.modules.data_quality.repository import InMemoryDataQualityRepository
+    from agent_app.modules.data_quality.service import DataQualityService
+
+    ref = "raw_market.raw_candle:future"
+    future_ts = to_utc_iso(utc_now() + timedelta(days=1))
+    repo = InMemoryDataQualityRepository(
+        {
+            ref: {
+                "raw_candle_id": "future",
+                "instrument_id": "moex:SBER",
+                "timestamp": future_ts,
+                "source_module": "MOEX ISS",
+                "calculation_version": "raw",
+                "ttl_seconds": 300,
+            }
+        }
+    )
+    job = ModuleJob(
+        job_id="job_dq_future",
+        module_name="Data Quality Module",
+        contour="decision_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T09:00:00Z"),
+        input_refs=(ref,),
+        config_ref="",
+        run_mode="live_trading",
+        idempotency_key="idem_dq_future",
+    )
+    result = DataQualityService(repo).process(
+        {
+            "quality_check_request": {
+                "input_refs": [ref],
+                "check_level": "decision",
+                "required_freshness_seconds": 300,
+                "required_coverage_ratio": 1.0,
+                "critical_fields": ["timestamp", "source_module", "calculation_version"],
+            }
+        },
+        job,
+    )
+
+    assert result.data_quality_report.freshness_status == "invalid"
+    assert "future_timestamp" in result.data_quality_report.quality_flags
+    assert "future_timestamp_blocks_decision:1" in result.data_quality_report.blocking_errors
+
+
+def test_monitoring_missing_replay_chain_is_not_false_healthy(monkeypatch) -> None:
+    from agent_app.modules.monitoring_audit.repository import InMemoryMonitoringAuditRepository
+    from agent_app.modules.monitoring_audit.service import MonitoringAuditService
+
+    monkeypatch.setenv("MARKET_SESSION_STATUS_OVERRIDE", "open")
+    service = MonitoringAuditService(repository=InMemoryMonitoringAuditRepository())
+    job = ModuleJob(
+        job_id="job_monitoring_false_green",
+        module_name="Monitoring & Audit Module",
+        contour="monitoring_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T09:05:00Z"),
+        input_refs=(),
+        config_ref="monitoring:default",
+        run_mode="live_trading",
+        idempotency_key="idem_monitoring_false_green",
+    )
+
+    result = service.process(
+        {
+            "monitoring_event": {
+                "event_id": "event_monitoring_false_green",
+                "event_type": "system",
+                "severity": "info",
+                "source_module": "Monitoring & Audit Module",
+                "payload_ref": "audit.monitoring_record:seed",
+                "created_at": "2026-05-24T09:05:00Z",
+            }
+        },
+        job,
+    )
+
+    assert result.health_report is not None
+    assert result.health_report["system_status"] != "healthy"
+    assert "decision_replay_not_possible" in result.health_report["reason_codes"]
+    assert "current_window_decision_chain_missing" in result.health_report["reason_codes"]
 
 
 def _risk_request_job() -> ModuleJob:
@@ -830,7 +1291,16 @@ def _risk_request_job() -> ModuleJob:
     )
 
 
-def _risk_payload(edge_after_cost: float):
+def _risk_payload(
+    edge_after_cost: float,
+    future_feature: bool = False,
+    daily_turnover_mode: str | None = None,
+    current_daily_turnover: float = 0.0,
+    max_daily_turnover: float | None = None,
+    current_quantity: float = 0.0,
+    action: str = "buy",
+    target_quantity: float = 1.0,
+):
     from agent_app.modules.risk_control.repository import (
         DecisionSet,
         FeatureVector,
@@ -838,10 +1308,38 @@ def _risk_payload(edge_after_cost: float):
         InstrumentLimit,
         PortfolioLimit,
         PortfolioSnapshot,
+        PositionState,
         RiskPolicy,
     )
 
     policy_id = "live_policy"
+    policy_rules = {"market_session_status": "open", "market_regime": "normal"}
+    if daily_turnover_mode is not None:
+        policy_rules["daily_turnover_limit_mode"] = daily_turnover_mode
+        policy_rules["max_daily_turnover_hard_block_enabled"] = daily_turnover_mode != "monitor_only"
+    portfolio_limits = [
+        PortfolioLimit(policy_id, "min_expected_edge_after_cost_score", 0.01, {}),
+        PortfolioLimit(policy_id, "max_portfolio_exposure_pct", 1.0, {}),
+        PortfolioLimit(policy_id, "max_sector_exposure_pct", 1.0, {}),
+        PortfolioLimit(policy_id, "max_daily_loss_rub", 50_000, {}),
+        PortfolioLimit(policy_id, "max_drawdown_limit", 0.5, {}),
+        PortfolioLimit(policy_id, "max_allowed_slippage_bps", 20, {}),
+        PortfolioLimit(policy_id, "arena_go_daily_trade_limit", 1000, {}),
+        PortfolioLimit(policy_id, "total_risk_budget", 1.0, {}),
+        PortfolioLimit(policy_id, "used_risk_budget", 0.0, {}),
+        PortfolioLimit(policy_id, "min_data_quality_score", 0.5, {}),
+        PortfolioLimit(policy_id, "portfolio_snapshot_ttl_seconds", 300, {}),
+    ]
+    if max_daily_turnover is not None:
+        portfolio_limits.append(
+            PortfolioLimit(
+                policy_id,
+                "max_daily_turnover_rub",
+                max_daily_turnover,
+                {"limit_mode": daily_turnover_mode} if daily_turnover_mode is not None else {},
+            )
+        )
+
     repo = InMemoryRiskControlRepository(
         decision_sets=(
             DecisionSet(
@@ -851,8 +1349,8 @@ def _risk_payload(edge_after_cost: float):
                 decisions=(
                     {
                         "instrument_id": "moex:SBER",
-                        "action": "buy",
-                        "target_quantity": 1,
+                        "action": action,
+                        "target_quantity": target_quantity,
                         "expected_edge_score": 0.02,
                         "expected_edge_after_cost_score": edge_after_cost,
                         "primary_reason_codes": ["turnover_mandate_urgency"],
@@ -862,21 +1360,9 @@ def _risk_payload(edge_after_cost: float):
                 created_at="2026-05-24T09:00:00Z",
             ),
         ),
-        risk_policies=(RiskPolicy(policy_id, "live", "1", "active", ("live_trading",), {"market_session_status": "open", "market_regime": "normal"}),),
+        risk_policies=(RiskPolicy(policy_id, "live", "1", "active", ("live_trading",), policy_rules),),
         instrument_limits=(InstrumentLimit(policy_id, "moex:SBER", 1.0, 100_000, 20, {"arena_go_secid": "SBER"}),),
-        portfolio_limits=(
-            PortfolioLimit(policy_id, "min_expected_edge_after_cost_score", 0.01, {}),
-            PortfolioLimit(policy_id, "max_portfolio_exposure_pct", 1.0, {}),
-            PortfolioLimit(policy_id, "max_sector_exposure_pct", 1.0, {}),
-            PortfolioLimit(policy_id, "max_daily_loss_rub", 50_000, {}),
-            PortfolioLimit(policy_id, "max_drawdown_limit", 0.5, {}),
-            PortfolioLimit(policy_id, "max_allowed_slippage_bps", 20, {}),
-            PortfolioLimit(policy_id, "arena_go_daily_trade_limit", 1000, {}),
-            PortfolioLimit(policy_id, "total_risk_budget", 1.0, {}),
-            PortfolioLimit(policy_id, "used_risk_budget", 0.0, {}),
-            PortfolioLimit(policy_id, "min_data_quality_score", 0.5, {}),
-            PortfolioLimit(policy_id, "portfolio_snapshot_ttl_seconds", 300, {}),
-        ),
+        portfolio_limits=tuple(portfolio_limits),
         portfolio_snapshots=(
             PortfolioSnapshot(
                 "snapshot_edge",
@@ -890,9 +1376,27 @@ def _risk_payload(edge_after_cost: float):
                 0,
                 0,
                 0,
-                {"market_session_status": "open", "market_regime": "normal"},
+                {
+                    "market_session_status": "open",
+                    "market_regime": "normal",
+                    "gross_turnover_rub_1d": current_daily_turnover,
+                },
             ),
         ),
+        position_states=(
+            PositionState(
+                "position_edge",
+                "arena_go_default",
+                "moex:SBER",
+                "2026-05-24T09:00:00Z",
+                current_quantity,
+                250,
+                250,
+                current_quantity * 250,
+                0,
+                {},
+            ),
+        ) if current_quantity else (),
         feature_vectors=(
             FeatureVector(
                 "fv_edge",
@@ -900,12 +1404,20 @@ def _risk_payload(edge_after_cost: float):
                 "intraday",
                 "2026-05-24T09:00:00Z",
                 {
-                    "latest_price": {"raw_value": 250, "ttl_status": "fresh"},
+                    "latest_price": {
+                        "raw_value": 250,
+                        "ttl_status": "fresh",
+                        "quality_flags": ["future_timestamp"] if future_feature else [],
+                    },
                     "spread_bps": {"raw_value": 4, "ttl_status": "fresh"},
                     "estimated_slippage_bps": {"raw_value": 3, "ttl_status": "fresh"},
                     "market_session_status": {"value": "open", "ttl_status": "fresh"},
                     "market_regime": {"value": "normal", "ttl_status": "fresh"},
                     "arena_go_secid": {"value": "SBER", "ttl_status": "fresh"},
+                    "_meta": {
+                        "ttl_status": "invalid" if future_feature else "fresh",
+                        "quality_flags": ["future_timestamp"] if future_feature else [],
+                    },
                 },
                 1.0,
                 1.0,
@@ -953,6 +1465,70 @@ def test_turnover_behind_positive_edge_is_approved_when_risk_ok() -> None:
     assert result.order_intents[0].payload["decision_set_id"] == "decision_edge"
     assert result.order_intents[0].payload["risk_check_id"].startswith("risk_check_")
     assert result.order_intents[0].payload["run_mode"] == "live_trading"
+
+
+def test_daily_turnover_soft_limit_does_not_block_positive_edge_order() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        daily_turnover_mode="monitor_only",
+        current_daily_turnover=2_000_000,
+        max_daily_turnover=1_500_000,
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "approved"
+    assert len(result.order_intents) == 1
+    risk_payload = result.order_intents[0].payload
+    assert "max_daily_turnover_soft_warning" in result.risk_check_result.risk_flags
+    assert "max_daily_turnover_failed" not in result.risk_check_result.risk_flags
+    assert risk_payload["risk_metrics"]["daily_turnover_limit_monitor_only"] == 1.0
+
+
+def test_buy_order_uses_delta_to_target_quantity_not_full_target_each_cycle() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(edge_after_cost=0.02, current_quantity=1.0)
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "rejected"
+    assert result.order_intents == ()
+    assert "order_quantity_non_positive" in result.risk_check_result.risk_flags
+
+
+def test_risk_reducing_sell_is_not_blocked_by_positive_edge_gate() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.02,
+        current_quantity=10.0,
+        action="sell",
+        target_quantity=0.0,
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "approved"
+    assert len(result.order_intents) == 1
+    assert result.order_intents[0].side == "sell"
+    assert result.order_intents[0].quantity == 10.0
+    assert "expected_edge_after_cost_below_threshold" not in result.risk_check_result.risk_flags
+    assert "turnover_trade_without_positive_edge" not in result.risk_check_result.risk_flags
+
+
+def test_future_timestamp_feature_is_rejected_by_risk() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(edge_after_cost=0.02, future_feature=True)
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "rejected"
+    assert "future_timestamp_blocked:feature_vector" in result.risk_check_result.risk_flags
+    assert result.order_intents == ()
 
 
 def test_live_execution_requires_explicit_safe_live_submit(monkeypatch) -> None:

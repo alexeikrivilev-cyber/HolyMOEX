@@ -884,7 +884,13 @@ def _market_state_from_row(row: tuple[Any, ...]) -> MarketStateRecord:
 
 
 def _ref_tail(ref: str) -> str:
-    return str(ref).rsplit(":", 1)[-1] if ":" in str(ref) else str(ref)
+    text = str(ref)
+    if ":" not in text:
+        return text
+    prefix, value = text.split(":", 1)
+    if "." in prefix:
+        return value
+    return text
 
 
 def _optional_text(value: Any) -> str | None:

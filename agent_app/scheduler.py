@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from agent_app.main import main as run_orchestration_once
+from agent_app.runtime_calendar import agent_runtime_phase, current_market_session
 
 
 DEFAULT_AUTONOMOUS_SOURCES: tuple[str, ...] = (
@@ -68,13 +69,10 @@ LLM_HEAVY_MODULES = {
     "Fundamental & Valuation Module",
 }
 TEXT_HEAVY_SOURCES = {"Raw Text Store"}
-OFF_MARKET_ALLOWED_SOURCES = {
-    "Order Store",
-    "Request Log Store",
-    "Audit Log Store",
-    "Raw Market Data Store",
-    "Raw Macro Data Store",
-    "Selected Instruments DB",
+OFF_MARKET_ALLOWED_SOURCES: set[str] = set()
+OFF_MARKET_ALLOWED_MODULES = {
+    "Portfolio State Module",
+    "Monitoring & Audit Module",
 }
 MIN_LLM_FALLBACK_INTERVAL_SECONDS = 900.0
 
@@ -89,6 +87,7 @@ class ScheduleEntry:
     run_mode: str
     trigger_type: str = "scheduled"
     priority: str = "normal"
+    direct_module_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -278,11 +277,11 @@ class AutonomousScheduler:
         )
         argv = [
             "--trigger-type",
-            entry.trigger_type,
+            "manual" if entry.direct_module_only else entry.trigger_type,
             "--source",
             entry.source,
             "--payload-ref",
-            entry.payload_ref,
+            f"module:{entry.module_name}" if entry.direct_module_only else entry.payload_ref,
             "--system-mode",
             entry.run_mode,
             "--universe-id",
@@ -310,9 +309,12 @@ class AutonomousScheduler:
         return exit_code
 
     def market_session_status(self) -> str:
-        status = str(os.getenv("MARKET_SESSION_STATUS") or "").strip().lower()
+        status = str(os.getenv("MARKET_SESSION_STATUS_OVERRIDE") or "").strip().lower()
         if status in MARKET_SESSION_STATUSES:
             return status
+        session = current_market_session()
+        if session.market_session_status in MARKET_SESSION_STATUSES and session.market_session_status != "unknown":
+            return session.market_session_status
         database_url = os.getenv("DATABASE_URL", "")
         if database_url:
             try:
@@ -321,14 +323,20 @@ class AutonomousScheduler:
                     return db_status
             except Exception:
                 pass
+        if session.market_session_status in MARKET_SESSION_STATUSES:
+            return session.market_session_status
         return "unknown"
 
     def skip_reason(self, entry: ScheduleEntry, *, market_status: str, runtime_phase: str, db_schedule: bool) -> str:
         del runtime_phase
         if market_status != "open" and is_trading_heavy_entry(entry):
             return "off_market_heavy_trading_loop_blocked" if market_status != "unknown" else "market_session_unknown_live_loop_blocked"
-        if market_status != "open" and is_llm_heavy_entry(entry) and entry.interval_seconds < MIN_LLM_FALLBACK_INTERVAL_SECONDS:
-            return "off_market_llm_loop_throttled"
+        if market_status != "open" and is_llm_heavy_entry(entry):
+            return "off_market_text_llm_loop_blocked" if market_status != "unknown" else "market_session_unknown_text_llm_loop_blocked"
+        if production_env() and is_llm_heavy_entry(entry) and not _env_bool("ENABLE_LLM_TEXT_SCHEDULES", False):
+            return "llm_text_schedule_disabled_in_production"
+        if market_status != "open" and not is_off_market_allowed_entry(entry):
+            return "off_market_scheduled_loop_blocked" if market_status != "unknown" else "market_session_unknown_scheduled_loop_blocked"
         if not db_schedule and entry.source in TEXT_HEAVY_SOURCES and production_env():
             if not self.config.allow_llm_fallback:
                 return "raw_text_fallback_disabled_in_production"
@@ -510,7 +518,7 @@ def load_schedule_entries_from_postgres(database_url: str, *, default_run_mode: 
         )
         if entry is not None:
             entries.append(entry)
-    return tuple(entries)
+    return tuple(sorted(entries, key=schedule_priority))
 
 
 def load_market_session_status_from_postgres(database_url: str) -> str:
@@ -609,7 +617,7 @@ def schedule_entry_from_payload(
     if interval is None:
         return None
     source = schedule_source(module_name, payload)
-    run_mode = str(payload.get("run_mode") or default_run_mode)
+    run_mode = schedule_run_mode(payload, default_run_mode)
     return ScheduleEntry(
         schedule_config_id=schedule_config_id,
         module_name=module_name,
@@ -618,6 +626,7 @@ def schedule_entry_from_payload(
         interval_seconds=interval,
         run_mode=run_mode,
         trigger_type="scheduled",
+        direct_module_only=bool(payload.get("direct_module_only", False)),
     )
 
 
@@ -640,15 +649,6 @@ def fallback_module_name(source: str) -> str:
     return "Orchestration Module"
 
 
-def agent_runtime_phase(market_session_status: str) -> str:
-    status = str(market_session_status or "unknown").lower()
-    if status == "open":
-        return "trading_session"
-    if status in {"closed", "premarket", "postmarket"}:
-        return "off_market"
-    return "degraded"
-
-
 def is_trading_heavy_entry(entry: ScheduleEntry) -> bool:
     return entry.module_name in TRADING_HEAVY_MODULES or entry.schedule_config_id.startswith(
         (
@@ -661,6 +661,21 @@ def is_trading_heavy_entry(entry: ScheduleEntry) -> bool:
 
 def is_llm_heavy_entry(entry: ScheduleEntry) -> bool:
     return entry.module_name in LLM_HEAVY_MODULES or entry.source in TEXT_HEAVY_SOURCES
+
+
+def is_off_market_allowed_entry(entry: ScheduleEntry) -> bool:
+    return entry.module_name in OFF_MARKET_ALLOWED_MODULES or entry.source in OFF_MARKET_ALLOWED_SOURCES
+
+
+def schedule_run_mode(payload: Mapping[str, Any], default_run_mode: str) -> str:
+    configured = str(payload.get("run_mode") or default_run_mode)
+    if (
+        default_run_mode == "live_trading"
+        and configured != "live_trading"
+        and not _env_bool("ALLOW_NON_LIVE_RUNTIME", False)
+    ):
+        return "live_trading"
+    return configured
 
 
 def production_env() -> bool:
@@ -688,6 +703,26 @@ def schedule_interval_seconds(payload: Mapping[str, Any]) -> float | None:
     unit = match.group(2)
     multiplier = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86_400.0}[unit]
     return value * multiplier
+
+
+def schedule_priority(entry: ScheduleEntry) -> tuple[int, str]:
+    """Keep trading-critical live schedules ahead of text/LLM maintenance."""
+    priority_by_id = {
+        "schedule:live_autonomous:portfolio_sync:1m": 0,
+        "schedule:live_autonomous:market_data:1m": 1,
+        "schedule:market_data_metrics:intraday": 2,
+        "schedule:liquidity_microstructure:realtime": 3,
+        "schedule:volatility_risk:realtime": 4,
+        "schedule:live_autonomous:decision:1m": 5,
+        "schedule:live_autonomous:monitoring:1m": 6,
+    }
+    if entry.schedule_config_id in priority_by_id:
+        return (priority_by_id[entry.schedule_config_id], entry.schedule_config_id)
+    if entry.module_name in LLM_HEAVY_MODULES or entry.source in TEXT_HEAVY_SOURCES:
+        return (80, entry.schedule_config_id)
+    if entry.module_name in OFF_MARKET_ALLOWED_MODULES:
+        return (10, entry.schedule_config_id)
+    return (50, entry.schedule_config_id)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

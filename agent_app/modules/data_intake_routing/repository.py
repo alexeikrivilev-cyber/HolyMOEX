@@ -789,6 +789,10 @@ def _raw_text_item_from_row(row: Any | None) -> Any | None:
 
     source_payload = row[12] or {}
     source_type = row[3] or source_payload.get("source_type") or "unknown"
+    if source_type in {"polza_ai", "llm", "llm_completion"}:
+        return None
+    if source_type == "controlled_staging":
+        source_type = "news_api"
     if source_type == "macro_api":
         source_type = "macro_text"
     return RawTextItem(

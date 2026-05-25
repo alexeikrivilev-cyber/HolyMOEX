@@ -74,10 +74,17 @@ def partial_fill_ratio(statuses: Iterable[str]) -> float:
     return partial / submitted
 
 
-def arena_go_quantity(order_quantity: float | None, quantity_mode: str, lot_size: int | None) -> int:
+def arena_go_quantity(
+    order_quantity: float | None,
+    quantity_mode: str,
+    lot_size: int | None,
+    submit_units: str | None = None,
+) -> int:
     if order_quantity is None or order_quantity <= 0:
         return 0
-    if quantity_mode == "lots":
-        safe_lot_size = lot_size if lot_size and lot_size > 0 else 1
+    safe_lot_size = lot_size if lot_size and lot_size > 0 else 1
+    if submit_units == "lots" or quantity_mode == "lots":
         return max(0, floor(float(order_quantity) / safe_lot_size))
+    if submit_units == "shares":
+        return max(0, floor(float(order_quantity)))
     return max(0, floor(float(order_quantity)))

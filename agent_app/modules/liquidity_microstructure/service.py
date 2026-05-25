@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -45,6 +46,7 @@ from .repository import (
     InMemoryLiquidityMicrostructureRepository,
     InstrumentProfile,
     LiquidityMicrostructureRepository,
+    RawCandle,
     RawOrderBook,
     RawTrade,
 )
@@ -237,6 +239,12 @@ class LiquidityMicrostructureService:
                 from_ts=job.time_range.from_ts,
                 to_ts=job.time_range.to_ts,
             )
+            candles = self.repository.list_candles(
+                universe_id=job.universe_id,
+                instrument_ids=active_ids,
+                from_ts=job.time_range.from_ts,
+                to_ts=job.time_range.to_ts,
+            )
 
             external_requests = self.create_external_requests_for_missing_raw_data(
                 liquidity_input=liquidity_input,
@@ -264,6 +272,12 @@ class LiquidityMicrostructureService:
                     from_ts=job.time_range.from_ts,
                     to_ts=job.time_range.to_ts,
                 )
+                candles = self.repository.list_candles(
+                    universe_id=job.universe_id,
+                    instrument_ids=active_ids,
+                    from_ts=job.time_range.from_ts,
+                    to_ts=job.time_range.to_ts,
+                )
 
             feature_records, hints, compute_warnings = self.compute_outputs(
                 liquidity_input=liquidity_input,
@@ -271,6 +285,7 @@ class LiquidityMicrostructureService:
                 profiles=profiles,
                 orderbooks=orderbooks,
                 trades=trades,
+                candles=candles,
             )
             warnings.extend(compute_warnings)
             feature_refs = tuple(self.write_feature_record(record) for record in feature_records)
@@ -345,16 +360,53 @@ class LiquidityMicrostructureService:
         profiles: tuple[InstrumentProfile, ...],
         orderbooks: tuple[RawOrderBook, ...],
         trades: tuple[RawTrade, ...],
+        candles: tuple[RawCandle, ...],
     ) -> tuple[tuple[FeatureRecord, ...], tuple[ExecutionConstraintHint, ...], tuple[str, ...]]:
         feature_records: list[FeatureRecord] = []
         hints: list[ExecutionConstraintHint] = []
         warnings: list[str] = []
         snapshots_by_instrument = _group_orderbooks(orderbooks)
         trades_by_instrument = _group_trades(trades)
+        candles_by_instrument = _group_candles(candles)
 
         for profile in profiles:
             instrument_orderbooks = snapshots_by_instrument.get(profile.instrument_id, ())
             if not instrument_orderbooks:
+                fallback = self.compute_candle_liquidity_proxy(
+                    liquidity_input=liquidity_input,
+                    job=job,
+                    profile=profile,
+                    candles=candles_by_instrument.get(profile.instrument_id, ()),
+                )
+                if fallback is not None:
+                    metric_values, constraint_data, metric_warnings = fallback
+                    warnings.extend(metric_warnings)
+                    for metric_value in metric_values:
+                        feature_records.append(
+                            self.build_feature_record(
+                                profile=profile,
+                                metric_value=metric_value,
+                                contour=job.contour,
+                                timestamp=str(constraint_data["as_of_ts"]),
+                                quality_flags=tuple(metric_warnings),
+                            )
+                        )
+                    hints.append(
+                        self.build_execution_constraint_hint(
+                            profile=profile,
+                            as_of_ts=str(constraint_data["as_of_ts"]),
+                            spread_bps=constraint_data["spread_bps"],
+                            estimated_slippage_bps=constraint_data["estimated_slippage_bps"],
+                            max_suggested_order_notional=constraint_data["max_suggested_order_notional"] or 0.0,
+                            market_order_allowed=False,
+                            reason_codes=tuple(constraint_data["reason_codes"]),
+                            payload={
+                                "raw_candle_id": constraint_data["raw_candle_id"],
+                                "fallback_source": "candle_liquidity_proxy",
+                            },
+                        )
+                    )
+                    continue
                 hints.append(
                     self.build_execution_constraint_hint(
                         profile=profile,
@@ -467,6 +519,7 @@ class LiquidityMicrostructureService:
         source_refs = _context_refs(liquidity_input)
         spread_bps = compute_bid_ask_spread(latest_snapshot.best_bid, latest_snapshot.best_ask)
         self._append_metric(values, "bid_ask_spread_bps", "raw_metric", spread_bps, None, "bps", ORDERBOOK_TTL_SECONDS, source_refs)
+        self._append_metric(values, "spread_bps", "raw_metric", spread_bps, None, "bps", ORDERBOOK_TTL_SECONDS, source_refs)
 
         historical_spreads = tuple(
             spread
@@ -513,6 +566,29 @@ class LiquidityMicrostructureService:
                 source_refs,
                 payload,
             )
+        canonical_slippage = slippage_by_notional.get(1000000.0) or slippage_by_notional.get(100000.0)
+        self._append_metric(
+            values,
+            "estimated_slippage_bps",
+            "derived_metric",
+            canonical_slippage,
+            None,
+            "bps",
+            SLIPPAGE_TTL_SECONDS,
+            source_refs,
+            {"source_metric": "estimated_slippage_1m_or_100k"},
+        )
+        self._append_metric(
+            values,
+            "estimated_order_slippage_bps",
+            "derived_metric",
+            canonical_slippage,
+            None,
+            "bps",
+            SLIPPAGE_TTL_SECONDS,
+            source_refs,
+            {"source_metric": "estimated_slippage_1m_or_100k"},
+        )
 
         trade_prices = tuple(trade.price for trade in trades if trade.price is not None and trade.price > 0)
         turnover = sum(_trade_value(trade) for trade in trades)
@@ -633,6 +709,78 @@ class LiquidityMicrostructureService:
         }
         return tuple(values), constraint_data, tuple(warnings)
 
+    def compute_candle_liquidity_proxy(
+        self,
+        *,
+        liquidity_input: LiquidityMicrostructureInput,
+        job: ModuleJob,
+        profile: InstrumentProfile,
+        candles: tuple[RawCandle, ...],
+    ) -> tuple[tuple[MetricValue, ...], Mapping[str, Any], tuple[str, ...]] | None:
+        latest = _latest_liquidity_candle(candles)
+        if latest is None or latest.close_price is None or latest.close_price <= 0:
+            return None
+
+        source_refs = tuple(
+            dict.fromkeys(
+                (
+                    *_context_refs(liquidity_input),
+                    f"raw_market.raw_candle:{latest.raw_candle_id}",
+                )
+            )
+        )
+        close_price = float(latest.close_price)
+        high_price = float(latest.high_price) if latest.high_price is not None else close_price
+        low_price = float(latest.low_price) if latest.low_price is not None else close_price
+        range_bps = max(0.0, ((high_price - low_price) / close_price) * 10_000.0) if close_price > 0 else 0.0
+        turnover = _candle_turnover(latest)
+        spread_bps = _clip(max(3.0, range_bps * 0.08), 3.0, 80.0)
+        liquidity_penalty_bps = 0.0 if turnover <= 0 else min(60.0, (100_000.0 / max(turnover, 1.0)) * 10.0)
+        estimated_slippage_bps = _clip(max(spread_bps, spread_bps * 0.75 + liquidity_penalty_bps), 3.0, 120.0)
+        liquidity_risk_score = _clip(estimated_slippage_bps / 80.0, 0.0, 1.0)
+        max_suggested_notional = max(0.0, min(100_000.0, turnover * 0.02)) if turnover > 0 else 0.0
+        values: list[MetricValue] = []
+        for metric_name, value, unit in (
+            ("bid_ask_spread_bps", spread_bps, "bps"),
+            ("spread_bps", spread_bps, "bps"),
+            ("estimated_slippage_100k", estimated_slippage_bps, "bps"),
+            ("estimated_slippage_1m", min(120.0, estimated_slippage_bps * 1.5), "bps"),
+            ("estimated_slippage_bps", estimated_slippage_bps, "bps"),
+            ("estimated_order_slippage_bps", estimated_slippage_bps, "bps"),
+            ("liquidity_risk_score", liquidity_risk_score, "score"),
+        ):
+            self._append_metric(
+                values,
+                metric_name,
+                "proxy_metric" if metric_name != "liquidity_risk_score" else "composite_score",
+                value,
+                liquidity_risk_score if metric_name == "liquidity_risk_score" else None,
+                unit,
+                SLIPPAGE_TTL_SECONDS,
+                source_refs,
+                {
+                    "fallback_source": "candle_liquidity_proxy",
+                    "raw_candle_id": latest.raw_candle_id,
+                    "timeframe": latest.timeframe,
+                    "turnover_rub": turnover,
+                    "range_bps": range_bps,
+                },
+            )
+        warnings = (
+            f"missing_orderbook_using_candle_liquidity_proxy:{profile.instrument_id}",
+            f"low_trade_coverage:{profile.instrument_id}",
+        )
+        constraint_data = {
+            "as_of_ts": latest.close_ts,
+            "raw_candle_id": latest.raw_candle_id,
+            "spread_bps": spread_bps,
+            "estimated_slippage_bps": estimated_slippage_bps,
+            "max_suggested_order_notional": max_suggested_notional,
+            "market_order_allowed": False,
+            "reason_codes": ("candle_liquidity_proxy", "missing_orderbook"),
+        }
+        return tuple(values), constraint_data, warnings
+
     def build_feature_record(
         self,
         *,
@@ -731,7 +879,7 @@ class LiquidityMicrostructureService:
             if latest_orderbook is None or _orderbook_stale(latest_orderbook, job):
                 requests.append(self._instrument_orderbook_request(job, profile))
             instrument_trades = tuple(trade for trade in trades if trade.instrument_id == profile.instrument_id)
-            if not instrument_trades or _trades_stale(instrument_trades, job):
+            if _env_bool("LIQUIDITY_FETCH_RAW_TRADES", False) and (not instrument_trades or _trades_stale(instrument_trades, job)):
                 requests.append(self._instrument_trades_request(job, profile))
         return tuple(requests)
 
@@ -971,6 +1119,39 @@ def _group_trades(trades: tuple[RawTrade, ...]) -> dict[str, tuple[RawTrade, ...
     }
 
 
+def _group_candles(candles: tuple[RawCandle, ...]) -> dict[str, tuple[RawCandle, ...]]:
+    grouped: dict[str, list[RawCandle]] = {}
+    for candle in candles:
+        grouped.setdefault(candle.instrument_id, []).append(candle)
+    return {
+        instrument_id: tuple(sorted(items, key=lambda item: (_timeframe_rank(item.timeframe), item.close_ts)))
+        for instrument_id, items in grouped.items()
+    }
+
+
+def _latest_liquidity_candle(candles: tuple[RawCandle, ...]) -> RawCandle | None:
+    candidates = tuple(candle for candle in candles if candle.close_ts and candle.close_price is not None and candle.close_price > 0)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: (item.close_ts, -_timeframe_rank(item.timeframe)))[-1]
+
+
+def _timeframe_rank(timeframe: str) -> int:
+    return {"1m": 0, "5m": 1, "15m": 2, "1d": 3}.get(str(timeframe or ""), 9)
+
+
+def _candle_turnover(candle: RawCandle) -> float:
+    if candle.turnover is not None and candle.turnover > 0:
+        return float(candle.turnover)
+    if candle.volume is not None and candle.volume > 0 and candle.close_price is not None and candle.close_price > 0:
+        return float(candle.volume) * float(candle.close_price)
+    return 0.0
+
+
+def _clip(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, float(value)))
+
+
 def _latest_orderbooks(orderbooks: tuple[RawOrderBook, ...]) -> tuple[RawOrderBook, ...]:
     return tuple(items[-1] for items in _group_orderbooks(orderbooks).values() if items)
 
@@ -990,6 +1171,13 @@ def _trades_stale(trades: tuple[RawTrade, ...], job: ModuleJob) -> bool:
 def _stable_hash(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _strip_moex_prefix(value: str) -> str:

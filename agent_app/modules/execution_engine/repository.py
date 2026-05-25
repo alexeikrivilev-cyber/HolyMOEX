@@ -318,7 +318,7 @@ class InMemoryExecutionEngineRepository:
         return None
 
     def get_instrument_profile(self, instrument_id: str) -> InstrumentProfileRecord | None:
-        requested = ref_tail(instrument_id)
+        requested = instrument_id_tail(instrument_id)
         for profile in self.instrument_profiles:
             if profile.instrument_id == requested:
                 return profile
@@ -454,6 +454,7 @@ class PostgresExecutionEngineRepository:
         return _risk_check_result_from_row(row) if row else None
 
     def get_instrument_profile(self, instrument_id: str) -> InstrumentProfileRecord | None:
+        requested = instrument_id_tail(instrument_id)
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -464,7 +465,7 @@ class PostgresExecutionEngineRepository:
                       FROM registry.instrument_profile
                      WHERE instrument_id = %s
                     """,
-                    (ref_tail(instrument_id),),
+                    (requested,),
                 )
                 row = cur.fetchone()
         return _instrument_profile_from_row(row) if row else None
@@ -635,6 +636,19 @@ def stable_record_id(prefix: str, payload: Mapping[str, Any]) -> str:
 def ref_tail(ref: str | None) -> str:
     value = str(ref or "")
     return value.rsplit(":", 1)[-1] if ":" in value else value
+
+
+def instrument_id_tail(ref: str | None) -> str:
+    value = str(ref or "")
+    for prefix in (
+        "registry.instrument_profile:",
+        "registry.instrument:",
+        "instrument_profile:",
+        "instrument:",
+    ):
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+    return value
 
 
 def _order_intent_from_row(row: tuple[Any, ...]) -> OrderIntentRecord:

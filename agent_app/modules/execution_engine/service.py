@@ -11,6 +11,7 @@ from agent_app.contracts.unified_objects.module_job import (
     to_utc_iso,
     utc_now,
 )
+from agent_app.runtime_calendar import current_market_session
 
 from .gateway import GatewayUnavailableError, submit_via_gateway
 from .metrics import arena_go_quantity, avg_fill_price, fee_estimate, fill_ratio, slippage_bps, time_to_fill_ms
@@ -69,6 +70,7 @@ class ExecutionPolicy:
     fee_rate_bps: float = 0.0
     gateway_timeout_ms: int = 10_000
     arena_go_bot_name: str = ""
+    arena_go_submit_quantity_units: str = "lots"
 
     @classmethod
     def from_mapping(cls, execution_policy_id: str, payload: Mapping[str, Any] | None = None) -> "ExecutionPolicy":
@@ -83,6 +85,11 @@ class ExecutionPolicy:
             fee_rate_bps=_optional_float(payload.get("fee_rate_bps")) or 0.0,
             gateway_timeout_ms=int(payload.get("gateway_timeout_ms") or 10_000),
             arena_go_bot_name=str(payload.get("arena_go_bot_name") or ""),
+            arena_go_submit_quantity_units=str(
+                payload.get("arena_go_submit_quantity_units")
+                or os.getenv("ARENA_GO_SUBMIT_QUANTITY_UNITS")
+                or "lots"
+            ).strip().lower(),
         )
 
     @property
@@ -622,6 +629,7 @@ class ExecutionEngineService:
             order_quantity=order.quantity,
             quantity_mode=instrument_profile.arena_go_quantity_mode,
             lot_size=instrument_profile.lot_size,
+            submit_units=policy.arena_go_submit_quantity_units,
         )
         if arena_quantity <= 0:
             return self.persist_blocked_result(
@@ -664,9 +672,16 @@ class ExecutionEngineService:
         if external_response.status in {"success", "partial_success"} and data.get("success", True) is not False:
             provider_quantity = _optional_float(data.get("quantity")) or 0.0
             provider_price = _optional_float(data.get("price")) or None
-            status = self.live_success_status(provider_quantity, order.quantity)
+            provider_order_value = _optional_float(data.get("order_value"))
+            filled_quantity = self.live_filled_quantity(
+                provider_quantity=provider_quantity,
+                provider_price=provider_price,
+                provider_order_value=provider_order_value,
+                instrument_profile=instrument_profile,
+                policy=policy,
+            )
+            status = self.live_success_status(filled_quantity, order.quantity)
             broker_order_id = external_response.provider_tracking_id or _optional_text(data.get("order_id")) or external_response.request_id
-            filled_quantity = min(order.quantity, provider_quantity)
             fees = _optional_float(data.get("fees"))
             if fees is None:
                 fees = fee_estimate(filled_quantity, provider_price, policy.fee_rate_bps)
@@ -698,10 +713,17 @@ class ExecutionEngineService:
                     "external_response_ref": external_response.data_ref,
                     "provider_tracking_id": external_response.provider_tracking_id,
                     "arena_go_quantity": arena_quantity,
+                    "arena_go_submit_quantity_units": policy.arena_go_submit_quantity_units,
+                    "provider_quantity_raw": provider_quantity,
+                    "provider_order_value": provider_order_value,
+                    "filled_quantity_basis": "order_value"
+                    if provider_order_value is not None and provider_price
+                    else policy.arena_go_submit_quantity_units,
                     "portfolio_update_hint": {
                         "remaining_cash": _optional_float(data.get("remaining_cash")) or 0.0,
                         "provider_price": provider_price or 0.0,
                         "provider_quantity": provider_quantity,
+                        "filled_quantity": filled_quantity,
                     },
                     "portfolio_update_triggered": True,
                     "fill_ratio": fill_ratio(filled_quantity, order.quantity),
@@ -972,6 +994,9 @@ class ExecutionEngineService:
                 "secid": instrument_profile.arena_go_secid or "",
                 "quantity": quantity,
                 "bot": policy.bot_name,
+                "quantity_units": policy.arena_go_submit_quantity_units,
+                "order_quantity_shares": order.quantity,
+                "lot_size": instrument_profile.lot_size or 1,
             },
             cache_policy=CachePolicy(use_cache=False, max_age_seconds=0, write_cache=False),
             timeout_ms=policy.gateway_timeout_ms,
@@ -1163,6 +1188,7 @@ class ExecutionEngineService:
             _payload_text(risk_result.payload if risk_result else {}, "market_session_status"),
             _payload_text(portfolio_snapshot.payload if portfolio_snapshot else {}, "market_session_status"),
             ref_tail(request.market_session_status_ref),
+            current_market_session().market_session_status,
         ):
             if source:
                 return source.strip().lower()
@@ -1257,6 +1283,22 @@ class ExecutionEngineService:
         if provider_quantity < submitted_quantity:
             return "partially_filled"
         return "filled"
+
+    def live_filled_quantity(
+        self,
+        *,
+        provider_quantity: float,
+        provider_price: float | None,
+        provider_order_value: float | None,
+        instrument_profile: InstrumentProfileRecord,
+        policy: ExecutionPolicy,
+    ) -> float:
+        if provider_order_value is not None and provider_price is not None and provider_price > 0:
+            return max(0.0, provider_order_value / provider_price)
+        lot_size = instrument_profile.lot_size if instrument_profile.lot_size and instrument_profile.lot_size > 0 else 1
+        if policy.arena_go_submit_quantity_units == "lots":
+            return max(0.0, provider_quantity * lot_size)
+        return max(0.0, provider_quantity)
 
     def normalized_error_codes(self, errors: tuple[str, ...], response_status: str) -> tuple[str, ...]:
         normalized: list[str] = []
@@ -1407,14 +1449,17 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
-def _payload_text(payload: Mapping[str, Any], key: str) -> str | None:
-    if not isinstance(payload, Mapping):
-        return None
-    value = payload.get(key)
+def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _payload_text(payload: Mapping[str, Any], key: str) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    return _optional_text(payload.get(key))
 
 
 def _payload_bool(payload: Mapping[str, Any], key: str) -> bool:

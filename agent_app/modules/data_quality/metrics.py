@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 STANDARD_QUALITY_FLAGS = (
     "missing_data",
     "stale_data",
+    "future_timestamp",
     "duplicate_data",
     "outlier_data",
     "source_conflict",
@@ -86,6 +87,21 @@ def expired_record_count(records: Iterable[Mapping[str, Any]], now_ts: datetime)
     return count
 
 
+def future_timestamp_count(
+    records: Iterable[Mapping[str, Any]],
+    now_ts: datetime,
+    tolerance_seconds: int = 300,
+) -> int:
+    count = 0
+    for record in records:
+        timestamp = _record_timestamp(record)
+        if timestamp is None:
+            continue
+        if (timestamp - now_ts).total_seconds() > tolerance_seconds:
+            count += 1
+    return count
+
+
 def duplicate_record_count(records: Iterable[Mapping[str, Any]], refs: tuple[str, ...] = ()) -> int:
     ref_set = {ref for ref in refs if ref}
     keys: list[str] = [ref for ref in refs if ref]
@@ -149,6 +165,7 @@ def quality_flags_from_counts(
     *,
     missing_count: int,
     stale_count: int,
+    future_count: int,
     duplicate_count: int,
     outliers: int,
     conflicts: int,
@@ -160,6 +177,8 @@ def quality_flags_from_counts(
         flags.append("missing_data")
     if stale_count > 0:
         flags.append("stale_data")
+    if future_count > 0:
+        flags.append("future_timestamp")
     if duplicate_count > 0:
         flags.append("duplicate_data")
     if outliers > 0:

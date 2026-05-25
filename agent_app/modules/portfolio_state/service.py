@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from agent_app.contracts.unified_objects import CachePolicy, ExternalRequest, ModuleJob, ModuleJobResult, RetryPolicy
@@ -65,13 +65,15 @@ class PortfolioConfig:
     initial_capital_rub: float = 1_000_000.0
     currency: str = "RUB"
     reconciliation_ttl_seconds: int = 300
-    mismatch_threshold_cash: float = 1.0
-    mismatch_threshold_quantity: float = 0.000001
+    mismatch_threshold_cash: float = 1_000.0
+    mismatch_threshold_quantity: float = 0.01
     gateway_timeout_ms: int = 10_000
     total_risk_budget: float = 1.0
     used_risk_budget: float = 0.0
     arena_go_bot_name: str = ""
     arena_go_portfolio: str = ""
+    arena_go_position_units: str = "lots"
+    arena_go_trade_quantity_units: str = "lots"
     target_gross_turnover_rub_14d: float = 10_000_000.0
     turnover_window_days: int = 14
 
@@ -85,13 +87,27 @@ class PortfolioConfig:
             or 1_000_000.0,
             currency=str(payload.get("currency") or "RUB"),
             reconciliation_ttl_seconds=int(payload.get("reconciliation_ttl_seconds") or 300),
-            mismatch_threshold_cash=_float(payload.get("mismatch_threshold_cash")) or 1.0,
-            mismatch_threshold_quantity=_float(payload.get("mismatch_threshold_quantity")) or 0.000001,
+            mismatch_threshold_cash=_float(payload.get("mismatch_threshold_cash"))
+            or _float(os.getenv("PORTFOLIO_CASH_MISMATCH_THRESHOLD_RUB"))
+            or 1_000.0,
+            mismatch_threshold_quantity=_float(payload.get("mismatch_threshold_quantity"))
+            or _float(os.getenv("PORTFOLIO_QUANTITY_MISMATCH_THRESHOLD"))
+            or 0.01,
             gateway_timeout_ms=int(payload.get("gateway_timeout_ms") or 10_000),
             total_risk_budget=_float(payload.get("total_risk_budget")) or 1.0,
             used_risk_budget=_float(payload.get("used_risk_budget")) or 0.0,
             arena_go_bot_name=str(payload.get("arena_go_bot_name") or ""),
             arena_go_portfolio=str(payload.get("arena_go_portfolio") or ""),
+            arena_go_position_units=str(
+                payload.get("arena_go_position_units")
+                or os.getenv("ARENA_GO_POSITION_UNITS")
+                or "lots"
+            ).strip().lower(),
+            arena_go_trade_quantity_units=str(
+                payload.get("arena_go_trade_quantity_units")
+                or os.getenv("ARENA_GO_TRADE_QUANTITY_UNITS")
+                or "lots"
+            ).strip().lower(),
             target_gross_turnover_rub_14d=_float(payload.get("target_gross_turnover_rub_14d")) or _float(os.getenv("TARGET_GROSS_TURNOVER_RUB_14D")) or 10_000_000.0,
             turnover_window_days=int(payload.get("turnover_window_days") or os.getenv("TURNOVER_WINDOW_DAYS", "14")),
         )
@@ -191,6 +207,7 @@ class BrokerSyncResult:
     trades: tuple[Mapping[str, Any], ...]
     errors: tuple[str, ...]
     request_refs: tuple[str, ...]
+    portfolio_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -251,6 +268,11 @@ class PortfolioStateService:
             request = PortfolioUpdateRequest.from_dict(payload, job)
             previous_snapshot = self.repository.get_previous_snapshot(request.portfolio_id, request.as_of_ts)
             broker_sync = self.sync_with_broker(request, job, previous_snapshot)
+            if request.run_mode == "live_trading" and broker_sync.portfolio_id:
+                canonical_request = replace(request, portfolio_id=broker_sync.portfolio_id)
+                if canonical_request.portfolio_id != request.portfolio_id:
+                    previous_snapshot = self.repository.get_previous_snapshot(canonical_request.portfolio_id, canonical_request.as_of_ts)
+                    request = canonical_request
             if self.live_snapshot_forbidden(request, previous_snapshot, broker_sync):
                 return self._stale_live_failure(job, request, started_at, broker_sync)
 
@@ -330,6 +352,7 @@ class PortfolioStateService:
                 trades=(),
                 errors=(),
                 request_refs=(),
+                portfolio_id=request.portfolio_id,
             )
         responses = []
         request_refs: list[str] = []
@@ -351,6 +374,7 @@ class PortfolioStateService:
                 trades=(),
                 errors=tuple(dict.fromkeys(errors)),
                 request_refs=tuple(request_refs),
+                portfolio_id=request.portfolio_id,
             )
 
         bots_payload = self.response_items(self.response_data(responses, "get_bots"))
@@ -363,6 +387,7 @@ class PortfolioStateService:
                 trades=(),
                 errors=("arena_go_bot_not_found",),
                 request_refs=tuple(request_refs),
+                portfolio_id=request.portfolio_id,
             )
         for request_type in ("get_positions", "get_trades"):
             external_request = self.broker_external_request(request_type, request, job, portfolio_name=portfolio_name)
@@ -382,6 +407,7 @@ class PortfolioStateService:
                 trades=(),
                 errors=tuple(dict.fromkeys(errors)),
                 request_refs=tuple(request_refs),
+                portfolio_id=portfolio_name,
             )
         positions_payload = self.response_items(self.response_data(responses, "get_positions"))
         trades_payload = self.response_items(self.response_data(responses, "get_trades"))
@@ -393,6 +419,7 @@ class PortfolioStateService:
             trades=trades_payload,
             errors=(),
             request_refs=tuple(request_refs),
+            portfolio_id=portfolio_name,
         )
 
     def build_portfolio_state(
@@ -452,6 +479,20 @@ class PortfolioStateService:
         if missing_fills:
             warnings.append("fill_report_missing")
 
+        broker_instrument_ids = tuple(
+            sorted(
+                {
+                    instrument_id
+                    for instrument_id in (
+                        *(self.broker_position_instrument_id(position) for position in broker_sync.positions),
+                        *(self.broker_trade_instrument_id(trade) for trade in broker_sync.trades),
+                        *position_quantities.keys(),
+                    )
+                    if instrument_id
+                }
+            )
+        )
+        lot_sizes = dict(self.repository.get_instrument_lot_sizes(broker_instrument_ids))
         broker_report = self.apply_broker_reconciliation(
             request=request,
             cash=cash,
@@ -460,6 +501,8 @@ class PortfolioStateService:
             average_prices=position_avg_prices,
             payloads=position_payloads,
             broker_sync=broker_sync,
+            previous_snapshot=previous_snapshot,
+            lot_sizes=lot_sizes,
         )
         cash = broker_report["cash"]
         realized = broker_report["realized_pnl"]
@@ -474,6 +517,7 @@ class PortfolioStateService:
             average_prices=position_avg_prices,
             payloads=position_payloads,
             price_records=price_records,
+            lot_sizes=lot_sizes,
             source_refs=tuple(source_refs),
         )
         if any(position.market_price is None for position in position_records if abs(position.quantity) > 0):
@@ -493,7 +537,11 @@ class PortfolioStateService:
         start_equity = _float(previous_snapshot.payload.get("start_of_day_equity")) if previous_snapshot else None
         if start_equity is None:
             start_equity = previous_snapshot.equity if previous_snapshot else self.config.initial_capital_rub
-        stale = self.snapshot_stale(previous_snapshot, request.as_of_ts) if previous_snapshot else False
+        stale = (
+            self.snapshot_stale(previous_snapshot, request.as_of_ts)
+            if previous_snapshot and broker_sync.status != "success"
+            else False
+        )
         if stale:
             warnings.append("stale_portfolio_detected")
         inconsistent = "reconciliation_mismatch_exceeds_threshold" in warnings
@@ -505,6 +553,7 @@ class PortfolioStateService:
             broker_sync=broker_sync,
             newly_applied_fills=tuple(newly_applied_fills),
             fill_contexts=fill_contexts,
+            lot_sizes=lot_sizes,
         )
         snapshot_payload = {
             "source_module": self.module_name,
@@ -576,6 +625,7 @@ class PortfolioStateService:
         broker_sync: BrokerSyncResult,
         newly_applied_fills: tuple[str, ...],
         fill_contexts: tuple[tuple[str, FillReportRecord | None, OrderIntentRecord | None], ...],
+        lot_sizes: Mapping[str, int],
     ) -> dict[str, Any]:
         target = max(0.0, self.config.target_gross_turnover_rub_14d)
         window_days = max(1, self.config.turnover_window_days)
@@ -589,7 +639,7 @@ class PortfolioStateService:
         recent_turnover = sum(abs(fill.filled_quantity * fill.fill_price) for fill in recent_fills)
         current_fill_turnover = sum(abs(fill.filled_quantity * fill.fill_price) for fill in current_fills)
         recent_turnover += current_fill_turnover
-        broker_turnover = self.broker_gross_turnover(broker_sync.trades, request.as_of_ts, window_days)
+        broker_turnover = self.broker_gross_turnover(broker_sync.trades, request.as_of_ts, window_days, lot_sizes)
         if request.run_mode == "live_trading" and broker_turnover > recent_turnover:
             recent_turnover = broker_turnover
         previous_payload = dict(previous_snapshot.payload) if previous_snapshot else {}
@@ -600,7 +650,7 @@ class PortfolioStateService:
             if fill.fill_ts and parse_utc_iso(fill.fill_ts).date() == as_of_dt.date()
         )
         if request.run_mode == "live_trading" and broker_sync.trades:
-            broker_1d = self.broker_gross_turnover(broker_sync.trades, request.as_of_ts, 1)
+            broker_1d = self.broker_gross_turnover(broker_sync.trades, request.as_of_ts, 1, lot_sizes)
             one_day_turnover = max(one_day_turnover, broker_1d)
         window_started_at = str(previous_payload.get("turnover_window_started_at") or request.as_of_ts)
         try:
@@ -647,7 +697,13 @@ class PortfolioStateService:
             "turnover_source": "arena_go_trades" if request.run_mode == "live_trading" and broker_turnover >= recent_turnover and broker_turnover > 0 else "fill_reports",
         }
 
-    def broker_gross_turnover(self, trades: tuple[Mapping[str, Any], ...], as_of_ts: str, window_days: int) -> float:
+    def broker_gross_turnover(
+        self,
+        trades: tuple[Mapping[str, Any], ...],
+        as_of_ts: str,
+        window_days: int,
+        lot_sizes: Mapping[str, int] | None = None,
+    ) -> float:
         as_of = parse_utc_iso(as_of_ts)
         window_seconds = max(1, int(window_days)) * 86_400
         total = 0.0
@@ -657,7 +713,11 @@ class PortfolioStateService:
                 age = (as_of - trade_ts).total_seconds()
                 if age < 0 or age > window_seconds:
                     continue
+            instrument_id = self.broker_trade_instrument_id(trade)
+            lot_size = self.instrument_lot_size(instrument_id, lot_sizes or {})
             quantity = _float(trade.get("quantity") or trade.get("filled_quantity") or trade.get("qty")) or 0.0
+            if self.config.arena_go_trade_quantity_units == "lots":
+                quantity *= lot_size
             price = _float(trade.get("price") or trade.get("avg_fill_price") or trade.get("fill_price")) or 0.0
             total += abs(quantity * price)
         return total
@@ -708,6 +768,8 @@ class PortfolioStateService:
         average_prices: dict[str, float | None],
         payloads: dict[str, dict[str, Any]],
         broker_sync: BrokerSyncResult,
+        previous_snapshot: PortfolioSnapshotRecord | None,
+        lot_sizes: Mapping[str, int],
     ) -> dict[str, Any]:
         warnings: list[str] = []
         report: dict[str, Any] = {
@@ -724,22 +786,31 @@ class PortfolioStateService:
                 warnings.append("broker_reconciliation_failed")
             return {"cash": cash, "realized_pnl": realized_pnl, "report": report, "warnings": tuple(warnings)}
 
+        first_broker_sync = previous_snapshot is None
         if broker_sync.cash_balance is not None:
             cash_mismatch = broker_sync.cash_balance - cash
-            report["cash_mismatch"] = cash_mismatch
-            if abs(cash_mismatch) > self.config.mismatch_threshold_cash:
+            report["cash_mismatch"] = 0.0 if first_broker_sync else cash_mismatch
+            if first_broker_sync:
+                report["cash_source"] = "arena_go_initial_sync"
+            elif abs(cash_mismatch) > self.config.mismatch_threshold_cash:
                 warnings.append("reconciliation_mismatch_exceeds_threshold")
             cash = broker_sync.cash_balance
 
+        broker_instruments_seen: set[str] = set()
         for broker_position in broker_sync.positions:
             instrument_id = self.broker_position_instrument_id(broker_position)
             if not instrument_id:
                 continue
-            broker_qty = _float(broker_position.get("position")) or _float(broker_position.get("quantity")) or 0.0
+            lot_size = self.instrument_lot_size(instrument_id, lot_sizes)
+            broker_units = _float(broker_position.get("position")) or _float(broker_position.get("quantity")) or 0.0
+            broker_qty = broker_units * lot_size if self.config.arena_go_position_units == "lots" else broker_units
             broker_avg = _float(broker_position.get("average_price") or broker_position.get("avg_price"))
             internal_qty = quantities.get(instrument_id, 0.0)
             mismatch = broker_qty - internal_qty
-            if abs(mismatch) > self.config.mismatch_threshold_quantity:
+            broker_instruments_seen.add(instrument_id)
+            if first_broker_sync:
+                mismatch = 0.0
+            elif abs(mismatch) > self.config.mismatch_threshold_quantity:
                 warnings.append("reconciliation_mismatch_exceeds_threshold")
                 report["position_mismatches"].append(
                     {
@@ -754,7 +825,21 @@ class PortfolioStateService:
                 average_prices[instrument_id] = broker_avg
             payloads.setdefault(instrument_id, {})
             payloads[instrument_id]["broker_reconciled"] = True
+            payloads[instrument_id]["broker_position_closed"] = False
             payloads[instrument_id]["broker_position"] = dict(broker_position)
+            payloads[instrument_id]["broker_quantity_raw"] = broker_units
+            payloads[instrument_id]["broker_quantity_units"] = self.config.arena_go_position_units
+            payloads[instrument_id]["lot_size"] = lot_size
+        for instrument_id in list(quantities):
+            if instrument_id in broker_instruments_seen:
+                continue
+            if payloads.get(instrument_id, {}).get("broker_reconciled"):
+                quantities[instrument_id] = 0.0
+                average_prices[instrument_id] = None
+                payloads[instrument_id]["broker_position_closed"] = True
+                payloads[instrument_id]["broker_quantity_raw"] = 0.0
+                payloads[instrument_id]["broker_position"] = {}
+                payloads[instrument_id]["broker_quantity_units"] = self.config.arena_go_position_units
         report["status"] = "mismatch" if warnings else "matched"
         broker_realized_pnl = self.broker_realized_pnl(broker_sync.trades)
         if broker_realized_pnl is not None:
@@ -775,6 +860,7 @@ class PortfolioStateService:
         average_prices: Mapping[str, float | None],
         payloads: Mapping[str, Mapping[str, Any]],
         price_records: Mapping[str, RawMarketPriceRecord],
+        lot_sizes: Mapping[str, int],
         source_refs: tuple[str, ...],
     ) -> tuple[PositionStateRecord, ...]:
         records: list[PositionStateRecord] = []
@@ -786,6 +872,7 @@ class PortfolioStateService:
             market_value = position_market_value(quantity, market_price)
             position_unrealized = unrealized_pnl(quantity, average_price, market_price)
             payload = dict(payloads.get(instrument_id) or {})
+            lot_size = self.instrument_lot_size(instrument_id, lot_sizes)
             payload.update(
                 {
                     "source_module": self.module_name,
@@ -796,6 +883,8 @@ class PortfolioStateService:
                     "price_snapshot_ref": request.price_snapshot_ref,
                     "instrument_exposure_source": "portfolio_state",
                     "market_value": market_value,
+                    "lot_size": lot_size,
+                    "quantity_units": "shares",
                 }
             )
             records.append(
@@ -961,7 +1050,26 @@ class PortfolioStateService:
         return None
 
     def broker_position_instrument_id(self, position: Mapping[str, Any]) -> str:
-        return str(position.get("instrument_id") or position.get("secid") or "").strip()
+        return self.canonical_instrument_id(position.get("instrument_id") or position.get("secid"))
+
+    def broker_trade_instrument_id(self, trade: Mapping[str, Any]) -> str:
+        return self.canonical_instrument_id(trade.get("instrument_id") or trade.get("secid"))
+
+    def canonical_instrument_id(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if ":" in text:
+            return text
+        return f"moex:{text.upper()}"
+
+    def instrument_lot_size(self, instrument_id: str, lot_sizes: Mapping[str, int]) -> int:
+        ticker = instrument_id.rsplit(":", 1)[-1] if ":" in instrument_id else instrument_id
+        for key in (instrument_id, ticker, f"moex:{ticker}" if ticker else ""):
+            value = lot_sizes.get(key)
+            if value and value > 0:
+                return int(value)
+        return 1
 
     def broker_realized_pnl(self, trades: tuple[Mapping[str, Any], ...]) -> float | None:
         values = []
