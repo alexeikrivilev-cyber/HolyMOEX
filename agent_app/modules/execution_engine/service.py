@@ -405,6 +405,24 @@ class ExecutionEngineService:
             errors.append("order_quantity_invalid")
         if order.side not in {"buy", "sell"}:
             errors.append("order_side_invalid")
+        position_effect = str((order.payload or {}).get("position_effect") or "").strip()
+        valid_position_effects = {
+            "open_long",
+            "increase_long",
+            "reduce_long",
+            "close_long",
+            "open_short",
+            "increase_short",
+            "reduce_short",
+            "close_short",
+        }
+        if request.run_mode == "live_trading" and position_effect not in valid_position_effects:
+            errors.append("position_effect_missing")
+        expected_side = self.side_for_position_effect(position_effect)
+        if expected_side is not None and expected_side != order.side:
+            errors.append("position_effect_side_mismatch")
+        if position_effect in {"open_short", "increase_short"} and not _env_bool("ARENA_GO_SHORTS_ALLOWED", False):
+            errors.append("short_selling_not_supported")
         if risk_result is None:
             errors.append("risk_check_result_missing")
         elif risk_result.status not in APPROVED_RISK_STATUSES:
@@ -997,12 +1015,20 @@ class ExecutionEngineService:
                 "quantity_units": policy.arena_go_submit_quantity_units,
                 "order_quantity_shares": order.quantity,
                 "lot_size": instrument_profile.lot_size or 1,
+                "position_effect": (order.payload or {}).get("position_effect"),
             },
             cache_policy=CachePolicy(use_cache=False, max_age_seconds=0, write_cache=False),
             timeout_ms=policy.gateway_timeout_ms,
             retry_policy=RetryPolicy(max_retries=0, backoff_ms=0),
             idempotency_key=f"{request.idempotency_key}:{order.order_intent_id}",
         )
+
+    def side_for_position_effect(self, position_effect: str) -> str | None:
+        if position_effect in {"open_long", "increase_long", "reduce_short", "close_short"}:
+            return "buy"
+        if position_effect in {"reduce_long", "close_long", "open_short", "increase_short"}:
+            return "sell"
+        return None
 
     def execution_result(
         self,
@@ -1466,11 +1492,22 @@ def _payload_bool(payload: Mapping[str, Any], key: str) -> bool:
     if not isinstance(payload, Mapping):
         return False
     value = payload.get(key)
+    return _coerce_bool(value)
+
+
+def _coerce_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return _coerce_bool(value)
 
 
 def _nested_mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:

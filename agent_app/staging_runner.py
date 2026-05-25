@@ -499,7 +499,17 @@ def insert_decision_set(
             0.035,
             0.20,
             ["controlled_staging_positive_edge", "turnover_mandate_urgency"],
-            Jsonb({"feature_vector_ref": feature_vector_ref, "current_cycle": True}),
+            Jsonb(
+                {
+                    "feature_vector_ref": feature_vector_ref,
+                    "gross_expected_edge_score": 0.035,
+                    "expected_edge_after_cost_score": 0.025,
+                    "execution_cost_estimate_bps": 10.0,
+                    "edge_to_cost_ratio": 35.0,
+                    "position_effect": "open_long",
+                    "current_cycle": True,
+                }
+            ),
             as_of_text,
         ),
     )
@@ -533,7 +543,14 @@ def insert_risk_and_order(cur: Any, Jsonb: Any, run_id: str, instrument: Mapping
             risk_check_id,
             run_mode,
             as_of_text,
-            Jsonb({"run_id": run_id, "expected_edge_after_cost_score": 0.025, "current_cycle": True}),
+            Jsonb(
+                {
+                    "run_id": run_id,
+                    "expected_edge_after_cost_score": 0.025,
+                    "position_effect": "open_long",
+                    "current_cycle": True,
+                }
+            ),
         ),
     )
     cur.execute(
@@ -558,6 +575,7 @@ def insert_risk_and_order(cur: Any, Jsonb: Any, run_id: str, instrument: Mapping
                     "run_id": run_id,
                     "expected_edge_after_cost_score": 0.025,
                     "post_cost_edge_gate": "passed",
+                    "position_effect": "open_long",
                     "current_cycle_order_intents_only": True,
                 }
             ),

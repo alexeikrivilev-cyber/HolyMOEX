@@ -216,6 +216,15 @@ The execution input may contain an empty `order_intent_refs` list. This means th
 
 Execution remains a pure executor: it does not create turnover, does not decide direction, and does not bypass `Risk Control Module`.
 
+`position_effect` is mandatory for live execution. Execution maps it mechanically:
+
+- `open_long` / `increase_long` -> ArenaGo `direction=B`
+- `reduce_long` / `close_long` -> ArenaGo `direction=S`
+- `open_short` / `increase_short` -> ArenaGo `direction=S`
+- `reduce_short` / `close_short` -> ArenaGo `direction=B`
+
+If `open_short` / `increase_short` arrives while `ARENA_GO_SHORTS_ALLOWED=false`, Execution blocks before broker submit with `short_selling_not_supported`. Quantity stays the Risk-approved share quantity internally; the ArenaGo request uses the configured provider submit units.
+
 ## Runtime hardening note v6
 
 Live ArenaGo sandbox `submit_order` is blocked unless `SAFE_LIVE_SUBMIT=true`, `ARENA_GO_SANDBOX=true`, and startup readiness exported `LIVE_READINESS_PASSED=true`. These gates are in addition to portfolio freshness, market session, valid instrument mapping, risk approval, kill switches, stale-order protection and current-cycle `order_intent_refs`.

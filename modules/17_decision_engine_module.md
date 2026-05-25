@@ -187,4 +187,15 @@ Hard blocking remains valid for missing feature vectors, insufficient coverage, 
 
 ## Post-cost turnover note v5
 
-For autonomous live turnover, the module must emit `expected_edge_after_cost_score` and `execution_cost_estimate_bps` in the `decision_set.decisions` payload. The estimate is derived from the scored edge minus a cost proxy from spread, slippage and commission features when no explicit post-cost alpha model output is available. This lets `Risk Control Module` distinguish profitable active trading from churn.
+For autonomous live turnover, the module must emit both gross/pre-cost edge and signed post-cost economics in the `decision_set.decisions` payload: `gross_expected_edge_score`, `expected_edge_after_cost_score`, `execution_cost_estimate_bps`, `commission_bps`, `edge_to_cost_ratio` and `position_effect`. Action selection is net-edge-first: new `buy`/`sell` candidates are ranked on post-cost edge, and turnover urgency cannot turn a below-threshold post-cost signal into a trade. `Risk Control Module` remains the hard gate, but Decision should avoid cost-blind candidates.
+
+Position semantics are explicit:
+
+- `open_long`, `increase_long`: buy to create/add long exposure.
+- `reduce_long`, `close_long`: sell existing long exposure.
+- `open_short`, `increase_short`: sell to create/add short exposure when `DECISION_ALLOW_SHORT_SELLING=true` and provider capability is enabled.
+- `reduce_short`, `close_short`: buy to cover existing short exposure.
+
+Existing long positions use a post-cost exit overlay. Stop-loss is a hard reduce/close proposal. If profit exceeds `DECISION_TAKE_PROFIT_PCT` and post-cost continuation edge weakens, Decision may propose partial take-profit via `DECISION_PARTIAL_TAKE_PROFIT_RATIO`; if continuation edge remains strong it can hold and let the trend continue. A profitable long with non-positive post-cost edge should not be held only because old pre-cost edge was positive.
+
+Short positions use the same side-aware policy: profitable shorts can be partially covered when negative post-cost edge weakens, losing shorts are reduced/covered at `DECISION_SHORT_STOP_LOSS_PCT`, and new shorts require explicit negative post-cost edge below `DECISION_SHORT_ENTRY_THRESHOLD`.

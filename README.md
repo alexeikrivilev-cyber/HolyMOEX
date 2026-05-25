@@ -708,6 +708,18 @@ ARENA_GO_BOT_NAME=
 ARENA_GO_DAILY_TRADE_LIMIT=1000
 SAFE_LIVE_SUBMIT=false
 LIVE_READINESS_PASSED=false
+ARENA_GO_SHORTS_ALLOWED=true
+DECISION_ALLOW_SHORT_SELLING=true
+DECISION_USE_POST_COST_EDGE_FOR_ACTIONS=true
+DECISION_PARTIAL_TAKE_PROFIT_ENABLED=true
+DECISION_PARTIAL_TAKE_PROFIT_RATIO=0.5
+DECISION_PROFIT_LOCK_ENABLED=true
+DECISION_EXIT_USE_POST_COST_EDGE=true
+DECISION_SHORT_ENTRY_THRESHOLD=0.05
+DECISION_SHORT_USE_POST_COST_EDGE=true
+DECISION_ALLOW_LONG_TO_SHORT_FLIP=false
+DECISION_SHORT_PARTIAL_TAKE_PROFIT_RATIO=0.5
+DECISION_SHORT_PROFIT_LOCK_ENABLED=true
 POLZA_BASE_URL=https://polza.ai/api/v1
 POLZA_API_KEY=replace_with_real_key
 POLZA_FAST_MODEL=deepseek/deepseek-v4-flash
@@ -1236,6 +1248,34 @@ expected_edge_after_cost_score > min_expected_edge_after_cost_score
 ```
 
 особенно для решений с `turnover_mandate_urgency`.
+
+### Strategy quality hardening v2
+
+Decision now carries both gross/pre-cost edge and signed post-cost economics:
+
+```text
+gross_expected_edge_score
+expected_edge_after_cost_score
+execution_cost_estimate_bps
+commission_bps
+edge_to_cost_ratio
+position_effect
+```
+
+Action selection is net-edge-first: new long candidates require positive post-cost edge, and new short candidates require negative post-cost edge. Turnover urgency can prioritize candidates but cannot turn below-threshold economics into a trade.
+
+`position_effect` removes ambiguous `sell` semantics:
+
+```text
+open_long / increase_long
+reduce_long / close_long
+open_short / increase_short
+reduce_short / close_short
+```
+
+Existing profitable long positions may be partially reduced after `DECISION_TAKE_PROFIT_PCT` when post-cost continuation edge weakens. If continuation edge remains strong, the agent may keep part of the position. Stop-loss and non-positive post-cost edge can still trigger reduce/close.
+
+Short selling is explicit capability, not an accidental `sell`. New/increased shorts require `DECISION_ALLOW_SHORT_SELLING=true`, `ARENA_GO_SHORTS_ALLOWED=true`, negative post-cost edge below `DECISION_SHORT_ENTRY_THRESHOLD`, and Risk Control approval. If shorts are disabled or provider capability is not confirmed, `open_short` / `increase_short` is rejected before execution with `short_selling_not_supported`; buy-to-cover is risk-reducing, not a new long.
 
 ## 39. Predfinal integration requirement
 

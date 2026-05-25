@@ -582,6 +582,13 @@ class RiskControlService:
             cycle_counters["new_short"] = cycle_counters.get("new_short", 0) + 1
 
     def order_risk_direction(self, order: OrderIntentRecord, position: PositionState | None) -> str:
+        position_effect = str((order.payload or {}).get("position_effect") or "")
+        if position_effect in {"reduce_long", "close_long", "reduce_short", "close_short"}:
+            return "risk_reducing"
+        if position_effect in {"open_short", "increase_short"}:
+            return "new_short"
+        if position_effect in {"open_long", "increase_long"}:
+            return "new_long"
         current_quantity = float(position.quantity) if position else 0.0
         quantity = float(order.quantity or 0.0)
         if order.side == "buy":
@@ -602,6 +609,81 @@ class RiskControlService:
         if action in {"reduce", "close"}:
             return "buy" if float(current_quantity or 0.0) < 0 else "sell"
         return "sell"
+
+    def position_effect_for_order(
+        self,
+        *,
+        action: str,
+        side: str,
+        current_quantity: float,
+        requested_quantity: float,
+    ) -> str:
+        current = float(current_quantity or 0.0)
+        requested = max(0.0, float(requested_quantity or 0.0))
+        if side == "buy":
+            if current < 0:
+                return "close_short" if requested >= abs(current) else "reduce_short"
+            return "increase_long" if current > 0 else "open_long"
+        if side == "sell":
+            if current > 0:
+                return "close_long" if requested >= current else "reduce_long"
+            return "increase_short" if current < 0 else "open_short"
+        return "unknown"
+
+    def arena_go_shorts_allowed(self, risk_policy: RiskPolicy | None) -> bool:
+        if risk_policy is not None:
+            for key in ("arena_go_shorts_allowed", "short_selling_supported", "short_selling_enabled"):
+                configured = _rule_value(risk_policy.rules, key)
+                if configured is not None:
+                    return _coerce_bool(configured)
+        return _env_bool("ARENA_GO_SHORTS_ALLOWED", False)
+
+    def short_selling_allowed(self, risk_policy: RiskPolicy | None) -> bool:
+        decision_allowed = _env_bool("DECISION_ALLOW_SHORT_SELLING", True)
+        if risk_policy is not None:
+            configured = _rule_value(risk_policy.rules, "decision_allow_short_selling")
+            if configured is not None:
+                decision_allowed = _coerce_bool(configured)
+        return bool(decision_allowed and self.arena_go_shorts_allowed(risk_policy))
+
+    def short_limit_value(
+        self,
+        portfolio_limits: tuple[PortfolioLimit, ...],
+        risk_policy: RiskPolicy | None,
+        name: str,
+        env_name: str,
+    ) -> float | None:
+        configured = self.portfolio_limit_value(portfolio_limits, risk_policy, name)
+        if configured is not None:
+            return configured
+        raw = os.getenv(env_name)
+        if raw not in (None, ""):
+            try:
+                return float(raw)
+            except ValueError:
+                return None
+        defaults = {
+            "max_short_position_pct": 0.05,
+            "max_total_short_exposure_pct": 0.20,
+            "max_single_short_order_value_rub": 75_000.0,
+        }
+        return defaults.get(name)
+
+    def projected_short_exposure_rub(
+        self,
+        *,
+        current_value: float,
+        signed_trade_value: float,
+        portfolio_snapshot: PortfolioSnapshot,
+    ) -> float:
+        current_short = abs(float(current_value or 0.0)) if current_value < 0 else 0.0
+        projected_instrument_value = float(current_value or 0.0) + float(signed_trade_value or 0.0)
+        projected_short = abs(projected_instrument_value) if projected_instrument_value < 0 else 0.0
+        existing_short = _payload_float(portfolio_snapshot.payload, "current_short_exposure_rub")
+        if existing_short is None:
+            existing_short = _payload_float(portfolio_snapshot.payload, "short_exposure_rub")
+        existing_short = max(0.0, float(existing_short or 0.0))
+        return max(0.0, existing_short - current_short + projected_short)
 
     def cycle_limit_value(
         self,
@@ -855,6 +937,15 @@ class RiskControlService:
             )
 
         side = self.order_side_for_action(action, current_quantity)
+        position_effect = self.position_effect_for_order(
+            action=action,
+            side=side,
+            current_quantity=current_quantity,
+            requested_quantity=requested_quantity,
+        )
+        decision_position_effect = str(decision.get("position_effect") or "").strip()
+        if decision_position_effect and decision_position_effect != position_effect:
+            flags.append("decision_position_effect_recomputed")
         proposed_trade_value = requested_quantity * price
         available_cash = self.available_cash(portfolio_snapshot)
         min_expected_edge = self.portfolio_limit_value(portfolio_limits, risk_policy, "min_expected_edge_after_cost_score")
@@ -862,14 +953,26 @@ class RiskControlService:
         expected_edge_after_cost = self.expected_edge_after_cost_score(decision, feature_vector)
         metrics["expected_edge_score"] = expected_edge
         metrics["expected_edge_after_cost_score"] = expected_edge_after_cost
-        if side == "buy" and min_expected_edge is not None and expected_edge_after_cost < min_expected_edge:
+        metrics["short_selling_enabled"] = 1.0 if self.short_selling_allowed(risk_policy) else 0.0
+        risk_reducing_order = position_effect in {"reduce_long", "close_long", "reduce_short", "close_short"}
+        new_or_add_short = position_effect in {"open_short", "increase_short"}
+        new_or_add_long = position_effect in {"open_long", "increase_long"}
+        if new_or_add_long and min_expected_edge is not None and expected_edge_after_cost < min_expected_edge:
             flags.append("expected_edge_after_cost_below_threshold")
-        if side == "buy" and "turnover_mandate_urgency" in tuple(decision.get("primary_reason_codes") or ()):
+        if new_or_add_short:
+            min_short_edge = abs(min_expected_edge or 0.0)
+            if not self.short_selling_allowed(risk_policy):
+                flags.append("short_selling_not_supported")
+            if min_short_edge > 0 and expected_edge_after_cost > -min_short_edge:
+                flags.append("short_expected_edge_after_cost_above_threshold")
+        if (new_or_add_long or new_or_add_short) and "turnover_mandate_urgency" in tuple(decision.get("primary_reason_codes") or ()):
             metrics["turnover_driven_expected_edge_after_cost"] = expected_edge_after_cost
-            if expected_edge_after_cost <= 0:
+            if new_or_add_long and expected_edge_after_cost <= 0:
                 flags.append("turnover_trade_without_positive_edge")
+            if new_or_add_short and expected_edge_after_cost >= 0:
+                flags.append("turnover_trade_without_negative_short_edge")
 
-        if side == "buy" and proposed_trade_value > available_cash:
+        if side == "buy" and new_or_add_long and proposed_trade_value > available_cash:
             adjusted_quantity = floor_quantity(available_cash / price)
             adjustments.append(self.adjustment(instrument_id, "quantity", requested_quantity, adjusted_quantity, "cash_check"))
             requested_quantity = adjusted_quantity
@@ -924,12 +1027,55 @@ class RiskControlService:
         instrument_exposure = instrument_exposure_after_trade(current_value, signed_trade_for_exposure, portfolio_equity)
         metrics["portfolio_exposure_after_trade"] = portfolio_exposure
         metrics["instrument_exposure_after_trade"] = instrument_exposure
+        metrics["current_short_exposure_rub"] = abs(current_value) if current_quantity < 0 else 0.0
+        metrics["projected_short_exposure_rub"] = self.projected_short_exposure_rub(
+            current_value=current_value,
+            signed_trade_value=signed_trade_for_exposure,
+            portfolio_snapshot=portfolio_snapshot,
+        )
 
         max_portfolio_exposure = self.portfolio_limit_value(portfolio_limits, risk_policy, "max_portfolio_exposure_pct")
         if max_portfolio_exposure is None:
             return self.manual_assessment(decision_set.decision_set_id, instrument_id, action, "max_portfolio_exposure_missing")
         if portfolio_exposure > max_portfolio_exposure:
             flags.append("portfolio_exposure_limit_exceeded")
+
+        if new_or_add_short:
+            max_single_short_order_value = self.short_limit_value(
+                portfolio_limits,
+                risk_policy,
+                "max_single_short_order_value_rub",
+                "RISK_MAX_SINGLE_SHORT_ORDER_VALUE_RUB",
+            )
+            if max_single_short_order_value is not None and proposed_trade_value > max_single_short_order_value:
+                adjusted_quantity = floor_quantity(max_single_short_order_value / price)
+                adjustments.append(self.adjustment(instrument_id, "quantity", requested_quantity, adjusted_quantity, "max_single_short_order_value"))
+                requested_quantity = adjusted_quantity
+                proposed_trade_value = requested_quantity * price
+                flags.append("max_single_short_order_value_adjusted")
+                if requested_quantity <= 0:
+                    flags.append("max_single_short_order_value_failed")
+            max_short_position_pct = self.short_limit_value(
+                portfolio_limits,
+                risk_policy,
+                "max_short_position_pct",
+                "RISK_MAX_SHORT_POSITION_PCT",
+            )
+            if max_short_position_pct is not None and instrument_exposure > max_short_position_pct:
+                flags.append("max_short_position_pct_exceeded")
+            max_total_short_exposure_pct = self.short_limit_value(
+                portfolio_limits,
+                risk_policy,
+                "max_total_short_exposure_pct",
+                "RISK_MAX_TOTAL_SHORT_EXPOSURE_PCT",
+            )
+            if (
+                max_total_short_exposure_pct is not None
+                and portfolio_equity
+                and portfolio_equity > 0
+                and metrics["projected_short_exposure_rub"] / portfolio_equity > max_total_short_exposure_pct
+            ):
+                flags.append("max_total_short_exposure_pct_exceeded")
 
         max_position_pct = instrument_limit.max_position_pct
         if max_position_pct is None:
@@ -1003,7 +1149,16 @@ class RiskControlService:
             for flag in flags
             if flag.endswith("_exceeded")
             or flag.endswith("_failed")
-            or flag in {"data_quality_score_below_threshold", "adjusted_quantity_non_positive", "expected_edge_after_cost_below_threshold", "turnover_trade_without_positive_edge"}
+            or flag
+            in {
+                "data_quality_score_below_threshold",
+                "adjusted_quantity_non_positive",
+                "expected_edge_after_cost_below_threshold",
+                "short_expected_edge_after_cost_above_threshold",
+                "turnover_trade_without_positive_edge",
+                "turnover_trade_without_negative_short_edge",
+                "short_selling_not_supported",
+            }
         )
         if reject_flags:
             return RiskDecisionAssessment(
@@ -1055,6 +1210,9 @@ class RiskControlService:
                     *_string_tuple(feature_vector.features.get("_meta", {}).get("source_refs") if isinstance(feature_vector.features.get("_meta"), Mapping) else ()),
                 ),
                 "market_session_status": market_session_status,
+                "position_effect": position_effect,
+                "short_selling_enabled": self.short_selling_allowed(risk_policy),
+                "arena_go_shorts_allowed": self.arena_go_shorts_allowed(risk_policy),
                 "risk_metrics": metrics,
             },
         )
@@ -1406,11 +1564,21 @@ class RiskControlService:
             value = _feature_numeric(feature_vector.features, metric_name)
             if value is not None and value > 0:
                 cost_bps += float(value)
-        # Decision edge is a normalized score, so bps are converted to a small
-        # comparable score penalty.  When a future alpha model emits explicit
-        # expected_edge_after_cost_bps/score, it should be passed directly in the
-        # decision payload and will take precedence above.
-        return raw_edge - (cost_bps / 10_000.0)
+        if cost_bps <= 0:
+            try:
+                cost_bps = max(0.0, float(os.getenv("RISK_CONSERVATIVE_COST_PROXY_BPS", "8.0")))
+            except ValueError:
+                cost_bps = 8.0
+        # Decision edge is a signed normalized score: positive means long edge,
+        # negative means short edge.  Costs reduce absolute edge on both sides,
+        # so a short signal moves toward zero instead of becoming artificially
+        # more negative.
+        cost_score = cost_bps / 10_000.0
+        if raw_edge > 0:
+            return raw_edge - cost_score
+        if raw_edge < 0:
+            return raw_edge + cost_score
+        return 0.0
 
     def portfolio_limit_value(
         self,
@@ -1428,6 +1596,9 @@ class RiskControlService:
             "arena_go_daily_trade_limit": ("arena_go_daily_trade_limit", "daily_trade_limit"),
             "max_daily_turnover_rub": ("max_daily_turnover_rub", "daily_turnover_limit_rub"),
             "min_expected_edge_after_cost_score": ("min_expected_edge_after_cost_score", "min_expected_edge_after_cost"),
+            "max_short_position_pct": ("max_short_position_pct", "single_short_exposure_pct"),
+            "max_total_short_exposure_pct": ("max_total_short_exposure_pct", "total_short_exposure_pct"),
+            "max_single_short_order_value_rub": ("max_single_short_order_value_rub",),
             "max_sector_exposure_pct": ("max_sector_exposure_pct", "sector_limit_pct"),
             "portfolio_snapshot_ttl_seconds": ("portfolio_snapshot_ttl_seconds", "portfolio_state_ttl_seconds"),
             "min_data_quality_score": ("min_data_quality_score",),
@@ -1674,11 +1845,22 @@ def _rule_bool(payload: Mapping[str, Any], key: str) -> bool:
     if not isinstance(payload, Mapping):
         return False
     value = payload.get(key)
+    return _coerce_bool(value)
+
+
+def _coerce_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value.lower() in {"true", "1", "yes", "on"}
     return bool(value)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return _coerce_bool(value)
 
 
 def _rule_text(payload: Mapping[str, Any], key: str) -> str | None:

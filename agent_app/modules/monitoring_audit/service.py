@@ -458,6 +458,7 @@ class MonitoringAuditService:
             "llm_cost_units": metrics.llm_cost_units(polza_costs),
             "gateway_error_rate": metrics.gateway_error_rate(request_failures, len(snapshot.request_logs)),
             "alert_count": 0,
+            **self.short_monitoring_metrics(snapshot),
             "raw_counts": {
                 "audit_records": len(snapshot.audit_records),
                 "request_logs": len(snapshot.request_logs),
@@ -468,6 +469,50 @@ class MonitoringAuditService:
                 "order_statuses": len(snapshot.order_statuses),
                 "portfolio_snapshots": len(snapshot.portfolio_snapshots),
             },
+        }
+
+    def short_monitoring_metrics(self, snapshot: MonitoringSnapshot) -> dict[str, float]:
+        latest_snapshot = max(snapshot.portfolio_snapshots, key=lambda item: item.as_of_ts, default=None)
+        positions = tuple((latest_snapshot.payload or {}).get("positions") or ()) if latest_snapshot else ()
+        short_exposure = 0.0
+        short_positions_count = 0
+        short_pnl = 0.0
+        if isinstance(positions, tuple) or isinstance(positions, list):
+            for item in positions:
+                if not isinstance(item, Mapping):
+                    continue
+                quantity = _optional_float(item.get("quantity")) or 0.0
+                market_value = _optional_float(item.get("market_value")) or 0.0
+                unrealized_pnl = _optional_float(item.get("unrealized_pnl")) or 0.0
+                if quantity < 0 or market_value < 0:
+                    short_positions_count += 1
+                    short_exposure += abs(market_value)
+                    short_pnl += unrealized_pnl
+        short_rejected_by_risk = 0
+        short_disabled_rejections = 0
+        short_take_profit_count = 0
+        short_stop_loss_count = 0
+        for record in snapshot.audit_records:
+            reason_codes = {str(item) for item in record.reason_codes}
+            payload = record.payload if isinstance(record.payload, Mapping) else {}
+            payload_reasons = {str(item) for item in (payload.get("risk_flags") or payload.get("reason_codes") or ())}
+            all_reasons = reason_codes | payload_reasons
+            if any("short" in item for item in all_reasons) and record.severity in {"warning", "error", "critical"}:
+                short_rejected_by_risk += 1
+            if "short_selling_not_supported" in all_reasons:
+                short_disabled_rejections += 1
+            if any("short" in item and "take_profit" in item for item in all_reasons):
+                short_take_profit_count += 1
+            if any("short" in item and "stop_loss" in item for item in all_reasons):
+                short_stop_loss_count += 1
+        return {
+            "current_short_exposure_rub": short_exposure,
+            "short_positions_count": float(short_positions_count),
+            "short_pnl": short_pnl,
+            "short_rejected_by_risk": float(short_rejected_by_risk),
+            "short_disabled_rejections": float(short_disabled_rejections),
+            "short_take_profit_count": float(short_take_profit_count),
+            "short_stop_loss_count": float(short_stop_loss_count),
         }
 
     def detect_alerts(
@@ -1116,6 +1161,15 @@ def _float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

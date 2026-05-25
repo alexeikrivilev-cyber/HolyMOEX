@@ -1384,6 +1384,8 @@ def _risk_payload(
     current_quantity: float = 0.0,
     action: str = "buy",
     target_quantity: float = 1.0,
+    expected_edge_score: float = 0.02,
+    shorts_allowed: bool = True,
 ):
     from agent_app.modules.risk_control.repository import (
         DecisionSet,
@@ -1397,7 +1399,12 @@ def _risk_payload(
     )
 
     policy_id = "live_policy"
-    policy_rules = {"market_session_status": "open", "market_regime": "normal"}
+    policy_rules = {
+        "market_session_status": "open",
+        "market_regime": "normal",
+        "arena_go_shorts_allowed": shorts_allowed,
+        "decision_allow_short_selling": shorts_allowed,
+    }
     if daily_turnover_mode is not None:
         policy_rules["daily_turnover_limit_mode"] = daily_turnover_mode
         policy_rules["max_daily_turnover_hard_block_enabled"] = daily_turnover_mode != "monitor_only"
@@ -1435,7 +1442,7 @@ def _risk_payload(
                         "instrument_id": "moex:SBER",
                         "action": action,
                         "target_quantity": target_quantity,
-                        "expected_edge_score": 0.02,
+                        "expected_edge_score": expected_edge_score,
                         "expected_edge_after_cost_score": edge_after_cost,
                         "primary_reason_codes": ["turnover_mandate_urgency"],
                     },
@@ -1608,6 +1615,7 @@ def test_short_opening_sell_order_is_supported_by_risk() -> None:
 
     repo, payload = _risk_payload(
         edge_after_cost=-0.02,
+        expected_edge_score=-0.02,
         current_quantity=0.0,
         action="sell",
         target_quantity=-10.0,
@@ -1619,9 +1627,29 @@ def test_short_opening_sell_order_is_supported_by_risk() -> None:
     assert len(result.order_intents) == 1
     assert result.order_intents[0].side == "sell"
     assert result.order_intents[0].quantity == 10.0
+    assert result.order_intents[0].payload["position_effect"] == "open_short"
     metrics = result.order_intents[0].payload["risk_metrics"]
     assert metrics["instrument_exposure_after_trade"] > 0.0
     assert metrics["portfolio_exposure_after_trade"] > 0.0
+
+
+def test_short_opening_is_rejected_when_provider_capability_disabled() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.02,
+        expected_edge_score=-0.02,
+        current_quantity=0.0,
+        action="sell",
+        target_quantity=-10.0,
+        shorts_allowed=False,
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "rejected"
+    assert result.order_intents == ()
+    assert "short_selling_not_supported" in result.risk_check_result.risk_flags
 
 
 def test_reduce_short_order_uses_buy_to_cover_side() -> None:
@@ -1640,6 +1668,38 @@ def test_reduce_short_order_uses_buy_to_cover_side() -> None:
     assert len(result.order_intents) == 1
     assert result.order_intents[0].side == "buy"
     assert result.order_intents[0].quantity == 10.0
+    assert result.order_intents[0].payload["position_effect"] == "close_short"
+
+
+def test_existing_long_sell_is_reduce_long_not_open_short() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.02,
+        expected_edge_score=-0.02,
+        current_quantity=10.0,
+        action="sell",
+        target_quantity=5.0,
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.risk_check_result.status == "approved"
+    assert len(result.order_intents) == 1
+    assert result.order_intents[0].payload["position_effect"] == "reduce_long"
+
+
+def test_execution_position_effect_direction_mapping() -> None:
+    from agent_app.modules.execution_engine.service import ExecutionEngineService
+
+    service = ExecutionEngineService()
+
+    assert service.side_for_position_effect("open_short") == "sell"
+    assert service.side_for_position_effect("increase_short") == "sell"
+    assert service.side_for_position_effect("close_short") == "buy"
+    assert service.side_for_position_effect("reduce_short") == "buy"
+    assert service.side_for_position_effect("open_long") == "buy"
+    assert service.side_for_position_effect("close_long") == "sell"
 
 
 def test_batch_risk_limits_rank_and_cap_new_long_fanout() -> None:
@@ -1785,6 +1845,52 @@ def test_decision_engine_can_choose_short_opening_sell() -> None:
     ) == "sell"
 
 
+def test_decision_action_selection_uses_post_cost_edge() -> None:
+    from agent_app.modules.decision_engine.repository import PositionState
+    from agent_app.modules.decision_engine.service import DecisionEngineService, DecisionRequest
+
+    request = DecisionRequest(
+        decision_request_id="decision_post_cost",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizon="intraday",
+        as_of_ts="2026-05-24T09:00:00Z",
+        feature_vector_refs=("features.feature_vector:fv",),
+        portfolio_state_ref="portfolio.portfolio_snapshot:snapshot",
+        weights_profile_id="weights:live_autonomous:intraday:v1",
+        run_mode="live_trading",
+        decision_mode="normal",
+    )
+    service = DecisionEngineService()
+
+    no_position_action = service.choose_action(
+        request=request,
+        expected_edge=-0.01,
+        gross_expected_edge=0.02,
+        expected_edge_after_cost=-0.01,
+        risk_score=0.2,
+        margin=-0.04,
+        reason_codes=(),
+        position=None,
+    )
+    long_position_action = service.choose_action(
+        request=request,
+        expected_edge=-0.01,
+        gross_expected_edge=0.02,
+        expected_edge_after_cost=-0.01,
+        risk_score=0.2,
+        margin=-0.04,
+        reason_codes=(),
+        position=PositionState("pos", "portfolio", "moex:SBER", "2026-05-24T09:00:00Z", 10, 100, 100, 1000, 0),
+    )
+
+    assert no_position_action == "hold"
+    assert long_position_action == "sell"
+    assert service.post_cost_edge_score(0.02, 10) == 0.019
+    assert service.post_cost_edge_score(-0.02, 10) == -0.019
+    assert service.edge_to_cost_ratio(0.02, 10) == 20.0
+
+
 def test_decision_exit_overlay_closes_take_profit_and_stop_loss() -> None:
     from agent_app.modules.decision_engine.repository import PositionState
     from agent_app.modules.decision_engine.service import DecisionEngineService
@@ -1822,6 +1928,92 @@ def test_decision_exit_overlay_closes_take_profit_and_stop_loss() -> None:
     assert "position_take_profit_triggered" in long_exit[3]
     assert "position_take_profit_triggered" in short_exit[3]
     assert "position_stop_loss_triggered" in stop_exit[3]
+
+
+def test_long_exit_policy_is_post_cost_and_partial_take_profit_aware() -> None:
+    from agent_app.modules.decision_engine.repository import PositionState
+    from agent_app.modules.decision_engine.service import DecisionEngineService
+
+    service = DecisionEngineService()
+    profitable_long = PositionState("pos_long", "portfolio", "moex:SBER", "2026-05-24T09:00:00Z", 10, 100, 102, 1020, 20)
+    flat_long = PositionState("pos_flat", "portfolio", "moex:SBER", "2026-05-24T09:00:00Z", 10, 100, 100, 1000, 0)
+
+    weak_profit = service.position_exit_overlay(
+        position=profitable_long,
+        latest_price=102,
+        current_quantity=10,
+        expected_edge=0.08,
+        expected_edge_after_cost=0.01,
+        risk_score=0.2,
+        current_pct=0.05,
+    )
+    strong_profit = service.position_exit_overlay(
+        position=profitable_long,
+        latest_price=102,
+        current_quantity=10,
+        expected_edge=0.10,
+        expected_edge_after_cost=0.10,
+        risk_score=0.2,
+        current_pct=0.05,
+    )
+    negative_edge = service.position_exit_overlay(
+        position=flat_long,
+        latest_price=100,
+        current_quantity=10,
+        expected_edge=0.02,
+        expected_edge_after_cost=-0.01,
+        risk_score=0.2,
+        current_pct=0.05,
+    )
+
+    assert weak_profit is not None and weak_profit[0] == "reduce"
+    assert weak_profit[2] == 5.0
+    assert "position_partial_take_profit_triggered" in weak_profit[3]
+    assert strong_profit is None
+    assert negative_edge is not None and negative_edge[0] == "reduce" and negative_edge[2] == 0.0
+    assert "long_post_cost_edge_non_positive" in negative_edge[3]
+
+
+def test_short_exit_policy_is_side_aware() -> None:
+    from agent_app.modules.decision_engine.repository import PositionState
+    from agent_app.modules.decision_engine.service import DecisionEngineService
+
+    service = DecisionEngineService()
+    profitable_short = PositionState("pos_short", "portfolio", "moex:SBER", "2026-05-24T09:00:00Z", -10, 100, 98, -980, 20)
+    losing_short = PositionState("pos_short_loss", "portfolio", "moex:SBER", "2026-05-24T09:00:00Z", -10, 100, 102, -1020, -20)
+
+    weak_profit = service.position_exit_overlay(
+        position=profitable_short,
+        latest_price=98,
+        current_quantity=-10,
+        expected_edge=-0.08,
+        expected_edge_after_cost=-0.01,
+        risk_score=0.2,
+        current_pct=-0.05,
+    )
+    strong_profit = service.position_exit_overlay(
+        position=profitable_short,
+        latest_price=98,
+        current_quantity=-10,
+        expected_edge=-0.10,
+        expected_edge_after_cost=-0.10,
+        risk_score=0.2,
+        current_pct=-0.05,
+    )
+    stop = service.position_exit_overlay(
+        position=losing_short,
+        latest_price=102,
+        current_quantity=-10,
+        expected_edge=-0.10,
+        expected_edge_after_cost=-0.10,
+        risk_score=0.2,
+        current_pct=-0.05,
+    )
+
+    assert weak_profit is not None and weak_profit[0] == "reduce"
+    assert weak_profit[2] == -5.0
+    assert strong_profit is None
+    assert stop is not None and stop[0] == "reduce" and stop[2] == 0.0
 
 
 def test_decision_engine_emits_negative_short_target_when_edge_is_negative() -> None:
@@ -1980,7 +2172,7 @@ def test_live_execution_requires_explicit_safe_live_submit(monkeypatch) -> None:
                 "risk_check_id": "risk",
                 "run_mode": "live_trading",
                 "created_at": "2026-05-24T09:00:00Z",
-                "payload": {"market_session_status": "open"},
+                "payload": {"market_session_status": "open", "position_effect": "open_long"},
             },
         ),
         risk_check_results=(
@@ -2089,7 +2281,7 @@ def test_market_closed_blocks_execution_submit_even_when_safe_live_enabled(monke
                 "risk_check_id": "risk",
                 "run_mode": "live_trading",
                 "created_at": "2026-05-24T09:00:00Z",
-                "payload": {"market_session_status": "closed"},
+                "payload": {"market_session_status": "closed", "position_effect": "open_long"},
             },
         ),
         risk_check_results=(
@@ -2180,7 +2372,7 @@ def test_live_execution_requires_sandbox_and_startup_readiness(monkeypatch) -> N
                     "risk_check_id": "risk",
                     "run_mode": "live_trading",
                     "created_at": "2026-05-24T09:00:00Z",
-                    "payload": {"market_session_status": "open"},
+                    "payload": {"market_session_status": "open", "position_effect": "open_long"},
                 },
             ),
             risk_check_results=(
