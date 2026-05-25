@@ -383,6 +383,7 @@ def test_runtime_calendar_closes_weekends_and_opens_regular_session(monkeypatch)
     from agent_app.runtime_calendar import current_market_session
 
     monkeypatch.delenv("MARKET_SESSION_STATUS_OVERRIDE", raising=False)
+    monkeypatch.setenv("MARKET_SESSION_SOURCE", "moex")
     sunday = current_market_session(datetime(2026, 5, 24, 12, 0, tzinfo=ZoneInfo("Europe/Moscow")))
     monday_open = current_market_session(datetime(2026, 5, 25, 12, 0, tzinfo=ZoneInfo("Europe/Moscow")))
     monday_after_close = current_market_session(datetime(2026, 5, 25, 19, 10, tzinfo=ZoneInfo("Europe/Moscow")))
@@ -392,6 +393,23 @@ def test_runtime_calendar_closes_weekends_and_opens_regular_session(monkeypatch)
     assert monday_open.market_session_status == "open"
     assert monday_open.agent_runtime_phase == "trading_session"
     assert monday_after_close.market_session_status == "postmarket"
+
+
+def test_runtime_calendar_uses_arena_go_extended_session_for_sandbox(monkeypatch) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from agent_app.runtime_calendar import current_market_session
+
+    monkeypatch.delenv("MARKET_SESSION_STATUS_OVERRIDE", raising=False)
+    monkeypatch.setenv("MARKET_SESSION_SOURCE", "auto")
+    monkeypatch.setenv("ARENA_GO_SANDBOX", "true")
+    session = current_market_session(datetime(2026, 5, 25, 21, 30, tzinfo=ZoneInfo("Europe/Moscow")))
+
+    assert session.market_session_status == "open"
+    assert session.agent_runtime_phase == "trading_session"
+    assert "arena_go" in session.reason
+    assert "extended_session" in session.reason
 
 
 def test_raw_text_fallback_disabled_in_production_and_throttled_when_enabled(monkeypatch) -> None:

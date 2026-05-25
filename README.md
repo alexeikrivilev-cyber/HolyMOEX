@@ -1388,6 +1388,9 @@ docker run -d --name holymoex \
   -e SYSTEM_MODE=automatic_live_trading \
   -e RUN_MODE=live_trading \
   -e ARENA_GO_SANDBOX=true \
+  -e MARKET_SESSION_SOURCE=auto \
+  -e ARENA_GO_MARKET_EXTENDED_SESSION=true \
+  -e ARENA_GO_MARKET_CLOSE_TIME=23:50 \
   -e SINGLE_SCHEDULER_INSTANCE=true \
   -e SAFE_LIVE_SUBMIT=true \
   -v holymoex_data:/data \
@@ -1492,7 +1495,17 @@ Steady-state Raw Text discovery and EventNews extraction must not run every minu
 
 ## Market-hours gating
 
-The runtime exposes `market_session_status = open | closed | premarket | postmarket | unknown` and derives `agent_runtime_phase = trading_session | off_market | degraded`. Outside `open`, the scheduler skips heavy live `Decision Engine`, `Risk Control` and `Execution Engine` loops and throttles LLM-heavy Raw Text/EventNews jobs. Portfolio sync, health/readiness, monitoring/audit and light market/macro maintenance may continue. If session status is `unknown`, live submit is blocked and monitoring/audit should surface a warning.
+The runtime exposes `market_session_status = open | closed | premarket | postmarket | unknown` and derives `agent_runtime_phase = trading_session | off_market | degraded`. With `MARKET_SESSION_SOURCE=auto` and `ARENA_GO_SANDBOX=true`, the server uses the ArenaGo sandbox session profile by default, so the autonomous loop can stay in `open/trading_session` during ArenaGo's extended test window even after the regular MOEX cash close. The default ArenaGo window is `ARENA_GO_MARKET_OPEN_TIME=10:00` to `ARENA_GO_MARKET_CLOSE_TIME=23:50` Europe/Moscow; set `MARKET_SESSION_SOURCE=moex` to force strict MOEX cash-session gating.
+
+Outside `open`, the scheduler skips heavy live `Decision Engine`, `Risk Control` and `Execution Engine` loops and throttles LLM-heavy Raw Text/EventNews jobs. Portfolio sync, health/readiness, monitoring/audit and light market/macro maintenance may continue. If session status is `unknown`, live submit is blocked and monitoring/audit should surface a warning.
+
+```env
+MARKET_SESSION_SOURCE=auto
+ARENA_GO_MARKET_TIMEZONE=Europe/Moscow
+ARENA_GO_MARKET_EXTENDED_SESSION=true
+ARENA_GO_MARKET_OPEN_TIME=10:00
+ARENA_GO_MARKET_CLOSE_TIME=23:50
+```
 
 Production fallback Raw Text/EventNews source-loop is disabled by default when `audit.schedule_config` cannot be loaded. To enable it deliberately:
 
