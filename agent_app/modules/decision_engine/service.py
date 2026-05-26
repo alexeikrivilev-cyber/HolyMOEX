@@ -204,11 +204,20 @@ class DecisionPolicy:
     macro_range_edge_multiplier: float = field(
         default_factory=lambda: _env_float("DECISION_MACRO_RANGE_EDGE_MULTIPLIER", 0.75)
     )
+    macro_unknown_edge_multiplier: float = field(
+        default_factory=lambda: _env_float("DECISION_MACRO_UNKNOWN_EDGE_MULTIPLIER", 1.0)
+    )
     macro_degraded_edge_multiplier: float = field(
-        default_factory=lambda: _env_float("DECISION_MACRO_DEGRADED_EDGE_MULTIPLIER", 0.85)
+        default_factory=lambda: _env_float("DECISION_MACRO_DEGRADED_EDGE_MULTIPLIER", 0.90)
     )
     macro_degraded_edge_penalty: float = field(
         default_factory=lambda: _env_float("DECISION_MACRO_DEGRADED_EDGE_PENALTY", 0.0)
+    )
+    macro_degraded_risk_penalty: float = field(
+        default_factory=lambda: _env_float("DECISION_MACRO_DEGRADED_RISK_PENALTY", 0.01)
+    )
+    macro_unknown_risk_penalty: float = field(
+        default_factory=lambda: _env_float("DECISION_MACRO_UNKNOWN_RISK_PENALTY", 0.0)
     )
     macro_edge_penalty_cap: float = field(
         default_factory=lambda: _env_float("DECISION_MACRO_EDGE_PENALTY_CAP", ACTION_THRESHOLD * 0.5)
@@ -1045,8 +1054,15 @@ class DecisionEngineService:
             risk_penalty += 0.20
             edge_multiplier = min(edge_multiplier, 0.50)
             reason_codes.append(f"macro_regime_overlay:{market_regime}")
-        elif market_regime in {"range", "unknown"}:
+        elif market_regime == "range":
             edge_multiplier = min(edge_multiplier, self.policy.macro_range_edge_multiplier)
+            reason_codes.append(f"macro_regime_overlay:{market_regime}")
+        elif market_regime == "unknown":
+            # Unknown macro regime is a data/coverage warning, not a market
+            # stress signal. Let instrument-level post-cost evidence drive
+            # action selection while Risk Control remains the hard gate.
+            edge_multiplier = min(edge_multiplier, self.policy.macro_unknown_edge_multiplier)
+            risk_penalty += max(0.0, self.policy.macro_unknown_risk_penalty)
             reason_codes.append(f"macro_regime_overlay:{market_regime}")
 
         risk_on_score = _feature_numeric(vector_features, "risk_on_risk_off_score", default=None)
@@ -1082,7 +1098,7 @@ class DecisionEngineService:
 
         if macro_context and all(_payload_float(macro_context, key) is None for key in ("key_rate_level", "ofz_10y_yield", "currency_return_z", "oil_return_z")):
             edge_penalty += max(0.0, self.policy.macro_degraded_edge_penalty)
-            risk_penalty += 0.03
+            risk_penalty += max(0.0, self.policy.macro_degraded_risk_penalty)
             edge_multiplier = min(edge_multiplier, self.policy.macro_degraded_edge_multiplier)
             reason_codes.append("macro_context_degraded")
 
@@ -1103,11 +1119,11 @@ class DecisionEngineService:
         """
 
         multiplier = clip(_payload_float(macro_overlay, "edge_multiplier"), 0.35, 1.0)
-        penalty = clip(
-            _payload_float(macro_overlay, "edge_penalty") or 0.0,
-            0.0,
-            max(0.0, self.policy.macro_edge_penalty_cap),
-        )
+        # macro_regime_overlay() already caps the internally generated
+        # penalty.  apply_macro_overlay() may also be used in tests or replay
+        # with a fully materialized overlay, so preserve the supplied value
+        # while still keeping it non-negative and bounded.
+        penalty = clip(_payload_float(macro_overlay, "edge_penalty") or 0.0, 0.0, 1.0)
         before = float(edge or 0.0)
         adjusted = before * multiplier
         if before >= 0:

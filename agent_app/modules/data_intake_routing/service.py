@@ -789,8 +789,10 @@ class DataIntakeRoutingService:
                 relevance_scores.append(raw_item.relevance_score)
 
                 if is_duplicate:
-                    warnings.append(f"duplicate_text_skipped:{raw_ref}")
-                    continue
+                    warnings.append(f"duplicate_text_reused_for_routing:{raw_ref}")
+                    stored_item = self.repository.load_raw_text_item(raw_ref)
+                    if stored_item is not None:
+                        raw_item = self._classify_and_map(stored_item, active_profiles)
                 if not raw_item.instrument_ids and raw_item.text_category not in MARKET_WIDE_CATEGORIES:
                     warnings.append(f"raw_text_unmapped_not_routed:{raw_ref}")
                     continue
@@ -802,6 +804,9 @@ class DataIntakeRoutingService:
                 )
                 if routing_message is None:
                     warnings.append(f"routing_target_not_available:{raw_ref}")
+                    continue
+                if self.repository.routing_message_exists(raw_ref, routing_message.target_modules):
+                    warnings.append(f"routing_message_already_exists:{raw_ref}")
                     continue
                 routing_ref = self.repository.save_routing_message(routing_message)
                 output_refs.append(routing_ref)

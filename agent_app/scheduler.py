@@ -383,8 +383,6 @@ class AutonomousScheduler:
             return "off_market_heavy_trading_loop_blocked" if market_status != "unknown" else "market_session_unknown_live_loop_blocked"
         if market_status != "open" and is_llm_heavy_entry(entry):
             return "off_market_text_llm_loop_blocked" if market_status != "unknown" else "market_session_unknown_text_llm_loop_blocked"
-        if production_env() and is_llm_heavy_entry(entry) and not _env_bool("ENABLE_LLM_TEXT_SCHEDULES", False):
-            return "llm_text_schedule_disabled_in_production"
         if market_status != "open" and not is_off_market_allowed_entry(entry):
             return "off_market_scheduled_loop_blocked" if market_status != "unknown" else "market_session_unknown_scheduled_loop_blocked"
         if not db_schedule and entry.source in TEXT_HEAVY_SOURCES and production_env():
@@ -392,6 +390,9 @@ class AutonomousScheduler:
                 return "raw_text_fallback_disabled_in_production"
             if self.config.raw_text_fallback_interval_seconds < MIN_LLM_FALLBACK_INTERVAL_SECONDS:
                 return "raw_text_fallback_interval_too_low"
+            return ""
+        if production_env() and is_llm_heavy_entry(entry) and not _env_bool("ENABLE_LLM_TEXT_SCHEDULES", False):
+            return "llm_text_schedule_disabled_in_production"
         return ""
 
     def _audit_raw_text_fallback_disabled(self) -> None:

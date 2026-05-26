@@ -122,6 +122,7 @@
 | `read` | `Decision Store` |
 | `read` | `Order Store` |
 | `read` | `Portfolio State Store` |
+| `read` | `Analytics Store` |
 | `write` | `Monitoring Store` |
 | `write` | `Audit Log Store` |
 
@@ -167,6 +168,9 @@ Monitoring events постоянные для audit. Health report обновл�
 - `health_report_available`
 - `database_readiness_preflight_available`
 - `metric_weights_readiness_preflight_available`
+- `analytics_performance_views_available`
+- `llm_quality_view_available`
+- `decision_outcome_view_available`
 
 ## 15. Metric formulas / calculation rules
 

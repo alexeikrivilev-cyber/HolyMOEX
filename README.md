@@ -89,6 +89,7 @@ Orchestration Module
 | `Order Store` | намерения, заявки, fill reports | `order_intent`, `order_status`, `fill_report` |
 | `Request Log Store` | запросы во внешние API | `external_request`, `external_response`, `external_request_log` |
 | `Audit Log Store` | запуски модулей, ошибки, overrides | `audit_record`, `module_job`, `module_job_result`, `module_run` |
+| `Analytics Store` | read-only витрины для анализа стратегии, весов, LLM и исполнения | `trade_fact`, `performance_daily`, `decision_outcome`, `feature_contribution`, `llm_quality`, `risk_gate_effectiveness` |
 
 ## 6. Таксономия метрик
 
@@ -616,6 +617,7 @@ The previous `strict_default` profiles are retained for audit/replay but seeded 
 | `Order Store` | `orders` |
 | `Request Log Store` | `request_logs` |
 | `Audit Log Store` | `audit` |
+| `Analytics Store` | `analytics` |
 
 Запрещено хранить ключевые trading state только в памяти контейнера. После рестарта должны восстанавливаться: `portfolio_snapshot`, `position_state`, `decision_record`, `order_intent`, `execution_result`, `external_request`, `external_response`, `external_request_log`, `module_job`, `module_job_result`, `module_run`, `feature_record`.
 

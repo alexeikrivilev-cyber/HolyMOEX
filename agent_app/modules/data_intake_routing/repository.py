@@ -213,6 +213,9 @@ class DataIntakeRoutingRepository(Protocol):
     def save_routing_message(self, message: Any) -> str:
         ...
 
+    def routing_message_exists(self, raw_text_ref: str, target_modules: tuple[str, ...]) -> bool:
+        ...
+
     def save_text_dedup_record(self, record: Any) -> str:
         ...
 
@@ -328,6 +331,19 @@ class InMemoryDataIntakeRoutingRepository:
         ref = f"raw_text.event_routing_message:{_value(message, 'routing_message_id')}"
         self.routing_refs[ref] = message
         return ref
+
+    def routing_message_exists(self, raw_text_ref: str, target_modules: tuple[str, ...]) -> bool:
+        raw_text_item_id = raw_text_ref.rsplit(":", 1)[-1]
+        requested_targets = set(target_modules)
+        for message in self.routing_messages:
+            message_ref = str(_value(message, "raw_text_ref", "") or "")
+            message_item_id = message_ref.rsplit(":", 1)[-1] if message_ref else ""
+            if message_item_id != raw_text_item_id:
+                continue
+            message_targets = set(_value(message, "target_modules", ()) or ())
+            if requested_targets & message_targets:
+                return True
+        return False
 
     def save_text_dedup_record(self, record: Any) -> str:
         self.text_dedup_records.append(record)
@@ -713,6 +729,25 @@ class PostgresDataIntakeRoutingRepository:
                     row = cur.fetchone()
                     refs.append(f"raw_text.event_routing_message:{row[0]}")
         return ",".join(refs)
+
+    def routing_message_exists(self, raw_text_ref: str, target_modules: tuple[str, ...]) -> bool:
+        raw_text_item_id = raw_text_ref.rsplit(":", 1)[-1]
+        if not _optional_uuid_text(raw_text_item_id) or not target_modules:
+            return False
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                      FROM raw_text.event_routing_message
+                     WHERE raw_text_item_id = %s
+                       AND target_module = ANY(%s)
+                       AND status IN ('pending', 'processed')
+                     LIMIT 1
+                    """,
+                    (raw_text_item_id, list(target_modules)),
+                )
+                return cur.fetchone() is not None
 
     def save_text_dedup_record(self, record: Any) -> str:
         return f"raw_text.text_dedup_record:{_value(record, 'content_hash')}"

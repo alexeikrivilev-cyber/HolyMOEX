@@ -1730,7 +1730,16 @@ def _reaction_z(item: Mapping[str, Any], reaction: EventReaction) -> float | Non
 
 
 def _refs_with_prefix(refs: tuple[str, ...], prefix: str) -> tuple[str, ...]:
-    return tuple(ref for ref in refs if str(ref).startswith(prefix))
+    result: list[str] = []
+    for ref in refs:
+        text = str(ref)
+        if not text.startswith(prefix):
+            continue
+        tail = text.rsplit(":", 1)[-1]
+        if tail in {"scheduled", "latest"}:
+            continue
+        result.append(text)
+    return tuple(result)
 
 
 def _coerce_timestamp(value: Any, fallback: str) -> str:

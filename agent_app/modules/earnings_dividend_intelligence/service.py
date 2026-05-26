@@ -2038,7 +2038,16 @@ def _latest_price(candles: tuple[RawCandle, ...]) -> RawCandle | None:
 
 
 def _refs_with_prefix(refs: tuple[str, ...], prefix: str) -> tuple[str, ...]:
-    return tuple(ref for ref in refs if str(ref).startswith(prefix))
+    result: list[str] = []
+    for ref in refs:
+        text = str(ref)
+        if not text.startswith(prefix):
+            continue
+        tail = text.rsplit(":", 1)[-1]
+        if tail in {"scheduled", "latest"}:
+            continue
+        result.append(text)
+    return tuple(result)
 
 
 def _field_float(fields: Mapping[str, Any], *keys: str) -> float | None:

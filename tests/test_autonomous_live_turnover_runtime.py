@@ -882,6 +882,129 @@ def test_data_intake_skips_polza_raw_payload_before_validation() -> None:
     assert warnings == ("llm_raw_text_payload_skipped:polza_ai",)
 
 
+def test_data_intake_routes_duplicate_raw_text_when_no_routing_exists() -> None:
+    from agent_app.modules.data_intake_routing.repository import InMemoryDataIntakeRoutingRepository
+    from agent_app.modules.data_intake_routing.service import DataIntakeRoutingService, RawTextItem
+
+    profile = {
+        "instrument_id": "moex:SBER",
+        "universe_id": "moex_top20_manual",
+        "ticker": "SBER",
+        "issuer_name": "Sberbank",
+        "aliases": ("Сбер", "Сбербанк"),
+        "related_entities": (),
+        "is_active": True,
+    }
+    payload = {
+        "source_type": "rbc_news",
+        "source_ref": "rbc:sber-duplicate",
+        "title": "SBER updates retail strategy",
+        "body": "SBER reported a new retail banking update for investors.",
+        "language": "en",
+        "fetched_at": "2026-05-24T09:00:00Z",
+    }
+    repository = InMemoryDataIntakeRoutingRepository(profiles=(profile,))
+    existing = RawTextItem.from_dict(payload, universe_id="moex_top20_manual", default_source_type="rbc_news")
+    repository.save_raw_text_item(existing)
+    service = DataIntakeRoutingService(repository=repository)
+
+    result = service.process(
+        {
+            "intake_request": {
+                "universe_id": "moex_top20_manual",
+                "instrument_ids": ["moex:SBER"],
+                "source_types": ["rbc_news"],
+                "discovery_mode": "scheduled",
+                "per_instrument_discovery": True,
+                "time_range": {"from_ts": "2026-05-24T08:00:00Z", "to_ts": "2026-05-24T10:00:00Z"},
+                "routing_targets": ["Event & News Intelligence Module"],
+                "raw_text_items": [payload],
+            }
+        },
+        ModuleJob(
+            job_id="job_data_intake_duplicate_route",
+            module_name="Data Intake & Routing Module",
+            contour="event_contour",
+            trigger_type="scheduled",
+            universe_id="moex_top20_manual",
+            instrument_ids=("moex:SBER",),
+            horizons=("intraday",),
+            time_range=TimeRange(from_ts="2026-05-24T08:00:00Z", to_ts="2026-05-24T10:00:00Z"),
+            input_refs=(),
+            config_ref="runtime_config:live_autonomous:v1",
+            run_mode="live_trading",
+            idempotency_key="idem_data_intake_duplicate_route",
+        ),
+    )
+
+    assert len(result.routing_messages) == 1
+    assert len(repository.routing_messages) == 1
+    assert result.routing_messages[0].raw_text_ref.endswith(existing.raw_text_item_id)
+    assert result.routing_messages[0].target_modules == ("Event & News Intelligence Module",)
+    assert "duplicate_text_reused_for_routing:" in " ".join(result.module_job_result.warnings)
+
+
+def test_data_intake_does_not_create_duplicate_routing_for_duplicate_raw_text() -> None:
+    from agent_app.modules.data_intake_routing.repository import InMemoryDataIntakeRoutingRepository
+    from agent_app.modules.data_intake_routing.service import DataIntakeRoutingService, RawTextItem
+
+    profile = {
+        "instrument_id": "moex:SBER",
+        "universe_id": "moex_top20_manual",
+        "ticker": "SBER",
+        "issuer_name": "Sberbank",
+        "aliases": ("Сбер", "Сбербанк"),
+        "related_entities": (),
+        "is_active": True,
+    }
+    payload = {
+        "source_type": "rbc_news",
+        "source_ref": "rbc:sber-routing-idempotent",
+        "title": "SBER dividend expectations improve",
+        "body": "SBER investors discussed dividend expectations after a bank update.",
+        "language": "en",
+        "fetched_at": "2026-05-24T09:00:00Z",
+    }
+    request_payload = {
+        "intake_request": {
+            "universe_id": "moex_top20_manual",
+            "instrument_ids": ["moex:SBER"],
+            "source_types": ["rbc_news"],
+            "discovery_mode": "scheduled",
+            "per_instrument_discovery": True,
+            "time_range": {"from_ts": "2026-05-24T08:00:00Z", "to_ts": "2026-05-24T10:00:00Z"},
+            "routing_targets": ["Event & News Intelligence Module"],
+            "raw_text_items": [payload],
+        }
+    }
+    repository = InMemoryDataIntakeRoutingRepository(profiles=(profile,))
+    existing = RawTextItem.from_dict(payload, universe_id="moex_top20_manual", default_source_type="rbc_news")
+    repository.save_raw_text_item(existing)
+    service = DataIntakeRoutingService(repository=repository)
+    job = ModuleJob(
+        job_id="job_data_intake_duplicate_route_idempotent",
+        module_name="Data Intake & Routing Module",
+        contour="event_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T08:00:00Z", to_ts="2026-05-24T10:00:00Z"),
+        input_refs=(),
+        config_ref="runtime_config:live_autonomous:v1",
+        run_mode="live_trading",
+        idempotency_key="idem_data_intake_duplicate_route_idempotent",
+    )
+
+    first = service.process(request_payload, job)
+    second = service.process(request_payload, job)
+
+    assert len(first.routing_messages) == 1
+    assert len(second.routing_messages) == 0
+    assert len(repository.routing_messages) == 1
+    assert "routing_message_already_exists:" in " ".join(second.module_job_result.warnings)
+
+
 def test_data_intake_repository_ignores_legacy_polza_raw_text_rows() -> None:
     from agent_app.modules.data_intake_routing.repository import _raw_text_item_from_row
 
@@ -1457,6 +1580,83 @@ def test_event_news_empty_items_is_valid_no_event_result() -> None:
     assert result.module_job_result.events_written == 0
     assert "no_event_found" in result.module_job_result.warnings
     assert {record.event_type for record in repo.audit_records} == {"llm_no_event_found"}
+
+
+def test_event_news_ignores_scheduled_placeholders_and_loads_routing_fallback() -> None:
+    from agent_app.modules.event_news_intelligence.repository import InMemoryEventNewsIntelligenceRepository
+    from agent_app.modules.event_news_intelligence.service import EventNewsIntelligenceService
+
+    raw_item = {
+        "raw_text_item_id": "routed_no_event",
+        "universe_id": "moex_top20_manual",
+        "instrument_ids": ("moex:SBER",),
+        "source": "rbc_news",
+        "source_type": "rbc_news",
+        "title": "SBER market note",
+        "body": "No material issuer-specific information.",
+        "fetched_at": "2026-05-24T09:30:00Z",
+        "content_hash": "hash_routed_no_event",
+        "source_payload": {
+            "llm_output": {
+                "schema_version": "event_news:v1",
+                "model_id": "deepseek/deepseek-v4-flash",
+                "model_version": "test",
+                "task_type": "event_extraction",
+                "instrument_ids": ["moex:SBER"],
+                "items": [],
+                "confidence_score": 0.9,
+                "evidence": [],
+                "reason_codes": ["no_material_event"],
+                "warnings": ["no_event_found"],
+            }
+        },
+    }
+    repo = InMemoryEventNewsIntelligenceRepository(
+        raw_text_items=(raw_item,),
+        routing_messages=(
+            {
+                "routing_message_id": "routing_no_event",
+                "raw_text_item_id": "routed_no_event",
+                "target_module": "Event & News Intelligence Module",
+                "universe_id": "moex_top20_manual",
+                "instrument_ids": ("moex:SBER",),
+                "created_at": "2026-05-24T09:31:00Z",
+            },
+        ),
+    )
+    service = EventNewsIntelligenceService(repository=repo)
+    job = ModuleJob(
+        job_id="job_event_scheduled_placeholder",
+        module_name="Event & News Intelligence Module",
+        contour="event_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-24T09:00:00Z", to_ts="2026-05-24T10:00:00Z"),
+        input_refs=("raw_text.raw_text_item:scheduled", "raw_text.event_routing_message:scheduled"),
+        config_ref="runtime_config:live_autonomous:v1",
+        run_mode="live_trading",
+        idempotency_key="idem_event_scheduled_placeholder",
+    )
+
+    result = service.process(
+        {
+            "event_news_input": {
+                "routing_message_refs": [],
+                "raw_text_refs": [],
+                "instrument_ids": ["moex:SBER"],
+                "event_ontology_version": "event_ontology:v1",
+                "llm_prompt_version": "prompt:v2",
+                "market_reaction_window": ["1h"],
+            }
+        },
+        job,
+    )
+
+    assert result.module_job_result.status == "partial_success"
+    assert "raw_text_items_missing" not in result.module_job_result.warnings
+    assert "no_event_found" in result.module_job_result.warnings
 
 
 def test_llm_throttle_blocks_excess_calls_without_crashing(monkeypatch) -> None:
@@ -2243,6 +2443,36 @@ def test_macro_degraded_overlay_does_not_create_short_from_flat_edge() -> None:
     assert contribution <= 0.0
 
 
+def test_unknown_macro_regime_does_not_suppress_instrument_edge_as_range_market() -> None:
+    from agent_app.modules.decision_engine.repository import MarketStateRecord
+    from agent_app.modules.decision_engine.service import DecisionEngineService
+
+    service = DecisionEngineService()
+    market_state = MarketStateRecord(
+        market_state_record_id="market_state_unknown_macro",
+        universe_id="moex_top20_manual",
+        as_of_ts="2026-05-24T09:00:00Z",
+        market_session_status="open",
+        market_regime="unknown",
+        payload={
+            "macro_context": {
+                "key_rate_level": None,
+                "ofz_10y_yield": None,
+                "currency_return_z": None,
+                "oil_return_z": None,
+            }
+        },
+    )
+
+    overlay = service.macro_regime_overlay({}, market_state)
+    adjusted, _ = service.apply_macro_overlay(0.02, overlay)
+
+    assert "macro_regime_overlay:unknown" in overlay["reason_codes"]
+    assert "macro_context_degraded" in overlay["reason_codes"]
+    assert overlay["risk_penalty"] <= 0.01
+    assert adjusted >= 0.018
+
+
 def test_turnover_on_track_does_not_add_decision_urgency() -> None:
     from agent_app.modules.decision_engine.repository import PortfolioSnapshot
     from agent_app.modules.decision_engine.service import DecisionEngineService
@@ -2352,7 +2582,7 @@ def test_decision_feature_contribution_is_centered_for_alpha_signals() -> None:
 
 def test_decision_action_selection_uses_post_cost_edge() -> None:
     from agent_app.modules.decision_engine.repository import PositionState
-    from agent_app.modules.decision_engine.service import DecisionEngineService, DecisionRequest
+    from agent_app.modules.decision_engine.service import DecisionEngineService, DecisionPolicy, DecisionRequest
 
     request = DecisionRequest(
         decision_request_id="decision_post_cost",
@@ -2394,6 +2624,21 @@ def test_decision_action_selection_uses_post_cost_edge() -> None:
     assert service.post_cost_edge_score(0.02, 10) == 0.019
     assert service.post_cost_edge_score(-0.02, 10) == -0.019
     assert service.edge_to_cost_ratio(0.02, 10) == 20.0
+
+    live_threshold_action = DecisionEngineService(
+        policy=DecisionPolicy(action_threshold=0.012, min_post_cost_edge_score=0.012)
+    ).choose_action(
+        request=request,
+        expected_edge=0.015,
+        gross_expected_edge=0.016,
+        expected_edge_after_cost=0.015,
+        risk_score=0.49,
+        margin=0.003,
+        reason_codes=("macro_regime_overlay:unknown", "macro_context_degraded"),
+        position=None,
+    )
+
+    assert live_threshold_action == "buy"
 
 
 def test_decision_exit_overlay_closes_take_profit_and_stop_loss() -> None:

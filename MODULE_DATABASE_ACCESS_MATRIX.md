@@ -29,7 +29,7 @@
 | `19 Execution Engine Module` | `Order Store`, `Selected Instruments DB`, `Risk Store`, `Portfolio State Store` | `Order Store`, `Execution Log Store`, `Audit Log Store` |
 | `20 Portfolio State Module` | `Order Store`, `Raw Market Data Store` | `Portfolio State Store`, `Audit Log Store` |
 | `21 Backtesting & Paper Trading Module` | `Raw Market Data Store`, `Feature Store`, `Metric Weights DB`, `Risk Policy Store`, `Corporate Actions Store` | `Research Store`, `Order Store` |
-| `22 Monitoring & Audit Module` | `Audit Log Store`, `Module Job Result Store`, `Request Log Store`, `Decision Store`, `Order Store`, `Portfolio State Store` | `Monitoring Store`, `Audit Log Store` |
+| `22 Monitoring & Audit Module` | `Audit Log Store`, `Module Job Result Store`, `Request Log Store`, `Decision Store`, `Order Store`, `Portfolio State Store`, `Analytics Store` | `Monitoring Store`, `Audit Log Store` |
 
 ## Store to PostgreSQL mapping
 
@@ -51,6 +51,7 @@
 | `Provider Config Store` | `request_logs.provider_config` |
 | `Request Cache Store` | `request_logs.request_cache` |
 | `Audit Log Store` | `audit.audit_record` |
+| `Analytics Store` | `analytics.trade_fact`, `analytics.performance_daily`, `analytics.decision_outcome`, `analytics.feature_contribution`, `analytics.llm_quality`, `analytics.risk_gate_effectiveness` |
 | `DB Readiness View` | `audit.database_readiness_check` |
 | `Metric Weights Readiness View` | `audit.metric_weights_readiness_check` |
 | `Public Data Source Readiness View` | `audit.public_data_source_readiness_check` |

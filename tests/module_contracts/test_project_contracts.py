@@ -47,6 +47,15 @@ EXPECTED_SCHEMAS = (
     "audit",
 )
 
+ANALYTICS_VIEWS = (
+    "analytics.trade_fact",
+    "analytics.performance_daily",
+    "analytics.decision_outcome",
+    "analytics.feature_contribution",
+    "analytics.llm_quality",
+    "analytics.risk_gate_effectiveness",
+)
+
 CORE_STORE_TABLES = (
     "registry.instrument_profile",
     "registry.instrument_alias",
@@ -188,6 +197,23 @@ class ProjectDocumentationContractTests(unittest.TestCase):
         for path in checked_files:
             with self.subTest(path=path.name):
                 self.assertIsNone(secret_pattern.search(read_text(path)))
+
+    def test_analytics_views_are_read_only_and_cover_live_learning_loop(self) -> None:
+        migration = read_text(MIGRATIONS_DIR / "032_analytics_performance_views.sql")
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS analytics;", migration)
+        for view_name in ANALYTICS_VIEWS:
+            with self.subTest(view=view_name):
+                self.assertIn(f"CREATE OR REPLACE VIEW {view_name} AS", migration)
+        self.assertIn("orders.execution_result", migration)
+        self.assertIn("decisions.decision_record", migration)
+        self.assertIn("portfolio.portfolio_snapshot", migration)
+        self.assertIn("request_logs.external_request_log", migration)
+        self.assertIn("raw_market.raw_candle", migration)
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS analytics.", migration)
+        self.assertNotIn("UPDATE decisions.", migration)
+        self.assertNotIn("UPDATE orders.", migration)
+        self.assertNotIn("UPDATE weights.", migration)
+        self.assertNotIn("UPDATE risk.", migration)
 
 
 if __name__ == "__main__":
