@@ -412,6 +412,150 @@ def test_runtime_calendar_uses_arena_go_extended_session_for_sandbox(monkeypatch
     assert "extended_session" in session.reason
 
 
+def test_runtime_calendar_uses_recent_arena_go_provider_probe(monkeypatch) -> None:
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    import agent_app.arena_go_session_probe as probe_module
+    from agent_app.runtime_calendar import current_market_session
+
+    monkeypatch.delenv("MARKET_SESSION_STATUS_OVERRIDE", raising=False)
+    monkeypatch.setenv("MARKET_SESSION_SOURCE", "auto")
+    monkeypatch.setenv("ARENA_GO_SANDBOX", "true")
+    monkeypatch.setenv("ARENA_GO_SESSION_PROBE_ENABLED", "true")
+    monkeypatch.setenv("ARENA_GO_SESSION_PROBE_REQUIRED_FOR_OPEN", "true")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example")
+
+    def fake_recent_probe(_database_url: str, *, max_age_seconds: float):
+        assert max_age_seconds > 0
+        return {
+            "market_session_status": "open",
+            "reason": "arena_go_broker_session_probe_success",
+            "created_at": datetime.now(UTC),
+        }
+
+    monkeypatch.setattr(probe_module, "read_recent_arena_go_session_probe", fake_recent_probe)
+
+    session = current_market_session(datetime(2026, 5, 25, 8, 30, tzinfo=ZoneInfo("Europe/Moscow")))
+
+    assert session.market_session_status == "open"
+    assert session.agent_runtime_phase == "trading_session"
+    assert session.reason == "arena_go_broker_session_probe_success"
+
+
+def test_runtime_calendar_probe_required_blocks_time_only_open(monkeypatch) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from agent_app.runtime_calendar import current_market_session
+
+    monkeypatch.delenv("MARKET_SESSION_STATUS_OVERRIDE", raising=False)
+    monkeypatch.setenv("MARKET_SESSION_SOURCE", "auto")
+    monkeypatch.setenv("ARENA_GO_SANDBOX", "true")
+    monkeypatch.setenv("ARENA_GO_SESSION_PROBE_ENABLED", "true")
+    monkeypatch.setenv("ARENA_GO_SESSION_PROBE_REQUIRED_FOR_OPEN", "true")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    session = current_market_session(datetime(2026, 5, 25, 12, 0, tzinfo=ZoneInfo("Europe/Moscow")))
+
+    assert session.market_session_status == "unknown"
+    assert session.agent_runtime_phase == "degraded"
+    assert session.reason == "arena_go_session_probe_missing_or_stale"
+
+
+def test_scheduler_uses_arena_go_probe_before_time_calendar(monkeypatch) -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    import agent_app.scheduler as scheduler_module
+    from agent_app.scheduler import AutonomousScheduler, SchedulerConfig
+
+    monkeypatch.delenv("MARKET_SESSION_STATUS_OVERRIDE", raising=False)
+    monkeypatch.setenv("MARKET_SESSION_SOURCE", "auto")
+    monkeypatch.setenv("ARENA_GO_SANDBOX", "true")
+    monkeypatch.setenv("ARENA_GO_SESSION_PROBE_ENABLED", "true")
+    monkeypatch.setenv("ARENA_GO_SESSION_PROBE_REQUIRED_FOR_OPEN", "true")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example")
+
+    def fake_probe(_database_url: str, *, min_interval_seconds: float):
+        assert min_interval_seconds == 120.0
+        return SimpleNamespace(
+            market_session_status="open",
+            reason="arena_go_broker_session_probe_success",
+            source="arena_go_session_probe",
+            as_of=datetime.now(UTC),
+            bot_name="bot",
+            warnings=(),
+            errors=(),
+            from_cache=False,
+        )
+
+    monkeypatch.setattr(scheduler_module, "maybe_probe_arena_go_session", fake_probe)
+
+    scheduler = AutonomousScheduler(SchedulerConfig(single_scheduler_instance=True))
+
+    assert scheduler.market_session_status() == "open"
+
+
+def test_arena_go_extended_session_keeps_recent_moex_market_features_usable(monkeypatch) -> None:
+    from agent_app.modules.normalization_feature_vector.repository import FeatureRecord
+    from agent_app.modules.normalization_feature_vector.service import check_ttl_status
+
+    monkeypatch.setenv("ARENA_GO_SANDBOX", "true")
+    monkeypatch.setenv("ARENA_GO_MARKET_EXTENDED_SESSION", "true")
+    monkeypatch.setenv("ALLOW_ARENA_GO_EXTENDED_MARKET_DATA_GRACE", "true")
+    monkeypatch.setenv("ARENA_GO_EXTENDED_MARKET_DATA_GRACE_SECONDS", "21600")
+    monkeypatch.setenv("ARENA_GO_MARKET_TIMEZONE", "Europe/Moscow")
+    monkeypatch.setenv("ARENA_GO_MARKET_CLOSE_TIME", "23:50")
+
+    record = FeatureRecord(
+        feature_id="feature_sber_intraday_return",
+        instrument_id="moex:SBER",
+        metric_name="intraday_return",
+        metric_group="price",
+        metric_type="derived_metric",
+        raw_value=0.001,
+        normalized_value=0.52,
+        unit="ratio",
+        horizon="intraday",
+        contour="realtime_contour",
+        timestamp="2026-05-25T15:50:00Z",
+        ttl_seconds=300,
+        confidence_score=0.8,
+        source_module="Market Data Metrics Module",
+        source_refs=("raw_market.raw_candle:SBER",),
+        calculation_version="test",
+        quality_flags=(),
+        payload={},
+    )
+
+    assert check_ttl_status(record, "2026-05-25T19:05:00Z") == "fresh"
+
+
+def test_arena_go_extended_session_expands_pipeline_lookback(monkeypatch) -> None:
+    from datetime import datetime, timezone
+
+    from agent_app.main import _arena_go_extended_lookback_minutes
+
+    monkeypatch.setenv("ARENA_GO_SANDBOX", "true")
+    monkeypatch.setenv("ARENA_GO_MARKET_EXTENDED_SESSION", "true")
+    monkeypatch.setenv("ALLOW_ARENA_GO_EXTENDED_MARKET_DATA_GRACE", "true")
+    monkeypatch.setenv("ARENA_GO_MARKET_TIMEZONE", "Europe/Moscow")
+    monkeypatch.setenv("MOEX_MARKET_CLOSE_TIME", "18:50")
+    monkeypatch.setenv("ARENA_GO_MARKET_CLOSE_TIME", "23:50")
+    monkeypatch.setenv("ARENA_GO_EXTENDED_LOOKBACK_MINUTES", "480")
+
+    now = datetime(2026, 5, 25, 19, 35, tzinfo=timezone.utc)
+
+    assert _arena_go_extended_lookback_minutes(now, 240) == 480
+
+
+def test_moex_daily_candle_end_uses_moscow_offset_when_naive() -> None:
+    from agent_app.modules.external_request_gateway.repository import _timestamp_text
+
+    assert _timestamp_text("2026-05-25 22:38:55", default_utc_offset="+03:00") == "2026-05-25T19:38:55Z"
+
+
 def test_raw_text_fallback_disabled_in_production_and_throttled_when_enabled(monkeypatch) -> None:
     from agent_app.scheduler import AutonomousScheduler, ScheduleEntry, SchedulerConfig
 
@@ -1836,8 +1980,42 @@ def test_batch_risk_limits_rank_and_cap_new_long_fanout() -> None:
     assert "new_long_cycle_order_limit_reached" in result.risk_check_result.risk_flags
 
 
+def test_risk_prioritizes_strong_short_with_longs_by_abs_post_cost_edge() -> None:
+    from agent_app.modules.risk_control.repository import PositionState
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    decisions = (
+        {"instrument_id": "moex:WEAK_LONG", "action": "buy", "expected_edge_after_cost_score": 0.018},
+        {"instrument_id": "moex:STRONG_SHORT", "action": "sell", "expected_edge_after_cost_score": -0.035},
+        {"instrument_id": "moex:STRONG_LONG", "action": "buy", "expected_edge_after_cost_score": 0.030},
+        {"instrument_id": "moex:REDUCE_LONG", "action": "sell", "expected_edge_after_cost_score": -0.005},
+    )
+    positions = {
+        "moex:REDUCE_LONG": PositionState(
+            "pos_reduce",
+            "portfolio",
+            "moex:REDUCE_LONG",
+            "2026-05-24T09:00:00Z",
+            10,
+            100,
+            100,
+            1000,
+            0,
+        )
+    }
+
+    ordered = RiskControlService().prioritized_decisions(decisions, positions)
+
+    assert [item["instrument_id"] for item in ordered] == [
+        "moex:REDUCE_LONG",
+        "moex:STRONG_SHORT",
+        "moex:STRONG_LONG",
+        "moex:WEAK_LONG",
+    ]
+
+
 def test_decision_engine_can_choose_short_opening_sell() -> None:
-    from agent_app.modules.decision_engine.service import DecisionEngineService, DecisionRequest
+    from agent_app.modules.decision_engine.service import DecisionEngineService, DecisionPolicy, DecisionRequest
 
     request = DecisionRequest(
         decision_request_id="decision_short",
@@ -1861,6 +2039,40 @@ def test_decision_engine_can_choose_short_opening_sell() -> None:
         reason_codes=(),
         position=None,
     ) == "sell"
+
+    live_scale_service = DecisionEngineService(
+        policy=DecisionPolicy(short_entry_threshold=0.012, short_add_threshold=0.018)
+    )
+    assert live_scale_service.choose_action(
+        request=request,
+        expected_edge=-0.017,
+        gross_expected_edge=-0.018,
+        expected_edge_after_cost=-0.017,
+        risk_score=0.2,
+        margin=-0.033,
+        reason_codes=(),
+        position=None,
+    ) == "sell"
+    assert live_scale_service.choose_action(
+        request=request,
+        expected_edge=-0.009,
+        gross_expected_edge=-0.010,
+        expected_edge_after_cost=-0.009,
+        risk_score=0.2,
+        margin=-0.041,
+        reason_codes=(),
+        position=None,
+    ) == "hold"
+
+
+def test_decision_feature_contribution_is_centered_for_alpha_signals() -> None:
+    from agent_app.modules.decision_engine.metrics import feature_contribution
+
+    assert feature_contribution(0.25, 1.0, "positive", 1.0) < 0
+    assert feature_contribution(0.75, 1.0, "positive", 1.0) > 0
+    assert feature_contribution(0.25, 1.0, "negative", 1.0) > 0
+    assert feature_contribution(0.02, 1.0, "positive", 1.0, centered=False) == 0.02
+    assert feature_contribution(-0.02, 1.0, "positive", 1.0, centered=False) == -0.02
 
 
 def test_decision_action_selection_uses_post_cost_edge() -> None:

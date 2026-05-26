@@ -34,6 +34,12 @@ def current_market_session(now: datetime | None = None, env: dict[str, str] | No
 
     resolved_now = _localized_now(now, env_map, source=session_source)
     if session_source == "arena_go":
+        probe_session = _recent_arena_go_probe_session(resolved_now, env_map)
+        if probe_session is not None:
+            return probe_session
+        if _arena_go_probe_required(env_map):
+            timezone_name = _timezone_name(env_map, source="arena_go")
+            return MarketSession("unknown", "degraded", resolved_now, timezone_name, "arena_go_session_probe_missing_or_stale")
         return _arena_go_session(resolved_now, env_map)
     return _moex_session(resolved_now, env_map)
 
@@ -160,6 +166,40 @@ def _session_source(env: dict[str, str]) -> str:
     return "moex"
 
 
+def _recent_arena_go_probe_session(now: datetime, env: dict[str, str]) -> MarketSession | None:
+    if not _env_bool(env, "ARENA_GO_SESSION_PROBE_ENABLED", False):
+        return None
+    database_url = str(env.get("DATABASE_URL") or "").strip()
+    if not database_url:
+        return None
+    try:
+        from agent_app.arena_go_session_probe import read_recent_arena_go_session_probe
+    except Exception:
+        return None
+    max_age_seconds = _env_float(env, "ARENA_GO_SESSION_PROBE_MAX_AGE_SECONDS", 300.0)
+    payload = read_recent_arena_go_session_probe(database_url, max_age_seconds=max_age_seconds)
+    if payload is None:
+        return None
+    status = str(payload.get("market_session_status") or "").strip().lower()
+    if status not in VALID_MARKET_SESSION_STATUSES:
+        return None
+    return MarketSession(
+        status,
+        agent_runtime_phase(status),
+        now,
+        _timezone_name(env, source="arena_go"),
+        str(payload.get("reason") or "arena_go_session_probe"),
+    )
+
+
+def _arena_go_probe_required(env: dict[str, str]) -> bool:
+    return _env_bool(env, "ARENA_GO_SESSION_PROBE_ENABLED", False) and _env_bool(
+        env,
+        "ARENA_GO_SESSION_PROBE_REQUIRED_FOR_OPEN",
+        False,
+    )
+
+
 def _env_bool(env: dict[str, str], name: str, default: bool) -> bool:
     value = env.get(name)
     if value is None:
@@ -181,3 +221,10 @@ def _env_time(env: dict[str, str], names: tuple[str, ...], default: time) -> tim
         except ValueError:
             continue
     return default
+
+
+def _env_float(env: dict[str, str], name: str, default: float) -> float:
+    try:
+        return float(env.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default

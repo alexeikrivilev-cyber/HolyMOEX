@@ -198,4 +198,6 @@ Position semantics are explicit:
 
 Existing long positions use a post-cost exit overlay. Stop-loss is a hard reduce/close proposal. If profit exceeds `DECISION_TAKE_PROFIT_PCT` and post-cost continuation edge weakens, Decision may propose partial take-profit via `DECISION_PARTIAL_TAKE_PROFIT_RATIO`; if continuation edge remains strong it can hold and let the trend continue. A profitable long with non-positive post-cost edge should not be held only because old pre-cost edge was positive.
 
-Short positions use the same side-aware policy: profitable shorts can be partially covered when negative post-cost edge weakens, losing shorts are reduced/covered at `DECISION_SHORT_STOP_LOSS_PCT`, and new shorts require explicit negative post-cost edge below `DECISION_SHORT_ENTRY_THRESHOLD`.
+Short positions use the same side-aware policy: profitable shorts can be partially covered when negative post-cost edge weakens, losing shorts are reduced/covered at `DECISION_SHORT_STOP_LOSS_PCT`, and new shorts require explicit negative post-cost edge below `DECISION_SHORT_ENTRY_THRESHOLD` (default `0.012` for the ArenaGo sandbox runtime).
+
+Normalized alpha and context metrics are scored around a neutral midpoint: values below `0.5` can subtract from expected edge instead of merely reducing a long bias. This lets weak price/market/context signals create an explicit negative post-cost edge for `open_short` candidates while Risk Control still applies short capability, exposure, liquidity, slippage and loss gates.

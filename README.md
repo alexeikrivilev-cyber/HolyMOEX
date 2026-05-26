@@ -715,7 +715,8 @@ DECISION_PARTIAL_TAKE_PROFIT_ENABLED=true
 DECISION_PARTIAL_TAKE_PROFIT_RATIO=0.5
 DECISION_PROFIT_LOCK_ENABLED=true
 DECISION_EXIT_USE_POST_COST_EDGE=true
-DECISION_SHORT_ENTRY_THRESHOLD=0.05
+DECISION_SHORT_ENTRY_THRESHOLD=0.012
+DECISION_SHORT_ADD_THRESHOLD=0.018
 DECISION_SHORT_USE_POST_COST_EDGE=true
 DECISION_ALLOW_LONG_TO_SHORT_FLIP=false
 DECISION_SHORT_PARTIAL_TAKE_PROFIT_RATIO=0.5
@@ -730,10 +731,11 @@ LLM_MAX_ITEMS_PER_RUN=3
 LLM_MAX_CALLS_PER_MINUTE=2
 LLM_MAX_CALLS_PER_HOUR=30
 LLM_MIN_SECONDS_BETWEEN_CALLS=2
-ENABLE_LLM_TEXT_SCHEDULES=false
+ENABLE_LLM_TEXT_SCHEDULES=true
 MARKET_DATA_FETCH_RAW_TRADES=false
 LIQUIDITY_FETCH_RAW_TRADES=false
 PIPELINE_LOOKBACK_MINUTES=240
+ARENA_GO_EXTENDED_LOOKBACK_MINUTES=480
 LLM_DEFAULT_TEMPERATURE=0
 LLM_DEFAULT_RESPONSE_FORMAT=json_object
 ```
@@ -1275,7 +1277,11 @@ reduce_short / close_short
 
 Existing profitable long positions may be partially reduced after `DECISION_TAKE_PROFIT_PCT` when post-cost continuation edge weakens. If continuation edge remains strong, the agent may keep part of the position. Stop-loss and non-positive post-cost edge can still trigger reduce/close.
 
-Short selling is explicit capability, not an accidental `sell`. New/increased shorts require `DECISION_ALLOW_SHORT_SELLING=true`, `ARENA_GO_SHORTS_ALLOWED=true`, negative post-cost edge below `DECISION_SHORT_ENTRY_THRESHOLD`, and Risk Control approval. If shorts are disabled or provider capability is not confirmed, `open_short` / `increase_short` is rejected before execution with `short_selling_not_supported`; buy-to-cover is risk-reducing, not a new long.
+Short selling is explicit capability, not an accidental `sell`. New/increased shorts require `DECISION_ALLOW_SHORT_SELLING=true`, `ARENA_GO_SHORTS_ALLOWED=true`, negative post-cost edge below `DECISION_SHORT_ENTRY_THRESHOLD` (default `0.012` in the ArenaGo sandbox runtime), and Risk Control approval. If shorts are disabled or provider capability is not confirmed, `open_short` / `increase_short` is rejected before execution with `short_selling_not_supported`; buy-to-cover is risk-reducing, not a new long.
+
+Decision alpha/context features are midpoint-centered after normalization. A normalized value below `0.5` can reduce expected edge and, when strong enough after spread/slippage/commission costs, produce an explicit `open_short` candidate. Turnover urgency does not override this post-cost edge gate.
+
+Risk Control assesses risk-reducing exits first, then ranks new long and new short candidates together by absolute post-cost edge strength. This keeps cycle limits from creating a long-only bias when a stronger short candidate is present.
 
 ## 39. Predfinal integration requirement
 
@@ -1461,11 +1467,12 @@ LLM_MAX_CALLS_PER_DAY=200
 LLM_MAX_ITEMS_PER_RUN=3
 LLM_MIN_SECONDS_BETWEEN_CALLS=2
 ALLOW_LLM_FALLBACK=false
-ENABLE_LLM_TEXT_SCHEDULES=false
+ENABLE_LLM_TEXT_SCHEDULES=true
 RAW_TEXT_FALLBACK_INTERVAL_SECONDS=1800
 MARKET_DATA_FETCH_RAW_TRADES=false
 LIQUIDITY_FETCH_RAW_TRADES=false
 PIPELINE_LOOKBACK_MINUTES=240
+ARENA_GO_EXTENDED_LOOKBACK_MINUTES=480
 ```
 
 `deepseek/deepseek-v4-flash` is used for light text tasks: `event_extraction`, `sentiment_scoring`, `news_classification`, entity/ticker matching, duplicate/novelty pre-classification, simple disclosure classification, short news summarization and raw-text relevance filtering. `qwen/qwen3.6-35b-a3b` is used for heavier reasoning tasks: `report_extraction`, `earnings_analysis`, long-report dividend extraction, `macro_text_analysis`, complex corporate actions, multi-source synthesis, validation/research commentary and strategy/risk explanations. LLM output remains strict JSON only and must not contain buy/sell recommendations, weight changes, risk-policy changes, order intents or free-form prose.
@@ -1474,7 +1481,7 @@ The LLM cache key includes `content_hash`, `task_type`, `prompt_version`, `model
 
 Validated EventNews envelopes with `"items": []` are treated as a successful `no_event_found` result for irrelevant text. They are audited and are not retried as schema failures.
 
-In the autonomous live loop, MOEX candle/index data and ArenaGo portfolio sync are the primary realtime inputs. The default realtime lookback is `PIPELINE_LOOKBACK_MINUTES=240`, so candle feature modules have enough recent history instead of querying a zero-width instant. MOEX raw trade tape fetch is opt-in via `MARKET_DATA_FETCH_RAW_TRADES=true` and `LIQUIDITY_FETCH_RAW_TRADES=true`; by default it is disabled so the scheduler can reach feature vector, decision, risk and execution instead of blocking on heavy `/trades` backfill. LLM-heavy text schedules require `ENABLE_LLM_TEXT_SCHEDULES=true` in production; this prevents startup/restart fan-out while leaving non-LLM data intake and trading modules active.
+In the autonomous live loop, MOEX candle/index data and ArenaGo portfolio sync are the primary realtime inputs. The default realtime lookback is `PIPELINE_LOOKBACK_MINUTES=240`; during the ArenaGo sandbox evening session it is automatically raised to at least `ARENA_GO_EXTENDED_LOOKBACK_MINUTES=480` so the agent can still use the latest MOEX cash-session candles without treating them as fake-fresh. MOEX raw trade tape fetch is opt-in via `MARKET_DATA_FETCH_RAW_TRADES=true` and `LIQUIDITY_FETCH_RAW_TRADES=true`; by default it is disabled so the scheduler can reach feature vector, decision, risk and execution instead of blocking on heavy `/trades` backfill. Scheduled LLM text jobs are enabled with `ENABLE_LLM_TEXT_SCHEDULES=true`, but schedule intervals and call caps keep them at 30-60 minute cadence rather than every minute.
 
 Russian routing markers are supported for reports/dividends/disclosures, including `отчет`, `отчёт`, `дивиденды`, `совет директоров`, `МСФО`, `РСБУ`, `финансовые результаты`, `операционные результаты`, `собрание акционеров` and `существенный факт`.
 
@@ -1495,17 +1502,29 @@ Steady-state Raw Text discovery and EventNews extraction must not run every minu
 
 ## Market-hours gating
 
-The runtime exposes `market_session_status = open | closed | premarket | postmarket | unknown` and derives `agent_runtime_phase = trading_session | off_market | degraded`. With `MARKET_SESSION_SOURCE=auto` and `ARENA_GO_SANDBOX=true`, the server uses the ArenaGo sandbox session profile by default, so the autonomous loop can stay in `open/trading_session` during ArenaGo's extended test window even after the regular MOEX cash close. The default ArenaGo window is `ARENA_GO_MARKET_OPEN_TIME=10:00` to `ARENA_GO_MARKET_CLOSE_TIME=23:50` Europe/Moscow; set `MARKET_SESSION_SOURCE=moex` to force strict MOEX cash-session gating.
+The runtime exposes `market_session_status = open | closed | premarket | postmarket | unknown` and derives `agent_runtime_phase = trading_session | off_market | degraded`. With `MARKET_SESSION_SOURCE=auto` and `ARENA_GO_SANDBOX=true`, the server uses a provider-driven ArenaGo sandbox session probe by default, not only a fixed wall-clock window. Every `ARENA_GO_SESSION_PROBE_INTERVAL_SECONDS` seconds the scheduler sends safe `get_bots` and `get_positions` requests through the External Request Gateway, writes `audit.audit_record.event_type='arena_go_session_probe'`, and `current_market_session()` uses that fresh probe across Decision, Risk, Execution and Monitoring. `ERROR: MARKET CLOSED` from ArenaGo submit remains authoritative: it closes the internal session for `ARENA_GO_MARKET_CLOSED_COOLDOWN_SECONDS` and prevents retry loops.
+
+The clock-based ArenaGo window is now a fallback/profile, not the primary server gate. The default fallback window is `ARENA_GO_MARKET_OPEN_TIME=10:00` to `ARENA_GO_MARKET_CLOSE_TIME=23:50` Europe/Moscow; set `MARKET_SESSION_SOURCE=moex` to force strict MOEX cash-session gating.
 
 Outside `open`, the scheduler skips heavy live `Decision Engine`, `Risk Control` and `Execution Engine` loops and throttles LLM-heavy Raw Text/EventNews jobs. Portfolio sync, health/readiness, monitoring/audit and light market/macro maintenance may continue. If session status is `unknown`, live submit is blocked and monitoring/audit should surface a warning.
 
 ```env
 MARKET_SESSION_SOURCE=auto
+ARENA_GO_SESSION_PROBE_ENABLED=true
+ARENA_GO_SESSION_PROBE_REQUIRED_FOR_OPEN=true
+ARENA_GO_SESSION_PROBE_INTERVAL_SECONDS=120
+ARENA_GO_SESSION_PROBE_MAX_AGE_SECONDS=300
+ARENA_GO_SESSION_PROBE_REQUIRE_POSITIONS=true
+ARENA_GO_MARKET_CLOSED_COOLDOWN_SECONDS=180
 ARENA_GO_MARKET_TIMEZONE=Europe/Moscow
 ARENA_GO_MARKET_EXTENDED_SESSION=true
 ARENA_GO_MARKET_OPEN_TIME=10:00
 ARENA_GO_MARKET_CLOSE_TIME=23:50
+ALLOW_ARENA_GO_EXTENDED_MARKET_DATA_GRACE=true
+ARENA_GO_EXTENDED_MARKET_DATA_GRACE_SECONDS=21600
 ```
+
+During the ArenaGo sandbox extended window, MOEX cash-session candles may stop updating before ArenaGo stops accepting sandbox orders. `ALLOW_ARENA_GO_EXTENDED_MARKET_DATA_GRACE=true` lets recent MOEX-derived intraday price/liquidity features remain usable until `ARENA_GO_EXTENDED_MARKET_DATA_GRACE_SECONDS` expires. The feature vector is still flagged with `arena_go_extended_session_market_data_grace`; future timestamps and genuinely missing data remain blocked.
 
 Production fallback Raw Text/EventNews source-loop is disabled by default when `audit.schedule_config` cannot be loaded. To enable it deliberately:
 

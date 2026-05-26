@@ -482,6 +482,12 @@ class PostgresExternalRequestGatewayRepository:
         instrument_id = _instrument_id(request, item)
         if not instrument_id:
             return ""
+        timeframe = _text(
+            _lookup(item, "timeframe", "interval")
+            or _first(request.payload.get("timeframes"))
+            or request.payload.get("timeframe")
+            or "unknown"
+        )
         open_ts = _timestamp_from_item(
             item,
             received_at,
@@ -489,13 +495,8 @@ class PostgresExternalRequestGatewayRepository:
             date_keys=("date", "tradedate"),
             time_keys=("time", "updatetime"),
         )
-        close_ts = _timestamp_text(_lookup(item, "close_ts", "end", "finish"))
-        timeframe = _text(
-            _lookup(item, "timeframe", "interval")
-            or _first(request.payload.get("timeframes"))
-            or request.payload.get("timeframe")
-            or "unknown"
-        )
+        close_ts_default_offset = "+03:00" if request.provider in {"moex_iss", "moex_fast"} and timeframe == "1d" else None
+        close_ts = _timestamp_text(_lookup(item, "close_ts", "end", "finish"), default_utc_offset=close_ts_default_offset)
         board_id = _text(_lookup(item, "board_id", "boardid", "board") or request.payload.get("board") or request.payload.get("board_id") or "TQBR")
         cur.execute(
             """
@@ -1211,7 +1212,7 @@ def _numeric(value: Any) -> float | None:
         return None
 
 
-def _timestamp_text(value: Any) -> str | None:
+def _timestamp_text(value: Any, *, default_utc_offset: str | None = None) -> str | None:
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
@@ -1222,9 +1223,12 @@ def _timestamp_text(value: Any) -> str | None:
     if len(text) < 10:
         return None
     try:
-        datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if default_utc_offset and parsed.tzinfo is None:
+        parsed = datetime.fromisoformat(text.replace(" ", "T") + default_utc_offset)
+        return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
     return text
 
 

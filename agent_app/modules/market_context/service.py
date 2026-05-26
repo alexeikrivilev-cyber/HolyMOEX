@@ -16,6 +16,7 @@ from agent_app.contracts.unified_objects.module_job import (
     to_utc_iso,
     utc_now,
 )
+from agent_app.runtime_calendar import current_market_session
 
 from .metrics import (
     average_pairwise_correlation,
@@ -971,6 +972,7 @@ class MarketContextService:
             "correlation_regime": correlation_regime,
             "calculation_version": CALCULATION_VERSION,
         }
+        runtime_session = current_market_session()
         return MarketStateRecord(
             market_state_id=stable_record_id("market_state", record_payload),
             universe_id=job.universe_id,
@@ -982,7 +984,7 @@ class MarketContextService:
             risk_on_risk_off_score=None if risk_on_risk_off_score is None else float(risk_on_risk_off_score),
             confidence_score=confidence_score,
             source_refs=source_refs,
-            market_session_status="unknown",
+            market_session_status=runtime_session.market_session_status,
             source_module=self.module_name,
             calculation_version=CALCULATION_VERSION,
             ttl_seconds=GLOBAL_TTL_SECONDS if job.contour == "global_contour" else DAILY_TTL_SECONDS,
@@ -992,6 +994,8 @@ class MarketContextService:
                 "job_id": job.job_id,
                 "horizons": list(job.horizons),
                 "ttl_seconds": GLOBAL_TTL_SECONDS if job.contour == "global_contour" else DAILY_TTL_SECONDS,
+                "market_session_reason": runtime_session.reason,
+                "agent_runtime_phase": runtime_session.agent_runtime_phase,
             },
         )
 

@@ -485,9 +485,9 @@ class RiskControlService:
                 score = abs(edge)
             elif action == "buy":
                 group = 1
-                score = edge
+                score = max(edge, 0.0)
             elif action == "sell":
-                group = 2
+                group = 1
                 score = abs(min(edge, 0.0))
             else:
                 group = 3

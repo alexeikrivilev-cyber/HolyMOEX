@@ -78,6 +78,10 @@ RISK_METRIC_NAMES = (
     "portfolio_concentration_risk",
     "data_quality_penalty",
 )
+NON_CENTERED_DECISION_METRICS = {
+    "trade_urgency_score",
+    "turnover_deficit_score",
+}
 
 
 class DecisionEngineError(ValueError):
@@ -250,10 +254,10 @@ class DecisionPolicy:
         default_factory=lambda: _env_float("DECISION_EXIT_EDGE_HOLD_THRESHOLD", 0.06)
     )
     short_entry_threshold: float = field(
-        default_factory=lambda: _env_float("DECISION_SHORT_ENTRY_THRESHOLD", ACTION_THRESHOLD)
+        default_factory=lambda: _env_float("DECISION_SHORT_ENTRY_THRESHOLD", 0.012)
     )
     short_add_threshold: float = field(
-        default_factory=lambda: _env_float("DECISION_SHORT_ADD_THRESHOLD", ACTION_THRESHOLD)
+        default_factory=lambda: _env_float("DECISION_SHORT_ADD_THRESHOLD", 0.018)
     )
     short_exit_edge_threshold: float = field(
         default_factory=lambda: _env_float("DECISION_SHORT_EXIT_EDGE_THRESHOLD", 0.0)
@@ -554,6 +558,7 @@ class DecisionEngineService:
             if rule is None or rule.metric_name in RISK_METRIC_NAMES:
                 continue
             normalized_value = _payload_float(feature_payload, "normalized_value")
+            raw_value = _payload_float(feature_payload, "raw_value")
             feature_confidence = clip(_payload_float(feature_payload, "confidence_score"))
             ttl_status = str(feature_payload.get("ttl_status") or "fresh")
             if feature_confidence < rule.min_confidence_score:
@@ -565,11 +570,13 @@ class DecisionEngineService:
                 reason_codes.append(f"expired_feature_blocked:{metric_name}")
                 continue
             confidence = feature_confidence * freshness_multiplier
+            contribution_input = normalized_value if normalized_value is not None else raw_value
             contributions[metric_name] = feature_contribution(
-                normalized_feature=normalized_value,
+                normalized_feature=contribution_input,
                 weight=rule.weight,
                 direction=rule.direction,
                 confidence=confidence,
+                centered=normalized_value is not None and metric_name not in NON_CENTERED_DECISION_METRICS,
             )
             contribution_confidences.append(confidence)
 
@@ -586,7 +593,12 @@ class DecisionEngineService:
         turnover_context = self.turnover_context(portfolio_snapshot)
         turnover_urgency = turnover_context.get("trade_urgency_score", 0.0)
         edge = raw_edge
-        if request.run_mode == "live_trading" and raw_edge > 0 and turnover_urgency > 0:
+        if (
+            request.run_mode == "live_trading"
+            and raw_edge != 0
+            and turnover_urgency > 0
+            and (raw_edge > 0 or self.policy.allow_short_selling)
+        ):
             turnover_boost = raw_edge * self.policy.turnover_urgency_boost_factor * turnover_urgency
             contributions["turnover_urgency_score"] = turnover_boost
             edge = raw_edge + turnover_boost
@@ -1109,7 +1121,7 @@ class DecisionEngineService:
         gross_edge = float(gross_expected_edge if gross_expected_edge is not None else expected_edge)
         action_edge = float(expected_edge_after_cost if expected_edge_after_cost is not None else expected_edge)
         long_threshold = max(abs(self.policy.action_threshold), abs(self.policy.min_post_cost_edge_score))
-        short_threshold = max(abs(self.policy.short_entry_threshold), abs(self.policy.min_post_cost_edge_score))
+        short_threshold = abs(self.policy.short_entry_threshold)
         if request.decision_mode == "risk_off":
             return "reduce" if current_quantity != 0 else "hold"
         if request.decision_mode == "reduce_only":
@@ -1127,12 +1139,8 @@ class DecisionEngineService:
         if current_quantity < 0:
             if action_edge >= self.policy.short_exit_edge_threshold:
                 return "reduce"
-            if margin <= 0:
-                return "hold"
             short_add_threshold = max(short_threshold, abs(self.policy.short_add_threshold))
             return "sell" if action_edge <= -short_add_threshold and risk_score < self.policy.risk_reduce_threshold else "hold"
-        if margin <= 0:
-            return "hold"
         if action_edge >= long_threshold:
             return "buy" if risk_score < self.policy.risk_reduce_threshold else "hold"
         if gross_edge < 0 and action_edge <= -short_threshold:

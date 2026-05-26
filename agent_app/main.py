@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import timedelta
+from datetime import time, timedelta
 from typing import Sequence
+from zoneinfo import ZoneInfo
 
 from agent_app.contracts.unified_objects import TimeRange
 from agent_app.contracts.unified_objects.module_job import to_utc_iso, utc_now
@@ -81,12 +82,63 @@ def _default_time_range(system_mode: str) -> TimeRange:
         lookback_minutes = int(os.getenv("PIPELINE_LOOKBACK_MINUTES", str(default_minutes)))
     except ValueError:
         lookback_minutes = default_minutes
+    lookback_minutes = _arena_go_extended_lookback_minutes(now, lookback_minutes)
     lookback_minutes = max(1, lookback_minutes)
     return TimeRange(
         from_ts=to_utc_iso(now - timedelta(minutes=lookback_minutes)),
         to_ts=to_utc_iso(now),
         timezone="UTC",
     )
+
+
+def _arena_go_extended_lookback_minutes(now, configured_minutes: int) -> int:
+    if not _env_bool("ARENA_GO_SANDBOX", False):
+        return configured_minutes
+    if not _env_bool("ARENA_GO_MARKET_EXTENDED_SESSION", True):
+        return configured_minutes
+    if not _env_bool("ALLOW_ARENA_GO_EXTENDED_MARKET_DATA_GRACE", True):
+        return configured_minutes
+    zone = ZoneInfo(os.getenv("ARENA_GO_MARKET_TIMEZONE") or "Europe/Moscow")
+    local_time = now.astimezone(zone).time()
+    moex_close = _env_time("MOEX_MARKET_CLOSE_TIME", time(18, 50))
+    arena_close = _env_time("ARENA_GO_MARKET_CLOSE_TIME", time(23, 50))
+    if not (moex_close <= local_time < arena_close):
+        return configured_minutes
+    fallback_minutes = _env_int("ARENA_GO_EXTENDED_LOOKBACK_MINUTES", 480)
+    grace_minutes = int(_env_int("ARENA_GO_EXTENDED_MARKET_DATA_GRACE_SECONDS", 21600) / 60) + 60
+    return max(configured_minutes, fallback_minutes, grace_minutes)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(float(value))
+    except ValueError:
+        return default
+
+
+def _env_time(name: str, default: time) -> time:
+    value = str(os.getenv(name) or "").strip()
+    if not value:
+        return default
+    parts = value.split(":")
+    try:
+        if len(parts) == 2:
+            return time(int(parts[0]), int(parts[1]))
+        if len(parts) == 3:
+            return time(int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return default
+    return default
 
 
 if __name__ == "__main__":

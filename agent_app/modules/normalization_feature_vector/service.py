@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from datetime import time
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 from agent_app.contracts.unified_objects import ModuleJob, ModuleJobResult
 from agent_app.contracts.unified_objects.module_job import (
@@ -32,6 +35,10 @@ from .repository import (
 
 MODULE_NAME = "Normalization & Feature Vector Module"
 CALCULATION_VERSION = "normalization_feature_vector_v1"
+DEFAULT_MARKET_TIMEZONE = "Europe/Moscow"
+DEFAULT_MOEX_CLOSE_TIME = time(18, 50)
+DEFAULT_ARENA_GO_CLOSE_TIME = time(23, 50)
+DEFAULT_ARENA_GO_EXTENDED_MARKET_DATA_GRACE_SECONDS = 6 * 60 * 60
 
 VALID_CONTOURS = {
     "realtime_contour",
@@ -483,7 +490,9 @@ class NormalizationFeatureVectorService:
 
         ttl_status = check_ttl_status(source_record, as_of_ts)
         data_quality_score = _data_quality_score_for_feature(source_record, data_quality_by_ref)
-        data_quality_flags = _data_quality_flags_for_feature(source_record, data_quality_by_ref)
+        data_quality_flags = list(_data_quality_flags_for_feature(source_record, data_quality_by_ref))
+        if _extended_session_market_data_grace_applies(source_record, as_of_ts):
+            data_quality_flags.append("arena_go_extended_session_market_data_grace")
         if "future_timestamp" in data_quality_flags:
             ttl_status = "invalid"
             data_quality_score = min(data_quality_score, 0.0)
@@ -505,7 +514,7 @@ class NormalizationFeatureVectorService:
             ttl_status=ttl_status,
             confidence_score=confidence,
             data_quality_score=data_quality_score,
-            data_quality_flags=data_quality_flags,
+            data_quality_flags=tuple(dict.fromkeys(data_quality_flags)),
             profile=profile,
             as_of_ts=as_of_ts,
         )
@@ -756,9 +765,53 @@ def check_ttl_status(record: FeatureRecord, as_of_ts: str) -> str:
     age_seconds = (parse_utc_iso(as_of_ts) - parse_utc_iso(record.timestamp)).total_seconds()
     if age_seconds <= ttl_seconds:
         return "fresh"
+    if _extended_session_market_data_grace_applies(record, as_of_ts, age_seconds=age_seconds):
+        return "fresh"
     if age_seconds <= ttl_seconds * 2:
         return "stale"
     return "expired"
+
+
+def _extended_session_market_data_grace_applies(
+    record: FeatureRecord,
+    as_of_ts: str,
+    *,
+    age_seconds: float | None = None,
+) -> bool:
+    if not _env_bool("ARENA_GO_SANDBOX", False):
+        return False
+    if not _env_bool("ARENA_GO_MARKET_EXTENDED_SESSION", True):
+        return False
+    if not _env_bool("ALLOW_ARENA_GO_EXTENDED_MARKET_DATA_GRACE", True):
+        return False
+    if record.horizon != "intraday":
+        return False
+    if record.metric_group not in {"price", "liquidity"}:
+        return False
+    if record.source_module not in {"Market Data Metrics Module", "Liquidity & Microstructure Module"}:
+        return False
+    ttl_seconds = record.ttl_seconds
+    if ttl_seconds is None or ttl_seconds <= 0:
+        return False
+    age = age_seconds
+    if age is None:
+        age = (parse_utc_iso(as_of_ts) - parse_utc_iso(record.timestamp)).total_seconds()
+    if age <= ttl_seconds:
+        return False
+    grace_seconds = _env_float(
+        "ARENA_GO_EXTENDED_MARKET_DATA_GRACE_SECONDS",
+        DEFAULT_ARENA_GO_EXTENDED_MARKET_DATA_GRACE_SECONDS,
+    )
+    if age > max(ttl_seconds, grace_seconds):
+        return False
+    as_of = parse_utc_iso(as_of_ts)
+    if record.timestamp and parse_utc_iso(record.timestamp) > as_of:
+        return False
+    zone = ZoneInfo(os.getenv("ARENA_GO_MARKET_TIMEZONE") or os.getenv("MOEX_MARKET_TIMEZONE") or DEFAULT_MARKET_TIMEZONE)
+    local_time = as_of.astimezone(zone).time()
+    moex_close = _env_time("MOEX_MARKET_CLOSE_TIME", DEFAULT_MOEX_CLOSE_TIME)
+    arena_close = _env_time("ARENA_GO_MARKET_CLOSE_TIME", DEFAULT_ARENA_GO_CLOSE_TIME)
+    return moex_close <= local_time < arena_close
 
 
 def _latest_records_by_instrument_horizon_metric(
@@ -878,3 +931,35 @@ def _clip01(value: float | None) -> float:
     if value is None:
         return 0.0
     return min(1.0, max(0.0, float(value)))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _env_time(name: str, default: time) -> time:
+    value = str(os.getenv(name) or "").strip()
+    if not value:
+        return default
+    parts = value.split(":")
+    try:
+        if len(parts) == 2:
+            return time(int(parts[0]), int(parts[1]))
+        if len(parts) == 3:
+            return time(int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return default
+    return default

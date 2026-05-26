@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from agent_app.arena_go_session_probe import arena_go_session_probe_required, maybe_probe_arena_go_session
 from agent_app.main import main as run_orchestration_once
 from agent_app.runtime_calendar import agent_runtime_phase, current_market_session
 
@@ -128,6 +129,7 @@ class AutonomousScheduler:
         self._runtime_ready = True
         self._owner_id = os.getenv("SCHEDULER_OWNER_ID") or f"{socket.gethostname()}:{os.getpid()}"
         self._last_fallback_warning_at: float = 0.0
+        self._last_probe_log_at: float = 0.0
 
     def run(self) -> int:
         self._install_signal_handlers()
@@ -312,6 +314,9 @@ class AutonomousScheduler:
         status = str(os.getenv("MARKET_SESSION_STATUS_OVERRIDE") or "").strip().lower()
         if status in MARKET_SESSION_STATUSES:
             return status
+        probe_status = self._arena_go_session_probe_status()
+        if probe_status in MARKET_SESSION_STATUSES and (probe_status != "unknown" or arena_go_session_probe_required()):
+            return probe_status
         session = current_market_session()
         if session.market_session_status in MARKET_SESSION_STATUSES and session.market_session_status != "unknown":
             return session.market_session_status
@@ -326,6 +331,51 @@ class AutonomousScheduler:
         if session.market_session_status in MARKET_SESSION_STATUSES:
             return session.market_session_status
         return "unknown"
+
+    def _arena_go_session_probe_status(self) -> str:
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            return ""
+        try:
+            result = maybe_probe_arena_go_session(
+                database_url,
+                min_interval_seconds=_env_float("ARENA_GO_SESSION_PROBE_INTERVAL_SECONDS", 120.0),
+            )
+        except Exception as error:
+            self._audit_scheduler_warning(
+                database_url,
+                "arena_go_session_probe_failed",
+                "ArenaGo session probe failed; live trading session status is unknown until the next successful probe.",
+                ("arena_go_session_probe_failed",),
+                severity="warning",
+                payload={"error": str(error)},
+            )
+            return "unknown" if arena_go_session_probe_required() else ""
+        if result is None:
+            return ""
+        if not result.from_cache or time.monotonic() - self._last_probe_log_at >= 60.0:
+            self._log_market_session_probe(result)
+            self._last_probe_log_at = time.monotonic()
+        return result.market_session_status
+
+    def _log_market_session_probe(self, result: Any) -> None:
+        print(
+            json.dumps(
+                {
+                    "event": "arena_go_session_probe",
+                    "market_session_status": result.market_session_status,
+                    "agent_runtime_phase": agent_runtime_phase(result.market_session_status),
+                    "reason": result.reason,
+                    "source": result.source,
+                    "bot_name": result.bot_name,
+                    "from_cache": result.from_cache,
+                    "warnings": list(result.warnings),
+                    "errors": list(result.errors),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
     def skip_reason(self, entry: ScheduleEntry, *, market_status: str, runtime_phase: str, db_schedule: bool) -> str:
         del runtime_phase

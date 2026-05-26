@@ -18,12 +18,21 @@ def signed_clip(value: float | None, bound: float = 1.0) -> float:
     return min(limit, max(-limit, float(value)))
 
 
-def direction_multiplier(direction: str, normalized_feature: float) -> float:
+def directional_feature_score(direction: str, normalized_feature: float, *, centered: bool = True) -> float:
+    if not centered:
+        value = signed_clip(normalized_feature)
+        if direction == "negative":
+            return -value
+        if direction == "nonlinear":
+            return value if value >= 0.5 else -value
+        return value
+    value = clip(normalized_feature)
+    centered_value = (value - 0.5) * 2.0
     if direction == "negative":
-        return -1.0
+        return -centered_value
     if direction == "nonlinear":
-        return 1.0 if normalized_feature >= 0.5 else -1.0
-    return 1.0
+        return abs(centered_value) if value >= 0.5 else -abs(centered_value)
+    return centered_value
 
 
 def feature_contribution(
@@ -31,9 +40,10 @@ def feature_contribution(
     weight: float | None,
     direction: str,
     confidence: float | None,
+    *,
+    centered: bool = True,
 ) -> float:
-    value = clip(normalized_feature)
-    return value * float(weight or 0.0) * direction_multiplier(direction, value) * clip(confidence)
+    return directional_feature_score(direction, normalized_feature, centered=centered) * float(weight or 0.0) * clip(confidence)
 
 
 def expected_edge_score(contributions: Mapping[str, float]) -> float:

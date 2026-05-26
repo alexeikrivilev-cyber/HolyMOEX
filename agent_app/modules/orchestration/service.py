@@ -1027,6 +1027,15 @@ class OrchestrationService:
                     "llm_prompt_version": "earnings_dividend_extraction:v1",
                 }
             },
+            "Corporate Actions Adjustment Module": {
+                "corporate_actions_input": {
+                    "instrument_ids": list(instrument_ids),
+                    "corporate_action_refs": list(structured_event_refs),
+                    "price_series_ref": "raw_market.raw_candle:scheduled",
+                    "instrument_profile_ref": "registry.instrument_profile:selected_universe",
+                    "adjustment_policy": "total_return",
+                }
+            },
             "Normalization & Feature Vector Module": {
                 "normalization_input": {
                     "instrument_ids": list(instrument_ids),

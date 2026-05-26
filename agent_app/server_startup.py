@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 
 import psycopg
 
+from agent_app.arena_go_session_probe import arena_go_session_probe_enabled, probe_arena_go_session
 from agent_app.contracts.unified_objects import CachePolicy, ExternalRequest, ModuleJob, RetryPolicy, TimeRange
 from agent_app.contracts.unified_objects.module_job import to_utc_iso, utc_now
 from agent_app.modules.external_request_gateway.repository import PostgresExternalRequestGatewayRepository
@@ -358,6 +359,13 @@ def run_startup_preflight(database_url: str, runtime_env_file: Path, *, skip_ext
     readiness_passed = readiness_passed and (skip_external or broker_sync_status == "success") and bool(bot_name)
     if not readiness_passed:
         reason_codes.append("readiness_not_passed")
+
+    if not skip_external and arena_go_session_probe_enabled():
+        try:
+            probe_arena_go_session(database_url)
+        except Exception as error:
+            reason_codes.append("arena_go_session_probe_failed")
+            print(f"warning: ArenaGo session probe failed during startup: {error}")
 
     market_session = current_market_session()
     _write_runtime_env(
