@@ -488,14 +488,16 @@ class PostgresExternalRequestGatewayRepository:
             or request.payload.get("timeframe")
             or "unknown"
         )
+        market_time_offset = _market_time_default_offset(request.provider)
         open_ts = _timestamp_from_item(
             item,
             received_at,
             ("open_ts", "begin", "start", "timestamp", "ts", "systime", "date", "tradedate"),
             date_keys=("date", "tradedate"),
             time_keys=("time", "updatetime"),
+            default_utc_offset=market_time_offset,
         )
-        close_ts_default_offset = "+03:00" if request.provider in {"moex_iss", "moex_fast"} and timeframe == "1d" else None
+        close_ts_default_offset = market_time_offset
         close_ts = _timestamp_text(_lookup(item, "close_ts", "end", "finish"), default_utc_offset=close_ts_default_offset)
         board_id = _text(_lookup(item, "board_id", "boardid", "board") or request.payload.get("board") or request.payload.get("board_id") or "TQBR")
         cur.execute(
@@ -1243,21 +1245,28 @@ def _timestamp_from_item(
     *,
     date_keys: tuple[str, ...] = (),
     time_keys: tuple[str, ...] = (),
+    default_utc_offset: str | None = None,
 ) -> str:
-    direct = _timestamp_text(_lookup(item, *value_keys))
+    direct = _timestamp_text(_lookup(item, *value_keys), default_utc_offset=default_utc_offset)
     if direct:
         return direct
     date_text = _text(_lookup(item, *date_keys)) if date_keys else ""
     time_text = _text(_lookup(item, *time_keys)) if time_keys else ""
     if date_text and time_text:
-        combined = _timestamp_text(f"{date_text}T{time_text}+03:00")
+        combined = _timestamp_text(f"{date_text}T{time_text}", default_utc_offset=default_utc_offset)
         if combined:
             return combined
     if date_text:
-        date_value = _timestamp_text(date_text)
+        date_value = _timestamp_text(date_text, default_utc_offset=default_utc_offset)
         if date_value:
             return date_value
     return fallback
+
+
+def _market_time_default_offset(provider: str) -> str | None:
+    if provider in {"moex_iss", "moex_fast"}:
+        return "+03:00"
+    return None
 
 
 def _first(value: Any) -> str:

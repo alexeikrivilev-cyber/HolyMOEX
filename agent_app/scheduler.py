@@ -453,6 +453,8 @@ class AutonomousScheduler:
                 schedule_config_id=entry.schedule_config_id,
                 owner_id=self._owner_id,
                 ttl_seconds=self.config.lock_ttl_seconds,
+                interval_seconds=entry.interval_seconds,
+                respect_interval=not self.config.once,
             )
         except Exception as error:  # pragma: no cover - defensive runtime fallback
             print(
@@ -594,6 +596,8 @@ def acquire_scheduler_tick_lock(
     schedule_config_id: str,
     owner_id: str,
     ttl_seconds: float,
+    interval_seconds: float = 0.0,
+    respect_interval: bool = True,
 ) -> bool:
     import psycopg
 
@@ -608,13 +612,29 @@ def acquire_scheduler_tick_lock(
             locked_until = EXCLUDED.locked_until,
             last_tick_at = now(),
             tick_count = audit.scheduler_tick_lock.tick_count + 1
-        WHERE audit.scheduler_tick_lock.locked_until <= now()
-           OR audit.scheduler_tick_lock.owner_id = EXCLUDED.owner_id
+        WHERE (
+                audit.scheduler_tick_lock.locked_until <= now()
+             OR audit.scheduler_tick_lock.owner_id = EXCLUDED.owner_id
+          )
+          AND (
+                %s = false
+             OR audit.scheduler_tick_lock.owner_id = EXCLUDED.owner_id
+             OR audit.scheduler_tick_lock.last_tick_at <= now() - (%s::text || ' seconds')::interval
+          )
         RETURNING schedule_config_id
     """
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
-            cur.execute(query, (schedule_config_id, owner_id, max(1, int(ttl_seconds))))
+            cur.execute(
+                query,
+                (
+                    schedule_config_id,
+                    owner_id,
+                    max(1, int(ttl_seconds)),
+                    bool(respect_interval),
+                    max(0, int(interval_seconds)),
+                ),
+            )
             row = cur.fetchone()
     return row is not None
 

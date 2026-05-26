@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, Mapping
 
 from agent_app.contracts.unified_objects import (
@@ -55,6 +56,113 @@ CALCULATION_VERSION = "market_context_v1"
 
 VALID_CONTOURS = {"global_contour", "daily_contour", "event_contour"}
 VALID_HORIZONS = {"intraday", "swing", "position"}
+DEFAULT_PUBLIC_MACRO_REFS = ("macro:key_rate", "macro:ofz_2y", "macro:ofz_10y", "macro:currency", "macro:oil")
+PUBLIC_MACRO_SERIES_CATALOG = {
+    "key_rate": {
+        "series_id": "key_rate",
+        "series_name": "CBR key rate",
+        "provider": "macro_api",
+        "endpoint": "https://www.cbr.ru/hd_base/KeyRate/?UniDbQuery.Posted=True&UniDbQuery.From={from_ddmmyyyy_dot}&UniDbQuery.To={to_ddmmyyyy_dot}",
+        "unit": "percent",
+        "confidence_score": 0.95,
+        "quality_flags": ("cbr_public_html_loader",),
+    },
+    "currency": {
+        "series_id": "currency",
+        "series_name": "USD/RUB official CBR rate",
+        "provider": "macro_api",
+        "endpoint": "https://www.cbr.ru/scripts/XML_dynamic.asp?date_req1={from_ddmmyyyy}&date_req2={to_ddmmyyyy}&VAL_NM_RQ=R01235",
+        "unit": "RUB",
+        "confidence_score": 0.95,
+        "quality_flags": ("cbr_xml_dynamic_loader",),
+    },
+    "usd_rub_cbr": {
+        "series_id": "usd_rub_cbr",
+        "series_name": "USD/RUB official CBR rate",
+        "provider": "macro_api",
+        "endpoint": "https://www.cbr.ru/scripts/XML_dynamic.asp?date_req1={from_ddmmyyyy}&date_req2={to_ddmmyyyy}&VAL_NM_RQ=R01235",
+        "unit": "RUB",
+        "confidence_score": 0.95,
+        "quality_flags": ("cbr_xml_dynamic_loader",),
+    },
+    "cny_rub_cbr": {
+        "series_id": "cny_rub_cbr",
+        "series_name": "CNY/RUB official CBR rate",
+        "provider": "macro_api",
+        "endpoint": "https://www.cbr.ru/scripts/XML_dynamic.asp?date_req1={from_ddmmyyyy}&date_req2={to_ddmmyyyy}&VAL_NM_RQ=R01375",
+        "unit": "RUB",
+        "confidence_score": 0.95,
+        "quality_flags": ("cbr_xml_dynamic_loader",),
+    },
+    "ofz_1y": {
+        "series_id": "ofz_1y",
+        "series_name": "CBR ZCYC OFZ 1Y",
+        "provider": "macro_api",
+        "endpoint": "https://www.cbr.ru/hd_base/zcyc_params/?UniDbQuery.Posted=True&UniDbQuery.From={from_ddmmyyyy_dot}&UniDbQuery.To={to_ddmmyyyy_dot}",
+        "unit": "percent",
+        "confidence_score": 0.75,
+        "quality_flags": ("cbr_zcyc_public_html_loader", "maturity_1y"),
+    },
+    "ofz_2y": {
+        "series_id": "ofz_2y",
+        "series_name": "CBR ZCYC OFZ 2Y",
+        "provider": "macro_api",
+        "endpoint": "https://www.cbr.ru/hd_base/zcyc_params/?UniDbQuery.Posted=True&UniDbQuery.From={from_ddmmyyyy_dot}&UniDbQuery.To={to_ddmmyyyy_dot}",
+        "unit": "percent",
+        "confidence_score": 0.75,
+        "quality_flags": ("cbr_zcyc_public_html_loader", "maturity_2y"),
+    },
+    "ofz_10y": {
+        "series_id": "ofz_10y",
+        "series_name": "CBR ZCYC OFZ 10Y",
+        "provider": "macro_api",
+        "endpoint": "https://www.cbr.ru/hd_base/zcyc_params/?UniDbQuery.Posted=True&UniDbQuery.From={from_ddmmyyyy_dot}&UniDbQuery.To={to_ddmmyyyy_dot}",
+        "unit": "percent",
+        "confidence_score": 0.75,
+        "quality_flags": ("cbr_zcyc_public_html_loader", "maturity_10y"),
+    },
+    "oil": {
+        "series_id": "oil",
+        "series_name": "Brent daily FRED",
+        "provider": "macro_api",
+        "endpoint": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DCOILBRENTEU",
+        "unit": "USD/bbl",
+        "confidence_score": 0.85,
+        "quality_flags": ("fred_csv_loader",),
+    },
+    "brent_fred": {
+        "series_id": "brent_fred",
+        "series_name": "Brent daily FRED",
+        "provider": "macro_api",
+        "endpoint": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DCOILBRENTEU",
+        "unit": "USD/bbl",
+        "confidence_score": 0.85,
+        "quality_flags": ("fred_csv_loader",),
+    },
+}
+PUBLIC_MARKET_SERIES_CATALOG = {
+    "imoex": {
+        "index_id": "IMOEX",
+        "board_id": "SNDX",
+        "provider": "moex_iss",
+        "endpoint": "/engines/stock/markets/index/boards/SNDX/securities/IMOEX/candles.json",
+        "quality_flags": ("moex_iss_index_candles_loader",),
+    },
+    "rtsi": {
+        "index_id": "RTSI",
+        "board_id": "SNDX",
+        "provider": "moex_iss",
+        "endpoint": "/engines/stock/markets/index/boards/SNDX/securities/RTSI/candles.json",
+        "quality_flags": ("moex_iss_index_candles_loader",),
+    },
+    "rgbi": {
+        "index_id": "RGBI",
+        "board_id": "SNDX",
+        "provider": "moex_iss",
+        "endpoint": "/engines/stock/markets/index/boards/SNDX/securities/RGBI/candles.json",
+        "quality_flags": ("moex_iss_index_candles_loader",),
+    },
+}
 INPUT_FIELDS = {
     "universe_id",
     "instrument_ids",
@@ -142,7 +250,7 @@ class MarketContextInput:
         return cls(
             universe_id=universe_id,
             instrument_ids=instrument_ids,
-            macro_refs=tuple(str(item) for item in (input_payload.get("macro_refs") or ())),
+            macro_refs=_normalize_macro_refs(input_payload.get("macro_refs") or ()),
             index_refs=tuple(str(item) for item in (input_payload.get("index_refs") or ())),
             sector_refs=tuple(str(item) for item in (input_payload.get("sector_refs") or ())),
             event_refs=tuple(str(item) for item in (input_payload.get("event_refs") or ())),
@@ -242,15 +350,16 @@ class MarketContextService:
         try:
             self.validate_module_job(job)
             market_input = MarketContextInput.from_dict(payload, job)
+            context_time_range = _expanded_time_range(job.time_range.to_dict(), days=120)
             macro_points = self.repository.list_macro_points(
                 market_input.macro_refs,
-                job.time_range.from_ts,
-                job.time_range.to_ts,
+                str(context_time_range.get("from_ts") or job.time_range.from_ts),
+                str(context_time_range.get("to_ts") or job.time_range.to_ts),
             )
             index_values = self.repository.list_index_values(
                 market_input.index_refs + market_input.sector_refs,
-                job.time_range.from_ts,
-                job.time_range.to_ts,
+                str(context_time_range.get("from_ts") or job.time_range.from_ts),
+                str(context_time_range.get("to_ts") or job.time_range.to_ts),
             )
             candles = self.repository.list_candles(
                 universe_id=job.universe_id,
@@ -1010,14 +1119,32 @@ class MarketContextService:
     ) -> tuple[ExternalRequest, ...]:
         requests: list[ExternalRequest] = []
         if market_input.macro_refs and (not macro_points or _macro_points_stale(macro_points, job)):
-            requests.append(self._external_request(job, market_input, "macro_api", "macro_series"))
+            existing_series = {point.series_id for point in macro_points if point.series_id}
+            stale_macro = _macro_points_stale(macro_points, job)
+            for macro_ref in market_input.macro_refs:
+                series_id = _ref_tail(macro_ref).lower()
+                if series_id in existing_series and not stale_macro:
+                    continue
+                catalog_entry = PUBLIC_MACRO_SERIES_CATALOG.get(series_id)
+                if catalog_entry is not None:
+                    requests.append(self._macro_series_external_request(job, market_input, catalog_entry))
+                else:
+                    requests.append(self._external_request(job, market_input, "macro_api", "macro_series"))
         if (
             ((market_input.index_refs or market_input.sector_refs) and not index_values)
             or not candles
             or _index_values_stale(index_values, job)
             or _candles_stale(candles, job)
         ):
-            requests.append(self._external_request(job, market_input, "moex_iss", "market_data"))
+            stale_indexes = _index_values_stale(index_values, job)
+            existing_indexes = {value.index_id.upper() for value in index_values if value.index_id}
+            for index_ref in market_input.index_refs + market_input.sector_refs:
+                index_id = _ref_tail(index_ref).lower()
+                catalog_entry = PUBLIC_MARKET_SERIES_CATALOG.get(index_id)
+                if catalog_entry is not None and (
+                    stale_indexes or str(catalog_entry["index_id"]).upper() not in existing_indexes
+                ):
+                    requests.append(self._market_series_external_request(job, market_input, catalog_entry))
         return tuple(requests)
 
     def write_feature_record(self, record: FeatureRecord) -> str:
@@ -1084,6 +1211,78 @@ class MarketContextService:
             request_type=request_type,
             universe_id=job.universe_id,
             instrument_ids=market_input.instrument_ids,
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=GLOBAL_TTL_SECONDS, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _macro_series_external_request(
+        self,
+        job: ModuleJob,
+        market_input: MarketContextInput,
+        catalog_entry: Mapping[str, Any],
+    ) -> ExternalRequest:
+        series_id = str(catalog_entry["series_id"])
+        time_range = _expanded_time_range(job.time_range.to_dict(), days=120)
+        payload = {
+            "series_id": series_id,
+            "series_name": str(catalog_entry.get("series_name") or series_id),
+            "unit": str(catalog_entry.get("unit") or ""),
+            "endpoint": str(catalog_entry["endpoint"]),
+            "source_url": str(catalog_entry["endpoint"]),
+            "confidence_score": float(catalog_entry.get("confidence_score") or 0.85),
+            "quality_flags": list(catalog_entry.get("quality_flags") or ()),
+            "macro_refs": list(market_input.macro_refs),
+            "time_range": time_range,
+        }
+        provider = str(catalog_entry.get("provider") or "macro_api")
+        idempotency_key = f"{job.idempotency_key}:macro_series:{series_id}"
+        return ExternalRequest(
+            request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
+            caller_module=self.module_name,
+            provider=provider,
+            request_type="macro_series",
+            universe_id=job.universe_id,
+            instrument_ids=market_input.instrument_ids,
+            payload=payload,
+            cache_policy=CachePolicy(use_cache=True, max_age_seconds=MACRO_TTL_SECONDS, write_cache=True),
+            timeout_ms=5000,
+            retry_policy=RetryPolicy(max_retries=2, backoff_ms=250),
+            idempotency_key=idempotency_key,
+        )
+
+    def _market_series_external_request(
+        self,
+        job: ModuleJob,
+        market_input: MarketContextInput,
+        catalog_entry: Mapping[str, Any],
+    ) -> ExternalRequest:
+        index_id = str(catalog_entry["index_id"])
+        board_id = str(catalog_entry.get("board_id") or "SNDX")
+        time_range = _expanded_time_range(job.time_range.to_dict(), days=120)
+        payload = {
+            "index_id": index_id,
+            "secid": index_id,
+            "board_id": board_id,
+            "timeframe": "1d",
+            "endpoint": str(catalog_entry["endpoint"]),
+            "timeframes": ["1d"],
+            "quality_flags": list(catalog_entry.get("quality_flags") or ()),
+            "index_refs": list(market_input.index_refs),
+            "sector_refs": list(market_input.sector_refs),
+            "time_range": time_range,
+        }
+        provider = str(catalog_entry.get("provider") or "moex_iss")
+        idempotency_key = f"{job.idempotency_key}:market_data:{index_id}:{board_id}:1d"
+        return ExternalRequest(
+            request_id=stable_record_id("request", {"idempotency_key": idempotency_key}),
+            caller_module=self.module_name,
+            provider=provider,
+            request_type="market_data",
+            universe_id=job.universe_id,
+            instrument_ids=(f"moex:{index_id}",),
             payload=payload,
             cache_policy=CachePolicy(use_cache=True, max_age_seconds=GLOBAL_TTL_SECONDS, write_cache=True),
             timeout_ms=5000,
@@ -1499,6 +1698,27 @@ def _candles_stale(candles: tuple[RawCandle, ...], job: ModuleJob) -> bool:
         return True
     max_age_seconds = GLOBAL_TTL_SECONDS if job.contour == "global_contour" else DAILY_TTL_SECONDS
     return (parse_utc_iso(job.time_range.to_ts) - max(close_times)).total_seconds() > max_age_seconds
+
+
+def _normalize_macro_refs(raw_refs: Any) -> tuple[str, ...]:
+    refs = tuple(str(item) for item in (raw_refs or ()))
+    if not refs:
+        return DEFAULT_PUBLIC_MACRO_REFS
+    generic_refs = {"scheduled", "latest", "raw_macro.raw_macro_point:scheduled", "raw_macro.raw_macro_point:latest"}
+    if all(ref in generic_refs or _ref_tail(ref).lower() in {"scheduled", "latest"} for ref in refs):
+        return DEFAULT_PUBLIC_MACRO_REFS
+    return refs
+
+
+def _expanded_time_range(time_range: Mapping[str, Any], *, days: int) -> dict[str, Any]:
+    to_ts = str(time_range.get("to_ts") or "")
+    if not to_ts:
+        return dict(time_range)
+    to_dt = parse_utc_iso(to_ts)
+    expanded = dict(time_range)
+    expanded["from_ts"] = to_utc_iso(to_dt - timedelta(days=max(1, int(days))))
+    expanded["to_ts"] = to_utc_iso(to_dt)
+    return expanded
 
 
 def _date_key(timestamp: str) -> str:

@@ -556,6 +556,22 @@ def test_moex_daily_candle_end_uses_moscow_offset_when_naive() -> None:
     assert _timestamp_text("2026-05-25 22:38:55", default_utc_offset="+03:00") == "2026-05-25T19:38:55Z"
 
 
+def test_moex_intraday_candle_begin_uses_moscow_offset_when_naive() -> None:
+    from agent_app.modules.external_request_gateway.repository import _timestamp_from_item
+
+    item = {"begin": "2026-05-26 10:25:00", "end": "2026-05-26 10:25:59"}
+
+    assert (
+        _timestamp_from_item(
+            item,
+            "2026-05-26T07:26:00Z",
+            ("begin",),
+            default_utc_offset="+03:00",
+        )
+        == "2026-05-26T07:25:00Z"
+    )
+
+
 def test_raw_text_fallback_disabled_in_production_and_throttled_when_enabled(monkeypatch) -> None:
     from agent_app.scheduler import AutonomousScheduler, ScheduleEntry, SchedulerConfig
 
@@ -699,6 +715,51 @@ def test_autonomous_default_payloads_cover_text_and_fundamental_modules() -> Non
         job = ModuleJob(job_id=f"job_{module_name}", module_name=module_name, **base)
         payload = service._autonomous_default_payload(job, context)
         assert expected_key in payload
+
+
+def test_live_orchestration_refreshes_downstream_job_time_range_for_current_cycle() -> None:
+    from agent_app.contracts.unified_objects import TimeRange
+    from agent_app.contracts.unified_objects.module_job import parse_utc_iso
+    from agent_app.modules.orchestration.repository import InMemoryOrchestrationRepository
+    from agent_app.modules.orchestration.service import (
+        IncomingTrigger,
+        OrchestrationInput,
+        OrchestrationService,
+        PipelineContext,
+    )
+
+    service = OrchestrationService(InMemoryOrchestrationRepository())
+    context = PipelineContext(
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(
+            from_ts="2026-05-26T09:00:00Z",
+            to_ts="2026-05-26T09:00:00Z",
+        ),
+        system_mode="live_trading",
+    )
+    request = OrchestrationInput(
+        schedule_config_ref=None,
+        dependency_graph_ref=None,
+        incoming_trigger=IncomingTrigger(
+            trigger_type="scheduled",
+            source_module="Feature Store",
+            payload_ref="features.feature_record:current",
+        ),
+        system_mode="live_trading",
+    )
+
+    job = service.build_module_job(
+        "Normalization & Feature Vector Module",
+        request,
+        context,
+        ("moex:SBER",),
+    )
+    payload = service._autonomous_default_payload(job, context)
+
+    assert parse_utc_iso(job.time_range.to_ts) >= parse_utc_iso(context.time_range.to_ts)
+    assert payload["normalization_input"]["as_of_ts"] == job.time_range.to_ts
 
 
 def test_postgres_orchestration_dependency_graph_query_handles_default_ref(monkeypatch) -> None:
@@ -1548,6 +1609,9 @@ def _risk_payload(
     target_quantity: float = 1.0,
     expected_edge_score: float = 0.02,
     shorts_allowed: bool = True,
+    lot_size: int | None = None,
+    arena_go_submit_quantity_units: str | None = None,
+    min_risk_increasing_order_value: float | None = None,
 ):
     from agent_app.modules.risk_control.repository import (
         DecisionSet,
@@ -1570,6 +1634,8 @@ def _risk_payload(
     if daily_turnover_mode is not None:
         policy_rules["daily_turnover_limit_mode"] = daily_turnover_mode
         policy_rules["max_daily_turnover_hard_block_enabled"] = daily_turnover_mode != "monitor_only"
+    if arena_go_submit_quantity_units is not None:
+        policy_rules["arena_go_submit_quantity_units"] = arena_go_submit_quantity_units
     portfolio_limits = [
         PortfolioLimit(policy_id, "min_expected_edge_after_cost_score", 0.01, {}),
         PortfolioLimit(policy_id, "max_portfolio_exposure_pct", 1.0, {}),
@@ -1590,6 +1656,15 @@ def _risk_payload(
                 "max_daily_turnover_rub",
                 max_daily_turnover,
                 {"limit_mode": daily_turnover_mode} if daily_turnover_mode is not None else {},
+            )
+        )
+    if min_risk_increasing_order_value is not None:
+        portfolio_limits.append(
+            PortfolioLimit(
+                policy_id,
+                "min_risk_increasing_order_value_rub",
+                min_risk_increasing_order_value,
+                {},
             )
         )
 
@@ -1614,7 +1689,19 @@ def _risk_payload(
             ),
         ),
         risk_policies=(RiskPolicy(policy_id, "live", "1", "active", ("live_trading",), policy_rules),),
-        instrument_limits=(InstrumentLimit(policy_id, "moex:SBER", 1.0, 100_000, 20, {"arena_go_secid": "SBER"}),),
+        instrument_limits=(
+            InstrumentLimit(
+                policy_id,
+                "moex:SBER",
+                1.0,
+                100_000,
+                20,
+                {
+                    "arena_go_secid": "SBER",
+                    **({"lot_size": lot_size, "arena_go_quantity_mode": "shares"} if lot_size else {}),
+                },
+            ),
+        ),
         portfolio_limits=tuple(portfolio_limits),
         portfolio_snapshots=(
             PortfolioSnapshot(
@@ -1738,6 +1825,80 @@ def test_daily_turnover_soft_limit_does_not_block_positive_edge_order() -> None:
     assert "max_daily_turnover_soft_warning" in result.risk_check_result.risk_flags
     assert "max_daily_turnover_failed" not in result.risk_check_result.risk_flags
     assert risk_payload["risk_metrics"]["daily_turnover_limit_monitor_only"] == 1.0
+
+
+def test_risk_rounds_small_short_to_min_executable_lot_when_edge_justifies() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.06,
+        action="sell",
+        target_quantity=-4,
+        expected_edge_score=-0.06,
+        lot_size=10,
+        arena_go_submit_quantity_units="lots",
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents
+    assert result.order_intents[0].quantity == 10
+    assert result.order_intents[0].payload["position_effect"] == "open_short"
+    assert "order_quantity_rounded_up_to_min_lot" in result.risk_check_result.risk_flags
+    assert any(item["reason_code"] == "min_lot_round_up" for item in result.risk_check_result.adjustments)
+
+
+def test_risk_rejects_sub_lot_short_when_post_cost_edge_is_too_weak() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.005,
+        action="sell",
+        target_quantity=-4,
+        expected_edge_score=-0.005,
+        lot_size=10,
+        arena_go_submit_quantity_units="lots",
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "min_lot_edge_not_justified" in result.risk_check_result.risk_flags
+
+
+def test_risk_rejects_tiny_risk_increasing_order_when_min_value_configured() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.06,
+        expected_edge_score=0.06,
+        target_quantity=1,
+        min_risk_increasing_order_value=5_000,
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "risk_increasing_order_value_below_minimum" in result.risk_check_result.risk_flags
+
+
+def test_risk_floors_order_quantity_to_lot_multiple_before_execution() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.02,
+        action="sell",
+        target_quantity=-34,
+        expected_edge_score=-0.02,
+        lot_size=10,
+        arena_go_submit_quantity_units="lots",
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents
+    assert result.order_intents[0].quantity == 30
+    assert any(item["reason_code"] == "lot_size_floor" for item in result.risk_check_result.adjustments)
 
 
 def test_buy_order_uses_delta_to_target_quantity_not_full_target_each_cycle() -> None:
@@ -2041,28 +2202,142 @@ def test_decision_engine_can_choose_short_opening_sell() -> None:
     ) == "sell"
 
     live_scale_service = DecisionEngineService(
-        policy=DecisionPolicy(short_entry_threshold=0.012, short_add_threshold=0.018)
+        policy=DecisionPolicy(short_entry_threshold=0.05, short_add_threshold=0.06)
     )
     assert live_scale_service.choose_action(
         request=request,
-        expected_edge=-0.017,
-        gross_expected_edge=-0.018,
-        expected_edge_after_cost=-0.017,
+        expected_edge=-0.04,
+        gross_expected_edge=-0.041,
+        expected_edge_after_cost=-0.04,
         risk_score=0.2,
-        margin=-0.033,
-        reason_codes=(),
-        position=None,
-    ) == "sell"
-    assert live_scale_service.choose_action(
-        request=request,
-        expected_edge=-0.009,
-        gross_expected_edge=-0.010,
-        expected_edge_after_cost=-0.009,
-        risk_score=0.2,
-        margin=-0.041,
+        margin=-0.01,
         reason_codes=(),
         position=None,
     ) == "hold"
+    assert live_scale_service.choose_action(
+        request=request,
+        expected_edge=-0.061,
+        gross_expected_edge=-0.062,
+        expected_edge_after_cost=-0.061,
+        risk_score=0.2,
+        margin=0.011,
+        reason_codes=(),
+        position=None,
+    ) == "sell"
+
+
+def test_macro_degraded_overlay_does_not_create_short_from_flat_edge() -> None:
+    from agent_app.modules.decision_engine.service import DecisionEngineService
+
+    service = DecisionEngineService()
+    overlay = {
+        "edge_penalty": 0.04,
+        "edge_multiplier": 0.75,
+        "risk_penalty": 0.03,
+        "reason_codes": ("macro_context_degraded",),
+    }
+
+    adjusted, contribution = service.apply_macro_overlay(0.01, overlay)
+
+    assert adjusted == 0.0
+    assert contribution <= 0.0
+
+
+def test_turnover_on_track_does_not_add_decision_urgency() -> None:
+    from agent_app.modules.decision_engine.repository import PortfolioSnapshot
+    from agent_app.modules.decision_engine.service import DecisionEngineService
+
+    snapshot = PortfolioSnapshot(
+        "snapshot_turnover_on_track",
+        "arena_go",
+        "moex_top20_manual",
+        "2026-05-24T09:00:00Z",
+        1_000_000,
+        1_000_000,
+        1_000_000,
+        0,
+        0,
+        0,
+        0,
+        {
+            "turnover_mandate_enabled": True,
+            "turnover_target_status": "on_track",
+            "turnover_progress_ratio": 0.2,
+            "remaining_turnover_rub_14d": 8_000_000,
+            "target_gross_turnover_rub_14d": 10_000_000,
+        },
+    )
+
+    context = DecisionEngineService().turnover_context(snapshot)
+
+    assert context["turnover_target_status"] == "on_track"
+    assert context["trade_urgency_score"] == 0.0
+
+
+def test_market_context_missing_macro_uses_real_public_series_endpoints() -> None:
+    from agent_app.modules.market_context.service import MarketContextInput, MarketContextService
+
+    service = MarketContextService()
+    job = ModuleJob(
+        job_id="job_market_context_public_sources",
+        module_name="Market Context Module",
+        contour="global_contour",
+        trigger_type="scheduled",
+        universe_id="moex_top20_manual",
+        instrument_ids=("moex:SBER",),
+        horizons=("intraday",),
+        time_range=TimeRange(from_ts="2026-05-20T00:00:00Z", to_ts="2026-05-26T00:00:00Z"),
+        input_refs=(),
+        config_ref="runtime_config:live_autonomous:v1",
+        run_mode="live_trading",
+        idempotency_key="idem_market_context_public_sources",
+    )
+    market_input = MarketContextInput.from_dict(
+        {
+            "market_context_input": {
+                "universe_id": "moex_top20_manual",
+                "instrument_ids": ["moex:SBER"],
+                "macro_refs": ["raw_macro.raw_macro_point:scheduled"],
+                "index_refs": ["index:imoex"],
+                "sector_refs": [],
+                "event_refs": [],
+                "windows": [5, 20],
+            }
+        },
+        job,
+    )
+
+    requests = service.create_external_requests_for_missing_raw_data(
+        market_input=market_input,
+        job=job,
+        macro_points=(),
+        index_values=(),
+        candles=(),
+    )
+    endpoints = {str(request.payload.get("endpoint") or "") for request in requests}
+
+    assert "https://www.cbr.ru/hd_base/KeyRate/?UniDbQuery.Posted=True&UniDbQuery.From={from_ddmmyyyy_dot}&UniDbQuery.To={to_ddmmyyyy_dot}" in endpoints
+    assert "https://www.cbr.ru/scripts/XML_dynamic.asp?date_req1={from_ddmmyyyy}&date_req2={to_ddmmyyyy}&VAL_NM_RQ=R01235" in endpoints
+    assert "/engines/stock/markets/index/boards/SNDX/securities/IMOEX/candles.json" in endpoints
+    assert all(request.payload.get("endpoint") != "/series" for request in requests)
+    assert any(str(request.payload.get("time_range", {}).get("from_ts", "")).startswith("2026-01-26") for request in requests)
+
+
+def test_directional_target_position_has_meaningful_minimum_size() -> None:
+    from agent_app.modules.decision_engine.service import DecisionEngineService, DecisionPolicy
+
+    service = DecisionEngineService(
+        policy=DecisionPolicy(
+            action_threshold=0.05,
+            min_post_cost_edge_score=0.05,
+            min_target_position_pct=0.012,
+            target_full_edge_score=0.18,
+        )
+    )
+
+    target_pct = service.directional_target_position_pct(0.06, 0.2, 0.08)
+
+    assert 0.009 <= target_pct <= 0.08
 
 
 def test_decision_feature_contribution_is_centered_for_alpha_signals() -> None:
@@ -2366,7 +2641,115 @@ def test_broker_short_position_direction_is_signed() -> None:
     assert result["warnings"] == ()
     assert result["cash"] == 1_010_000.0
     assert quantities["moex:SBER"] == -10.0
+    assert payloads["moex:SBER"]["broker_quantity_signed"] == -10.0
+    assert payloads["moex:SBER"]["broker_quantity_shares"] == -10.0
     assert payloads["moex:SBER"]["broker_direction"] == "s"
+
+    signed_quantities: dict[str, float] = {}
+    signed_payloads: dict[str, dict[str, object]] = {}
+    service.apply_broker_reconciliation(
+        request=PortfolioUpdateRequest(
+            portfolio_id="portfolio",
+            fill_report_refs=(),
+            broker_snapshot_ref="broker.snapshot:test",
+            price_snapshot_ref="price.snapshot:test",
+            run_mode="live_trading",
+            as_of_ts="2026-05-24T09:00:00Z",
+        ),
+        cash=1_000_000.0,
+        realized_pnl=0.0,
+        quantities=signed_quantities,
+        average_prices={},
+        payloads=signed_payloads,
+        broker_sync=BrokerSyncResult(
+            status="success",
+            cash_balance=1_010_000.0,
+            positions=({"secid": "SBER", "position": -10, "direction": "S", "average_price": 250},),
+            trades=(),
+            errors=(),
+            request_refs=(),
+            portfolio_id="portfolio",
+        ),
+        previous_snapshot=None,
+        lot_sizes={"moex:SBER": 1},
+    )
+
+    assert signed_quantities["moex:SBER"] == -10.0
+    assert signed_payloads["moex:SBER"]["broker_quantity_signed"] == -10.0
+    assert signed_payloads["moex:SBER"]["broker_quantity_shares"] == -10.0
+
+
+def test_live_broker_short_snapshot_keeps_negative_quantity_and_positive_equity_basis() -> None:
+    from agent_app.contracts.unified_objects import ExternalResponse
+
+    class Gateway:
+        def process(self, external_request):
+            data = {
+                "get_bots": {"bots": [{"name": "ROMASHKA_misis_guap_udgu_izhgtu", "cash_balance": 900_000}]},
+                "get_positions": {
+                    "positions": [
+                        {
+                            "secid": "SBER",
+                            "position": -10,
+                            "direction": "S",
+                            "average_price": 250,
+                        }
+                    ]
+                },
+                "get_trades": {"trades": []},
+            }[external_request.request_type]
+            return ExternalResponse(
+                request_id=external_request.request_id,
+                provider="arena_go",
+                status="success",
+                data_ref=f"request_logs.external_response:{external_request.request_id}",
+                received_at="2026-05-24T09:00:00Z",
+                latency_ms=1,
+                data=data,
+            )
+
+    repository = InMemoryPortfolioStateRepository(
+        market_prices=(
+            {
+                "instrument_id": "moex:SBER",
+                "price": 240,
+                "price_ts": "2026-05-24T09:00:00Z",
+                "source_ref": "raw_market.raw_trade:sber",
+                "payload": {"lot_size": 10},
+            },
+        )
+    )
+    service = PortfolioStateService(
+        repository=repository,
+        gateway=Gateway(),
+        config={
+            "arena_go_bot_name": "ROMASHKA_misis_guap_udgu_izhgtu",
+            "arena_go_position_units": "lots",
+        },
+    )
+
+    result = service.process(
+        {
+            "portfolio_update_request": {
+                "portfolio_id": "arena_go_default",
+                "fill_report_refs": [],
+                "broker_snapshot_ref": "broker:seed",
+                "price_snapshot_ref": "price:seed",
+                "run_mode": "live_trading",
+                "as_of_ts": "2026-05-24T09:00:00Z",
+            }
+        },
+        _job(run_mode="live_trading"),
+    )
+
+    assert result.module_job_result.status == "success"
+    position = next(item for item in result.positions if item.instrument_id == "moex:SBER")
+    assert position.quantity == -100.0
+    assert position.market_value == -24_000.0
+    assert position.unrealized_pnl == 1_000.0
+    assert result.portfolio_snapshot.equity == 924_000.0
+    assert result.portfolio_snapshot.net_exposure < 0
+    assert result.portfolio_snapshot.payload["equity_cash_accounting"] == "arena_go_cash_balance_plus_gross_positions"
 
 
 def test_future_timestamp_feature_is_rejected_by_risk() -> None:

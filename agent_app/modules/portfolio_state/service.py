@@ -524,7 +524,13 @@ class PortfolioStateService:
             warnings.append("market_price_missing")
 
         values = [position.market_value for position in position_records]
-        equity = equity_value(cash, values)
+        uses_broker_cash_balance = (
+            request.run_mode == "live_trading"
+            and broker_sync.status == "success"
+            and broker_sync.cash_balance is not None
+        )
+        equity_values = [abs(value) for value in values] if uses_broker_cash_balance else values
+        equity = equity_value(cash, equity_values)
         unrealized = sum(position.unrealized_pnl for position in position_records)
         gross = gross_exposure(values, equity)
         net = net_exposure(values, equity)
@@ -573,6 +579,11 @@ class PortfolioStateService:
             "fills_applied_once": True,
             "portfolio_reconciliation_report": dict(reconciliation_report),
             "broker_reconciliation_supported": True,
+            "equity_cash_accounting": (
+                "arena_go_cash_balance_plus_gross_positions"
+                if uses_broker_cash_balance
+                else "cash_plus_signed_positions"
+            ),
             "position_state_versioned": True,
             "ttl_status": "stale" if stale or inconsistent else "fresh",
             "portfolio_state_stale_or_inconsistent": stale or inconsistent,
@@ -805,8 +816,17 @@ class PortfolioStateService:
             broker_units = _float(broker_position.get("position")) or _float(broker_position.get("quantity")) or 0.0
             direction = str(broker_position.get("direction") or broker_position.get("side") or "").strip().lower()
             direction_sign = -1.0 if direction in {"s", "sell", "short"} else 1.0
-            broker_qty = broker_units * lot_size if self.config.arena_go_position_units == "lots" else broker_units
-            broker_qty *= direction_sign
+            if broker_units < 0:
+                signed_broker_units = broker_units
+            elif broker_units > 0:
+                signed_broker_units = broker_units * direction_sign
+            else:
+                signed_broker_units = 0.0
+            broker_qty = (
+                signed_broker_units * lot_size
+                if self.config.arena_go_position_units == "lots"
+                else signed_broker_units
+            )
             broker_avg = _float(broker_position.get("average_price") or broker_position.get("avg_price"))
             internal_qty = quantities.get(instrument_id, 0.0)
             mismatch = broker_qty - internal_qty
@@ -831,6 +851,8 @@ class PortfolioStateService:
             payloads[instrument_id]["broker_position_closed"] = False
             payloads[instrument_id]["broker_position"] = dict(broker_position)
             payloads[instrument_id]["broker_quantity_raw"] = broker_units
+            payloads[instrument_id]["broker_quantity_signed"] = signed_broker_units
+            payloads[instrument_id]["broker_quantity_shares"] = broker_qty
             payloads[instrument_id]["broker_direction"] = direction or None
             payloads[instrument_id]["broker_quantity_units"] = self.config.arena_go_position_units
             payloads[instrument_id]["lot_size"] = lot_size

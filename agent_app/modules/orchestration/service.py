@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 
 from agent_app.contracts.unified_objects import ModuleJob, ModuleJobResult, TimeRange
-from agent_app.contracts.unified_objects.module_job import VALID_PRIORITIES, utc_now
+from agent_app.contracts.unified_objects.module_job import VALID_PRIORITIES, parse_utc_iso, to_utc_iso, utc_now
 
 from .constants import FULL_RECALC_ALLOWED_CONTOURS, FULL_RECALC_ALLOWED_RUN_MODES, MODULE_SPECS
 from .dependency_graph import DependencyGraph
@@ -334,6 +334,7 @@ class OrchestrationService:
         horizons = tuple(horizon for horizon in context.horizons if horizon in spec.default_horizons)
         if not horizons and spec.default_horizons:
             horizons = spec.default_horizons
+        job_time_range = self._job_time_range(request, context)
 
         idempotency_payload = {
             "module_name": module_name,
@@ -343,7 +344,7 @@ class OrchestrationService:
             "universe_id": context.universe_id,
             "instrument_ids": active_instruments,
             "horizons": horizons,
-            "time_range": context.time_range.to_dict(),
+            "time_range": job_time_range.to_dict(),
             "input_refs": input_refs,
             "config_ref": context.config_ref or request.schedule_config_ref or request.dependency_graph_ref,
             "run_mode": run_mode,
@@ -359,13 +360,33 @@ class OrchestrationService:
             universe_id=context.universe_id,
             instrument_ids=active_instruments,
             horizons=horizons,
-            time_range=context.time_range,
+            time_range=job_time_range,
             input_refs=input_refs,
             config_ref=context.config_ref or request.schedule_config_ref or request.dependency_graph_ref,
             run_mode=run_mode,
             idempotency_key=idempotency_key,
             priority=request.incoming_trigger.priority,
             status="pending",
+        )
+
+    def _job_time_range(self, request: OrchestrationInput, context: PipelineContext) -> TimeRange:
+        if (
+            context.system_mode != "live_trading"
+            or not _env_bool("ORCHESTRATION_REFRESH_JOB_TIME_RANGE_TO_NOW", True)
+            or request.incoming_trigger.trigger_type == "replay"
+        ):
+            return context.time_range
+        now = utc_now()
+        try:
+            original_to = parse_utc_iso(context.time_range.to_ts)
+        except Exception:
+            return context.time_range
+        if now <= original_to:
+            return context.time_range
+        return TimeRange(
+            from_ts=context.time_range.from_ts,
+            to_ts=to_utc_iso(now),
+            timezone=context.time_range.timezone,
         )
 
     def resolve_dependencies(

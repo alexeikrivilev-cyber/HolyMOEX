@@ -946,7 +946,6 @@ class RiskControlService:
         decision_position_effect = str(decision.get("position_effect") or "").strip()
         if decision_position_effect and decision_position_effect != position_effect:
             flags.append("decision_position_effect_recomputed")
-        proposed_trade_value = requested_quantity * price
         available_cash = self.available_cash(portfolio_snapshot)
         min_expected_edge = self.portfolio_limit_value(portfolio_limits, risk_policy, "min_expected_edge_after_cost_score")
         expected_edge = _payload_float(decision, "expected_edge_score")
@@ -971,6 +970,22 @@ class RiskControlService:
                 flags.append("turnover_trade_without_positive_edge")
             if new_or_add_short and expected_edge_after_cost >= 0:
                 flags.append("turnover_trade_without_negative_short_edge")
+
+        requested_quantity = self.lot_aware_order_quantity(
+            requested_quantity=requested_quantity,
+            price=price,
+            position_effect=position_effect,
+            expected_edge_after_cost=expected_edge_after_cost,
+            min_expected_edge=min_expected_edge,
+            instrument_limit=instrument_limit,
+            feature_vector=feature_vector,
+            risk_policy=risk_policy,
+            metrics=metrics,
+            adjustments=adjustments,
+            flags=flags,
+            final_pass=False,
+        )
+        proposed_trade_value = requested_quantity * price
 
         if side == "buy" and new_or_add_long and proposed_trade_value > available_cash:
             adjusted_quantity = floor_quantity(available_cash / price)
@@ -1144,6 +1159,31 @@ class RiskControlService:
         if requested_quantity <= 0:
             flags.append("adjusted_quantity_non_positive")
 
+        requested_quantity = self.lot_aware_order_quantity(
+            requested_quantity=requested_quantity,
+            price=price,
+            position_effect=position_effect,
+            expected_edge_after_cost=expected_edge_after_cost,
+            min_expected_edge=min_expected_edge,
+            instrument_limit=instrument_limit,
+            feature_vector=feature_vector,
+            risk_policy=risk_policy,
+            metrics=metrics,
+            adjustments=adjustments,
+            flags=flags,
+            final_pass=True,
+        )
+        proposed_trade_value = requested_quantity * price
+        metrics["proposed_trade_value_rub"] = proposed_trade_value
+        metrics["approved_quantity"] = requested_quantity
+        metrics["available_cash_after_trade"] = available_cash - proposed_trade_value if side == "buy" else available_cash + proposed_trade_value
+        min_risk_order_value = self.min_risk_increasing_order_value_rub(risk_policy, portfolio_limits)
+        metrics["min_risk_increasing_order_value_rub"] = min_risk_order_value
+        if (new_or_add_long or new_or_add_short) and min_risk_order_value > 0 and proposed_trade_value < min_risk_order_value:
+            flags.append("risk_increasing_order_value_below_minimum")
+        if requested_quantity <= 0:
+            flags.append("adjusted_quantity_non_positive")
+
         reject_flags = tuple(
             flag
             for flag in flags
@@ -1153,11 +1193,14 @@ class RiskControlService:
             in {
                 "data_quality_score_below_threshold",
                 "adjusted_quantity_non_positive",
+                "order_quantity_below_min_executable_lot",
+                "min_lot_edge_not_justified",
                 "expected_edge_after_cost_below_threshold",
                 "short_expected_edge_after_cost_above_threshold",
                 "turnover_trade_without_positive_edge",
                 "turnover_trade_without_negative_short_edge",
                 "short_selling_not_supported",
+                "risk_increasing_order_value_below_minimum",
             }
         )
         if reject_flags:
@@ -1599,6 +1642,7 @@ class RiskControlService:
             "max_short_position_pct": ("max_short_position_pct", "single_short_exposure_pct"),
             "max_total_short_exposure_pct": ("max_total_short_exposure_pct", "total_short_exposure_pct"),
             "max_single_short_order_value_rub": ("max_single_short_order_value_rub",),
+            "min_risk_increasing_order_value_rub": ("min_risk_increasing_order_value_rub", "min_order_value_rub"),
             "max_sector_exposure_pct": ("max_sector_exposure_pct", "sector_limit_pct"),
             "portfolio_snapshot_ttl_seconds": ("portfolio_snapshot_ttl_seconds", "portfolio_state_ttl_seconds"),
             "min_data_quality_score": ("min_data_quality_score",),
@@ -1614,6 +1658,16 @@ class RiskControlService:
                 if value is not None:
                     return value
         return None
+
+    def min_risk_increasing_order_value_rub(
+        self,
+        risk_policy: RiskPolicy,
+        portfolio_limits: tuple[PortfolioLimit, ...],
+    ) -> float:
+        configured = self.portfolio_limit_value(portfolio_limits, risk_policy, "min_risk_increasing_order_value_rub")
+        if configured is None:
+            configured = _env_float("RISK_MIN_RISK_INCREASING_ORDER_VALUE_RUB", 0.0)
+        return max(0.0, float(configured or 0.0))
 
     def daily_turnover_limit_mode(
         self,
@@ -1739,6 +1793,127 @@ class RiskControlService:
                 return source
         return None
 
+    def lot_aware_order_quantity(
+        self,
+        *,
+        requested_quantity: float,
+        price: float,
+        position_effect: str,
+        expected_edge_after_cost: float,
+        min_expected_edge: float | None,
+        instrument_limit: InstrumentLimit,
+        feature_vector: FeatureVector,
+        risk_policy: RiskPolicy,
+        metrics: dict[str, float],
+        adjustments: list[Mapping[str, Any]],
+        flags: list[str],
+        final_pass: bool,
+    ) -> float:
+        requested = max(0.0, float(requested_quantity or 0.0))
+        lot_size = self.executable_lot_size(instrument_limit, feature_vector)
+        submit_units = self.arena_go_submit_quantity_units(risk_policy)
+        quantity_mode = self.arena_go_quantity_mode(instrument_limit, feature_vector)
+        min_executable_quantity = float(lot_size if self.requires_lot_quantity(submit_units, quantity_mode) else 1)
+        metrics["arena_go_lot_size"] = float(lot_size)
+        metrics["min_executable_quantity"] = min_executable_quantity
+        metrics["order_quantity_before_lot_normalization"] = requested
+        metrics["arena_go_submit_units_lots"] = 1.0 if submit_units == "lots" else 0.0
+        if requested <= 0:
+            metrics["order_quantity_after_lot_normalization"] = 0.0
+            return 0.0
+        if not self.requires_lot_quantity(submit_units, quantity_mode):
+            normalized = floor_quantity(requested, 1.0)
+            if normalized != requested:
+                adjustments.append(self.adjustment(instrument_limit.instrument_id, "quantity", requested, normalized, "share_quantity_floor"))
+            metrics["order_quantity_after_lot_normalization"] = normalized
+            return normalized
+
+        floored = floor_quantity(requested, float(lot_size))
+        if floored > 0:
+            if floored != requested:
+                adjustments.append(self.adjustment(instrument_limit.instrument_id, "quantity", requested, floored, "lot_size_floor"))
+                flags.append("order_quantity_rounded_to_lot")
+            metrics["order_quantity_after_lot_normalization"] = floored
+            return floored
+
+        if final_pass or not self.allow_min_lot_round_up(risk_policy):
+            flags.append("order_quantity_below_min_executable_lot")
+            metrics["order_quantity_after_lot_normalization"] = 0.0
+            return 0.0
+        if not self.min_lot_edge_justified(
+            position_effect=position_effect,
+            expected_edge_after_cost=expected_edge_after_cost,
+            min_expected_edge=min_expected_edge,
+            risk_policy=risk_policy,
+        ):
+            flags.append("min_lot_edge_not_justified")
+            metrics["order_quantity_after_lot_normalization"] = 0.0
+            return 0.0
+
+        rounded = float(lot_size)
+        adjustments.append(self.adjustment(instrument_limit.instrument_id, "quantity", requested, rounded, "min_lot_round_up"))
+        flags.append("order_quantity_rounded_up_to_min_lot")
+        metrics["min_lot_order_value_rub"] = rounded * float(price or 0.0)
+        metrics["order_quantity_after_lot_normalization"] = rounded
+        return rounded
+
+    def executable_lot_size(self, instrument_limit: InstrumentLimit, feature_vector: FeatureVector) -> int:
+        value = (
+            _rule_float(instrument_limit.payload, "lot_size")
+            or _feature_numeric(feature_vector.features, "lot_size")
+            or 1.0
+        )
+        return max(1, int(value))
+
+    def arena_go_submit_quantity_units(self, risk_policy: RiskPolicy) -> str:
+        value = str(
+            _rule_value(risk_policy.rules, "arena_go_submit_quantity_units")
+            or os.getenv("ARENA_GO_SUBMIT_QUANTITY_UNITS")
+            or "shares"
+        ).strip().lower()
+        return "lots" if value == "lots" else "shares"
+
+    def arena_go_quantity_mode(self, instrument_limit: InstrumentLimit, feature_vector: FeatureVector) -> str:
+        value = str(
+            _rule_text(instrument_limit.payload, "arena_go_quantity_mode")
+            or _feature_text(feature_vector.features, "arena_go_quantity_mode")
+            or "shares"
+        ).strip().lower()
+        return "lots" if value == "lots" else "shares"
+
+    def requires_lot_quantity(self, submit_units: str, quantity_mode: str) -> bool:
+        return submit_units == "lots" or quantity_mode == "lots"
+
+    def allow_min_lot_round_up(self, risk_policy: RiskPolicy) -> bool:
+        configured = _rule_value(risk_policy.rules, "allow_min_lot_round_up")
+        if configured is not None:
+            return _coerce_bool(configured)
+        return _env_bool("RISK_ALLOW_MIN_LOT_ROUND_UP", True)
+
+    def min_lot_edge_justified(
+        self,
+        *,
+        position_effect: str,
+        expected_edge_after_cost: float,
+        min_expected_edge: float | None,
+        risk_policy: RiskPolicy,
+    ) -> bool:
+        if position_effect in {"reduce_long", "close_long", "reduce_short", "close_short"}:
+            return True
+        configured = _rule_float(risk_policy.rules, "min_lot_round_up_edge_after_cost_score")
+        if configured is None:
+            configured = _payload_float(os.environ, "RISK_MIN_LOT_ROUND_UP_EDGE_AFTER_COST")
+        threshold_floor = _env_float("RISK_MIN_LOT_ROUND_UP_EDGE_AFTER_COST_FLOOR", 0.05)
+        threshold = max(
+            abs(configured if configured is not None else (min_expected_edge or 0.0)),
+            abs(threshold_floor),
+        )
+        if position_effect in {"open_short", "increase_short"}:
+            return expected_edge_after_cost <= -threshold
+        if position_effect in {"open_long", "increase_long"}:
+            return expected_edge_after_cost >= threshold
+        return False
+
     def requested_order_quantity(
         self,
         action: str,
@@ -1861,6 +2036,16 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None or value == "":
         return default
     return _coerce_bool(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _rule_text(payload: Mapping[str, Any], key: str) -> str | None:

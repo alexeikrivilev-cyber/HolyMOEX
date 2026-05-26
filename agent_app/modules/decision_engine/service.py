@@ -65,7 +65,7 @@ INPUT_FIELDS = {
     "run_mode",
     "decision_mode",
 }
-ACTION_THRESHOLD = 0.05
+ACTION_THRESHOLD = 0.012
 MIN_COVERAGE_RATIO = 0.50
 PORTFOLIO_STALE_SECONDS = 86_400
 MARKET_STATE_STALE_SECONDS = 86_400
@@ -189,7 +189,9 @@ class DecisionRequest:
 
 @dataclass(frozen=True)
 class DecisionPolicy:
-    action_threshold: float = ACTION_THRESHOLD
+    action_threshold: float = field(
+        default_factory=lambda: _env_float("DECISION_ACTION_THRESHOLD", ACTION_THRESHOLD)
+    )
     min_coverage_ratio: float = MIN_COVERAGE_RATIO
     max_position_pct: float = MAX_POSITION_PCT
     portfolio_stale_seconds: int = PORTFOLIO_STALE_SECONDS
@@ -203,7 +205,19 @@ class DecisionPolicy:
         default_factory=lambda: _env_float("DECISION_MACRO_RANGE_EDGE_MULTIPLIER", 0.75)
     )
     macro_degraded_edge_multiplier: float = field(
-        default_factory=lambda: _env_float("DECISION_MACRO_DEGRADED_EDGE_MULTIPLIER", 0.75)
+        default_factory=lambda: _env_float("DECISION_MACRO_DEGRADED_EDGE_MULTIPLIER", 0.85)
+    )
+    macro_degraded_edge_penalty: float = field(
+        default_factory=lambda: _env_float("DECISION_MACRO_DEGRADED_EDGE_PENALTY", 0.0)
+    )
+    macro_edge_penalty_cap: float = field(
+        default_factory=lambda: _env_float("DECISION_MACRO_EDGE_PENALTY_CAP", ACTION_THRESHOLD * 0.5)
+    )
+    macro_overlay_short_bias_enabled: bool = field(
+        default_factory=lambda: _env_bool("DECISION_MACRO_OVERLAY_SHORT_BIAS_ENABLED", False)
+    )
+    macro_overlay_short_penalty_factor: float = field(
+        default_factory=lambda: _env_float("DECISION_MACRO_OVERLAY_SHORT_PENALTY_FACTOR", 0.0)
     )
     macro_risk_on_low_threshold: float = field(
         default_factory=lambda: _env_float("DECISION_MACRO_RISK_ON_LOW_THRESHOLD", 0.55)
@@ -254,7 +268,7 @@ class DecisionPolicy:
         default_factory=lambda: _env_float("DECISION_EXIT_EDGE_HOLD_THRESHOLD", 0.06)
     )
     short_entry_threshold: float = field(
-        default_factory=lambda: _env_float("DECISION_SHORT_ENTRY_THRESHOLD", 0.012)
+        default_factory=lambda: _env_float("DECISION_SHORT_ENTRY_THRESHOLD", ACTION_THRESHOLD)
     )
     short_add_threshold: float = field(
         default_factory=lambda: _env_float("DECISION_SHORT_ADD_THRESHOLD", 0.018)
@@ -282,6 +296,15 @@ class DecisionPolicy:
     )
     short_profit_lock_enabled: bool = field(
         default_factory=lambda: _env_bool("DECISION_SHORT_PROFIT_LOCK_ENABLED", True)
+    )
+    min_target_position_pct: float = field(
+        default_factory=lambda: _env_float("DECISION_MIN_TARGET_POSITION_PCT", 0.012)
+    )
+    target_full_edge_score: float = field(
+        default_factory=lambda: _env_float("DECISION_TARGET_FULL_EDGE_SCORE", 0.18)
+    )
+    degraded_context_target_multiplier: float = field(
+        default_factory=lambda: _env_float("DECISION_DEGRADED_CONTEXT_TARGET_MULTIPLIER", 0.65)
     )
 
 
@@ -604,11 +627,10 @@ class DecisionEngineService:
             edge = raw_edge + turnover_boost
             reason_codes.append("turnover_mandate_urgency")
         macro_overlay = self.macro_regime_overlay(vector_features, market_state)
-        if macro_overlay["edge_penalty"] > 0:
-            contributions["macro_regime_overlay_penalty"] = -macro_overlay["edge_penalty"]
-        if macro_overlay["edge_multiplier"] < 1.0:
-            contributions["macro_regime_overlay_multiplier"] = -(1.0 - macro_overlay["edge_multiplier"]) * max(edge, 0.0)
-        edge = (edge * macro_overlay["edge_multiplier"]) - macro_overlay["edge_penalty"]
+        overlay_adjusted_edge, overlay_contribution = self.apply_macro_overlay(edge, macro_overlay)
+        if overlay_contribution != 0:
+            contributions["macro_regime_overlay_adjustment"] = overlay_contribution
+        edge = overlay_adjusted_edge
         reason_codes.extend(str(item) for item in macro_overlay["reason_codes"])
         risk_values = self.risk_components(
             vector_features=vector_features,
@@ -660,7 +682,15 @@ class DecisionEngineService:
         elif edge < 0 and action_edge < 0 and self.policy.allow_short_selling:
             target_edge = action_edge
         desired_target_pct = (
-            signed_target_position_pct(target_edge, risk, max_position_pct)
+            self.directional_target_position_pct(
+                target_edge,
+                risk,
+                max_position_pct,
+                degraded_context=(
+                    "macro_context_degraded" in reason_codes
+                    or _meta_has_quality_flag(vector_features, "low_context_coverage")
+                ),
+            )
             if target_edge != 0 and (target_edge > 0 or self.policy.allow_short_selling)
             else 0.0
         )
@@ -890,14 +920,14 @@ class DecisionEngineService:
         progress = clip(_payload_float(payload, "turnover_progress_ratio"))
         remaining = max(0.0, _payload_float(payload, "remaining_turnover_rub_14d") or 0.0)
         target = max(0.0, _payload_float(payload, "target_gross_turnover_rub_14d") or 0.0)
-        if status == "achieved" or target <= 0:
+        if status in {"achieved", "on_track"} or target <= 0:
             urgency = 0.0
         elif status == "critically_behind":
             urgency = 1.0
         elif status == "behind":
             urgency = max(0.35, min(0.85, 1.0 - progress))
         else:
-            urgency = max(0.0, min(0.35, 1.0 - progress))
+            urgency = 0.0
         return {
             "turnover_mandate_enabled": bool(payload.get("turnover_mandate_enabled", True)),
             "turnover_target_status": status,
@@ -1051,17 +1081,72 @@ class DecisionEngineService:
             reason_codes.append("market_volatility_high")
 
         if macro_context and all(_payload_float(macro_context, key) is None for key in ("key_rate_level", "ofz_10y_yield", "currency_return_z", "oil_return_z")):
-            edge_penalty += 0.01
+            edge_penalty += max(0.0, self.policy.macro_degraded_edge_penalty)
             risk_penalty += 0.03
             edge_multiplier = min(edge_multiplier, self.policy.macro_degraded_edge_multiplier)
             reason_codes.append("macro_context_degraded")
 
         return {
-            "edge_penalty": clip(edge_penalty, 0.0, 0.25),
+            "edge_penalty": clip(edge_penalty, 0.0, max(0.0, self.policy.macro_edge_penalty_cap)),
             "risk_penalty": clip(risk_penalty, 0.0, 0.35),
             "edge_multiplier": clip(edge_multiplier, 0.35, 1.0),
             "reason_codes": tuple(dict.fromkeys(reason_codes)),
         }
+
+    def apply_macro_overlay(self, edge: float, macro_overlay: Mapping[str, Any]) -> tuple[float, float]:
+        """Apply market-wide context without letting missing macro data invent shorts.
+
+        Macro context should reduce confidence/size and dampen weak long entries.
+        It should not flip a neutral or mildly positive instrument score into a
+        new short just because CBR/sector inputs are degraded.  Explicit short
+        entries still work when instrument-level post-cost edge is negative.
+        """
+
+        multiplier = clip(_payload_float(macro_overlay, "edge_multiplier"), 0.35, 1.0)
+        penalty = clip(
+            _payload_float(macro_overlay, "edge_penalty") or 0.0,
+            0.0,
+            max(0.0, self.policy.macro_edge_penalty_cap),
+        )
+        before = float(edge or 0.0)
+        adjusted = before * multiplier
+        if before >= 0:
+            adjusted = max(0.0, adjusted - penalty)
+        elif self.policy.macro_overlay_short_bias_enabled and penalty > 0:
+            adjusted = adjusted - penalty * max(0.0, self.policy.macro_overlay_short_penalty_factor)
+        return adjusted, adjusted - before
+
+    def directional_target_position_pct(
+        self,
+        expected_edge: float,
+        risk_score: float,
+        max_position_pct: float,
+        *,
+        degraded_context: bool = False,
+    ) -> float:
+        edge = float(expected_edge or 0.0)
+        if edge == 0:
+            return 0.0
+        threshold = self.directional_entry_threshold(edge)
+        abs_edge = abs(edge)
+        if abs_edge < threshold:
+            return 0.0
+        capped_max = clip(max_position_pct, 0.0, 1.0)
+        min_target = min(capped_max, max(0.0, self.policy.min_target_position_pct))
+        full_edge = max(threshold + 1e-6, abs(self.policy.target_full_edge_score))
+        edge_strength = clip((abs_edge - threshold) / (full_edge - threshold))
+        raw_target = min_target + (capped_max - min_target) * edge_strength
+        risk_multiplier = clip(1.0 - float(risk_score or 0.0), 0.0, 1.0)
+        if degraded_context:
+            risk_multiplier *= clip(self.policy.degraded_context_target_multiplier, 0.1, 1.0)
+        target = min(capped_max, raw_target * risk_multiplier)
+        return target if edge > 0 else -target
+
+    def directional_entry_threshold(self, expected_edge: float) -> float:
+        base = max(abs(self.policy.action_threshold), abs(self.policy.min_post_cost_edge_score))
+        if expected_edge < 0:
+            return max(base, abs(self.policy.short_entry_threshold))
+        return base
 
     def latest_price(
         self,
@@ -1120,8 +1205,8 @@ class DecisionEngineService:
         current_quantity = float(position.quantity) if position else 0.0
         gross_edge = float(gross_expected_edge if gross_expected_edge is not None else expected_edge)
         action_edge = float(expected_edge_after_cost if expected_edge_after_cost is not None else expected_edge)
-        long_threshold = max(abs(self.policy.action_threshold), abs(self.policy.min_post_cost_edge_score))
-        short_threshold = abs(self.policy.short_entry_threshold)
+        long_threshold = self.directional_entry_threshold(1.0)
+        short_threshold = self.directional_entry_threshold(-1.0)
         if request.decision_mode == "risk_off":
             return "reduce" if current_quantity != 0 else "hold"
         if request.decision_mode == "reduce_only":
@@ -1469,6 +1554,14 @@ def _feature_regime_text(features: Mapping[str, Mapping[str, Any]], metric_name:
         if text and not _looks_numeric(text):
             return text
     return None
+
+
+def _meta_has_quality_flag(features: Mapping[str, Mapping[str, Any]], flag_name: str) -> bool:
+    meta = _feature_payload(features, "_meta")
+    if not isinstance(meta, Mapping):
+        return False
+    flags = tuple(str(flag) for flag in (meta.get("quality_flags") or ()))
+    return flag_name in flags or any(flag_name in flag for flag in flags)
 
 
 def _field_value(payload: Any, key: str) -> Any:

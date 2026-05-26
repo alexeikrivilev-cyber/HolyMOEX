@@ -510,12 +510,26 @@ class PostgresRiskControlRepository:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT instrument_limit_id, risk_policy_id, instrument_id,
-                           max_position_pct, max_order_value_rub,
-                           max_slippage_bps, payload
-                      FROM risk.instrument_limit
-                     WHERE risk_policy_id = %s
-                       AND instrument_id = ANY(%s)
+                    SELECT limit_row.instrument_limit_id,
+                           limit_row.risk_policy_id,
+                           limit_row.instrument_id,
+                           limit_row.max_position_pct,
+                           limit_row.max_order_value_rub,
+                           limit_row.max_slippage_bps,
+                           limit_row.payload || jsonb_strip_nulls(
+                             jsonb_build_object(
+                               'lot_size', profile.lot_size,
+                               'arena_go_quantity_mode', profile.arena_go_quantity_mode,
+                               'arena_go_secid', COALESCE(limit_row.payload->>'arena_go_secid', profile.arena_go_secid),
+                               'tradable', profile.tradable,
+                               'execution_enabled', profile.execution_enabled
+                             )
+                           ) AS payload
+                      FROM risk.instrument_limit limit_row
+                      LEFT JOIN registry.instrument_profile profile
+                        ON profile.instrument_id = limit_row.instrument_id
+                     WHERE limit_row.risk_policy_id = %s
+                       AND limit_row.instrument_id = ANY(%s)
                     """,
                     (_ref_tail(risk_policy_id), list(instrument_ids)),
                 )
