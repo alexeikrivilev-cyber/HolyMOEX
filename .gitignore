@@ -1,5 +1,13 @@
 # Local secrets
+.env
+.env.*
+*.env
+*.local.env
+config/api_keys.local.env
+config/*.local.env
 !config/api_keys.example.env
+!.env.example
+
 *.secret.*
 *.secrets.*
 *secret*

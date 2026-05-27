@@ -949,6 +949,9 @@ class RiskControlService:
             flags.append("decision_position_effect_recomputed")
         available_cash = self.available_cash(portfolio_snapshot)
         min_expected_edge = self.portfolio_limit_value(portfolio_limits, risk_policy, "min_expected_edge_after_cost_score")
+        min_expected_edge_override = os.getenv("RISK_MIN_EXPECTED_EDGE_AFTER_COST_SCORE")
+        if min_expected_edge_override not in (None, ""):
+            min_expected_edge = _env_float("RISK_MIN_EXPECTED_EDGE_AFTER_COST_SCORE", min_expected_edge or 0.0)
         expected_edge = _payload_float(decision, "expected_edge_score")
         expected_edge_after_cost = self.expected_edge_after_cost_score(decision, feature_vector)
         metrics["expected_edge_score"] = expected_edge
@@ -1480,10 +1483,16 @@ class RiskControlService:
             return ()
 
     def portfolio_stale_seconds(self, risk_policy: RiskPolicy | None, portfolio_limits: tuple[PortfolioLimit, ...]) -> float:
+        env_override = _env_float("RISK_PORTFOLIO_STALE_SECONDS", 0.0)
+        if env_override > 0:
+            return env_override
         value = self.portfolio_limit_value(portfolio_limits, risk_policy, "portfolio_snapshot_ttl_seconds")
         return value if value is not None and value > 0 else DEFAULT_PORTFOLIO_STALE_SECONDS
 
     def min_data_quality_score(self, risk_policy: RiskPolicy, portfolio_limits: tuple[PortfolioLimit, ...]) -> float:
+        env_override = os.getenv("RISK_MIN_DATA_QUALITY_SCORE")
+        if env_override not in (None, ""):
+            return _env_float("RISK_MIN_DATA_QUALITY_SCORE", 0.0)
         return self.portfolio_limit_value(portfolio_limits, risk_policy, "min_data_quality_score") or 0.0
 
     def max_order_value_rub(
@@ -1554,12 +1563,13 @@ class RiskControlService:
             "secid",
         )
         flags: list[str] = []
+        stale_allowlist = _env_csv("RISK_ALLOW_STALE_FEATURES")
         for metric_name in required_metrics:
             payload = feature_vector.features.get(metric_name)
             if not isinstance(payload, Mapping):
                 continue
             ttl_status = str(payload.get("ttl_status") or "fresh")
-            if ttl_status != "fresh":
+            if ttl_status != "fresh" and metric_name not in stale_allowlist:
                 flags.append(f"stale_feature_blocked:{metric_name}")
             quality_flags = {str(flag) for flag in (payload.get("quality_flags") or ())}
             if "future_timestamp" in quality_flags:
@@ -2047,6 +2057,13 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _env_csv(name: str) -> set[str]:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return set()
+    return {item.strip() for item in str(value).split(",") if item.strip()}
 
 
 def _rule_text(payload: Mapping[str, Any], key: str) -> str | None:

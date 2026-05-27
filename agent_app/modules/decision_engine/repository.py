@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
+from datetime import timedelta
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
@@ -490,8 +492,29 @@ class PostgresDecisionEngineRepository:
         as_of_ts: str,
     ) -> tuple[FeatureVector, ...]:
         requested_refs = tuple(dict.fromkeys(_ref_tail(ref) for ref in feature_vector_refs if ref and _ref_tail(ref) not in {"latest", "scheduled"}))
+        as_of_dt = parse_utc_iso(as_of_ts)
         with self._connect() as conn:
             with conn.cursor() as cur:
+                if not requested_refs:
+                    lookback_seconds = _env_float("DECISION_FEATURE_VECTOR_MERGE_LOOKBACK_SECONDS", 14_400.0)
+                    since_dt = as_of_dt - timedelta(seconds=max(60.0, lookback_seconds))
+                    cur.execute(
+                        """
+                        SELECT feature_vector_id, instrument_id, horizon, as_of_ts,
+                               features, coverage_ratio, data_quality_score,
+                               build_version, created_at
+                          FROM features.feature_vector
+                         WHERE instrument_id = ANY(%s)
+                           AND horizon = %s
+                           AND as_of_ts <= %s
+                           AND as_of_ts >= %s
+                         ORDER BY instrument_id, as_of_ts DESC, created_at DESC, feature_vector_id DESC
+                        """,
+                        (list(instrument_ids), horizon, as_of_dt, since_dt),
+                    )
+                    rows = cur.fetchall()
+                    if rows:
+                        return _merge_feature_vectors(tuple(_feature_vector_from_row(row) for row in rows))
                 cur.execute(
                     """
                     SELECT DISTINCT ON (instrument_id)
@@ -505,7 +528,7 @@ class PostgresDecisionEngineRepository:
                        AND (%s OR feature_vector_id = ANY(%s))
                      ORDER BY instrument_id, as_of_ts DESC, feature_vector_id DESC
                     """,
-                    (list(instrument_ids), horizon, parse_utc_iso(as_of_ts), not requested_refs, list(requested_refs)),
+                    (list(instrument_ids), horizon, as_of_dt, not requested_refs, list(requested_refs)),
                 )
                 rows = cur.fetchall()
         return tuple(_feature_vector_from_row(row) for row in rows)
@@ -795,6 +818,63 @@ def stable_uuid(payload: Mapping[str, Any]) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, encoded))
 
 
+def _merge_feature_vectors(vectors: tuple[FeatureVector, ...]) -> tuple[FeatureVector, ...]:
+    """Merge recent partial vectors so a macro-only refresh cannot hide alpha features."""
+
+    grouped: dict[str, list[FeatureVector]] = {}
+    for vector in vectors:
+        grouped.setdefault(vector.instrument_id, []).append(vector)
+
+    merged_vectors: list[FeatureVector] = []
+    for instrument_id, items in grouped.items():
+        ordered = sorted(
+            items,
+            key=lambda item: (item.as_of_ts, item.created_at or "", item.feature_vector_id),
+            reverse=True,
+        )
+        latest = ordered[0]
+        merged_features: dict[str, Mapping[str, Any]] = {}
+        source_ids: list[str] = []
+        for vector in ordered:
+            source_ids.append(vector.feature_vector_id)
+            for metric_name, payload in vector.features.items():
+                if metric_name not in merged_features and isinstance(payload, Mapping):
+                    merged_features[str(metric_name)] = dict(payload)
+        if not merged_features:
+            merged_features = dict(latest.features)
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "instrument_id": instrument_id,
+                    "horizon": latest.horizon,
+                    "source_ids": source_ids,
+                    "metrics": sorted(merged_features),
+                },
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        meta = dict(merged_features.get("_meta") or {})
+        meta["merged_feature_vector_sources"] = source_ids[:10]
+        meta["merged_feature_vector_source_count"] = len(source_ids)
+        meta["ttl_status"] = meta.get("ttl_status") or "fresh"
+        merged_features["_meta"] = meta
+        merged_vectors.append(
+            FeatureVector(
+                feature_vector_id=f"merged_feature_vector_{digest}",
+                instrument_id=instrument_id,
+                horizon=latest.horizon,
+                as_of_ts=latest.as_of_ts,
+                features=merged_features,
+                coverage_ratio=max(item.coverage_ratio for item in ordered),
+                data_quality_score=max(item.data_quality_score for item in ordered),
+                build_version="merged_recent_feature_vectors_v1",
+                created_at=latest.created_at,
+            )
+        )
+    return tuple(sorted(merged_vectors, key=lambda item: item.instrument_id))
+
+
 def _feature_vector_from_row(row: tuple[Any, ...]) -> FeatureVector:
     return FeatureVector(
         feature_vector_id=str(row[0]),
@@ -807,6 +887,16 @@ def _feature_vector_from_row(row: tuple[Any, ...]) -> FeatureVector:
         build_version=row[7] or "",
         created_at=_iso(row[8]),
     )
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _weights_profile_from_row(row: tuple[Any, ...]) -> WeightsProfile:

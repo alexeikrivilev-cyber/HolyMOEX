@@ -258,6 +258,12 @@ class DecisionPolicy:
     min_post_cost_edge_score: float = field(
         default_factory=lambda: _env_float("DECISION_MIN_POST_COST_EDGE_SCORE", ACTION_THRESHOLD)
     )
+    min_feature_confidence_score_override: float | None = field(
+        default_factory=lambda: _env_optional_float("DECISION_MIN_FEATURE_CONFIDENCE_SCORE")
+    )
+    feature_confidence_blocks_actions: bool = field(
+        default_factory=lambda: _env_bool("DECISION_FEATURE_CONFIDENCE_BLOCKS_ACTIONS", True)
+    )
     partial_take_profit_enabled: bool = field(
         default_factory=lambda: _env_bool("DECISION_PARTIAL_TAKE_PROFIT_ENABLED", True)
     )
@@ -593,7 +599,13 @@ class DecisionEngineService:
             raw_value = _payload_float(feature_payload, "raw_value")
             feature_confidence = clip(_payload_float(feature_payload, "confidence_score"))
             ttl_status = str(feature_payload.get("ttl_status") or "fresh")
-            if feature_confidence < rule.min_confidence_score:
+            min_confidence_score = rule.min_confidence_score
+            if self.policy.min_feature_confidence_score_override is not None:
+                min_confidence_score = min(
+                    min_confidence_score,
+                    clip(self.policy.min_feature_confidence_score_override),
+                )
+            if feature_confidence < min_confidence_score:
                 reason_codes.append(f"feature_confidence_below_rule:{metric_name}")
                 continue
             freshness_multiplier = self.freshness_multiplier(metric_name, ttl_status, rule)
@@ -1382,16 +1394,17 @@ class DecisionEngineService:
         ``turnover_mandate_urgency``. Earlier versions treated any reason code as
         a block, which made autonomous turnover-aware decisions self-blocking.
         """
-        hard_prefixes = (
+        hard_prefixes = [
             "feature_vector_missing",
             "feature_coverage_low",
-            "feature_confidence_below_rule",
             "expired_feature_blocked",
             "market_session_status:",
             "market_regime:risk_off",
             "market_regime:stress",
             "market_regime:halt",
-        )
+        ]
+        if self.policy.feature_confidence_blocks_actions:
+            hard_prefixes.append("feature_confidence_below_rule")
         hard_codes = {
             "weights_profile_not_active",
             "weights_profile_horizon_mismatch",
@@ -1622,6 +1635,17 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _env_optional_float(name: str) -> float | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _env_bool(name: str, default: bool) -> bool:

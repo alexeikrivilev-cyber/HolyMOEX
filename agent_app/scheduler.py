@@ -6,6 +6,8 @@ import os
 import re
 import signal
 import socket
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -291,7 +293,11 @@ class AutonomousScheduler:
         ]
         if os.getenv("DATABASE_URL"):
             argv.append("--use-postgres")
-        exit_code = run_orchestration_once(argv)
+        if _env_bool("SCHEDULER_ENTRY_SUBPROCESS", True):
+            completed = subprocess.run([sys.executable, "-m", "agent_app.main", *argv], check=False)
+            exit_code = int(completed.returncode)
+        else:
+            exit_code = run_orchestration_once(argv)
         print(
             json.dumps(
                 {
