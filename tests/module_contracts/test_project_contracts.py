@@ -138,9 +138,42 @@ EXPECTED_TICKERS = (
     "PIKK",
 )
 
+SECRET_SCAN_EXCLUDED_DIRS = {
+    ".git",
+    ".venv",
+    ".pytest_cache",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    "data",
+    "logs",
+    "tmp",
+}
+
+SECRET_SCAN_EXCLUDED_FILES = {
+    PROJECT_ROOT / "config" / "api_keys.local.env",
+}
+
 
 def all_migration_sql() -> str:
     return "\n".join(read_text(path) for path in sorted(MIGRATIONS_DIR.glob("*.sql")))
+
+
+def project_text_files() -> list:
+    files = []
+    for path in PROJECT_ROOT.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in SECRET_SCAN_EXCLUDED_DIRS for part in path.parts):
+            continue
+        if path in SECRET_SCAN_EXCLUDED_FILES:
+            continue
+        if path.name.startswith(("live_smoke_report", "dry_run_summary", "preflight_before_smoke")):
+            continue
+        if path.suffix.lower() in {".pyc", ".png", ".jpg", ".jpeg", ".gif", ".ico"}:
+            continue
+        files.append(path)
+    return files
 
 
 class ProjectDocumentationContractTests(unittest.TestCase):
@@ -214,6 +247,78 @@ class ProjectDocumentationContractTests(unittest.TestCase):
         self.assertNotIn("UPDATE orders.", migration)
         self.assertNotIn("UPDATE weights.", migration)
         self.assertNotIn("UPDATE risk.", migration)
+
+    def test_gitlab_packaging_files_exist_and_ignore_local_secrets(self) -> None:
+        self.assertTrue((PROJECT_ROOT / "Dockerfile").exists())
+        self.assertTrue((PROJECT_ROOT / ".dockerignore").exists())
+        self.assertTrue((PROJECT_ROOT / ".gitignore").exists())
+        self.assertTrue((PROJECT_ROOT / ".env.example").exists())
+        self.assertTrue((PROJECT_ROOT / "config" / "api_keys.example.env").exists())
+        self.assertTrue((PROJECT_ROOT / "docs" / "deployment_gitlab.md").exists())
+
+        gitignore = read_text(PROJECT_ROOT / ".gitignore")
+        dockerignore = read_text(PROJECT_ROOT / ".dockerignore")
+        for token in ("config/api_keys.local.env", "*.local.env", ".env", ".venv/", ".pytest_cache/"):
+            with self.subTest(ignore_token=token):
+                self.assertIn(token, gitignore)
+        for token in (".git", ".venv", ".pytest_cache", "config/api_keys.local.env", "*.local.env", ".env", "data/"):
+            with self.subTest(dockerignore_token=token):
+                self.assertIn(token, dockerignore)
+
+    def test_safe_deployment_defaults_are_documented_and_configured(self) -> None:
+        dockerfile = read_text(PROJECT_ROOT / "Dockerfile")
+        startup = read_text(PROJECT_ROOT / "scripts" / "start_autonomous.sh")
+        example = read_text(PROJECT_ROOT / "config" / "api_keys.example.env")
+        docs = read_text(PROJECT_ROOT / "docs" / "deployment_gitlab.md")
+
+        for text in (dockerfile, example, docs):
+            with self.subTest(target="safe_defaults"):
+                self.assertIn("SAFE_LIVE_SUBMIT=false", text)
+                self.assertIn("ARENA_GO_SHORTS_ALLOWED=false", text)
+                self.assertIn("DECISION_ALLOW_SHORT_SELLING=false", text)
+        self.assertIn('ARENA_GO_SHORTS_ALLOWED="${ARENA_GO_SHORTS_ALLOWED:-false}"', startup)
+        self.assertIn('DECISION_ALLOW_SHORT_SELLING="${DECISION_ALLOW_SHORT_SELLING:-false}"', startup)
+        self.assertIn('SAFE_LIVE_SUBMIT="${SAFE_LIVE_SUBMIT:-false}"', startup)
+        self.assertIn("DATA_DIR=/data", dockerfile)
+        self.assertIn("SANDBOX_API_KEY=provided_by_organizers", example)
+        self.assertIn("POLZA_API_KEY=put_in_gitlab_ci_variables", example)
+
+    def test_arena_go_auth_uses_sandbox_key_as_primary_source(self) -> None:
+        startup = read_text(PROJECT_ROOT / "agent_app" / "server_startup.py")
+        gateway_repo = read_text(
+            PROJECT_ROOT / "agent_app" / "modules" / "external_request_gateway" / "repository.py"
+        )
+        gateway_provider = read_text(
+            PROJECT_ROOT / "agent_app" / "modules" / "external_request_gateway" / "providers.py"
+        )
+        self.assertIn('os.getenv("SANDBOX_API_KEY"', startup)
+        self.assertIn('auth_value_source="SANDBOX_API_KEY"', gateway_repo)
+        self.assertIn('"ARENA_GO_API_KEY"', gateway_repo)
+        self.assertIn('"ARENA_GO_TOKEN"', gateway_repo)
+        self.assertIn("ALLOW_ARENA_GO_TOKEN_FALLBACK", gateway_provider)
+
+    def test_tracked_project_files_do_not_contain_obvious_real_secrets(self) -> None:
+        real_secret_patterns = (
+            re.compile(r"pza_[A-Za-z0-9_-]+"),
+            re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+            re.compile(r"\b(?:SANDBOX_API_KEY|ARENA_GO_TOKEN|ARENA_GO_API_KEY|POLZA_API_KEY)=[A-Za-z0-9_./+=:-]{20,}"),
+            re.compile(r"Bearer\s+"),
+        )
+        allowed_placeholders = {
+            "SANDBOX_API_KEY=provided_by_organizers",
+            "POLZA_API_KEY=put_in_gitlab_ci_variables",
+        }
+        for path in project_text_files():
+            try:
+                text = read_text(path)
+            except UnicodeDecodeError:
+                continue
+            scrubbed = text
+            for placeholder in allowed_placeholders:
+                scrubbed = scrubbed.replace(placeholder, "")
+            for pattern in real_secret_patterns:
+                with self.subTest(path=str(path.relative_to(PROJECT_ROOT)), pattern=pattern.pattern):
+                    self.assertIsNone(pattern.search(scrubbed))
 
 
 if __name__ == "__main__":

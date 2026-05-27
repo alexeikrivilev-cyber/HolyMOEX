@@ -318,7 +318,10 @@ class ProviderRequestNormalizer:
         if isinstance(fallback_sources, (list, tuple)):
             auth_sources.extend(str(item) for item in fallback_sources if str(item or ""))
         auth_value = ""
+        primary_source = str(config.auth_value_source)
         for source in auth_sources:
+            if source != primary_source and not self._auth_fallback_allowed(config):
+                continue
             auth_value = self.env.get(source, "")
             if auth_value:
                 break
@@ -328,6 +331,14 @@ class ProviderRequestNormalizer:
         if auth_scheme and not auth_value.startswith(f"{auth_scheme} "):
             auth_value = f"{auth_scheme} {auth_value}"
         return {config.auth_header: auth_value}
+
+    def _auth_fallback_allowed(self, config: ProviderConfig) -> bool:
+        if config.provider != "arena_go":
+            return True
+        if str(self.env.get("ALLOW_ARENA_GO_TOKEN_FALLBACK", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+        app_env = str(self.env.get("APP_ENV", "")).strip().lower()
+        return app_env in {"local", "dev", "development", "test"}
 
     def _polza_model_for_task(self, payload: Mapping[str, Any], config: ProviderConfig) -> str:
         task_type = str(payload.get("task_type") or "").strip()

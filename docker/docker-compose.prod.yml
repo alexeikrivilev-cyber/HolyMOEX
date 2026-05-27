@@ -1,4 +1,7 @@
 services:
+  # Local development/prod-like compose only.
+  # Do not commit real config/api_keys.local.env. GitLab/server deployment should
+  # pass SANDBOX_API_KEY and other secrets through environment variables.
   postgres_local:
     image: postgres:16
     env_file:
@@ -47,7 +50,15 @@ services:
         condition: service_healthy
       migration_runner:
         condition: service_completed_successfully
-    command: ["python", "-m", "agent_app.scheduler", "--interval-seconds", "60"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        RUNTIME_ENV_FILE="$${RUNTIME_ENV_FILE:-/tmp/holymoex_runtime/arena_go.env}"
+        python -m agent_app.server_startup --runtime-env-file "$$RUNTIME_ENV_FILE"
+        . "$$RUNTIME_ENV_FILE"
+        exec python -m agent_app.scheduler --interval-seconds "$${SCHEDULER_INTERVAL_SECONDS:-60}"
     restart: unless-stopped
     stop_grace_period: 30s
 

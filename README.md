@@ -1,5 +1,35 @@
 # HolyMOEX
 
+## GitLab / Organizer Deployment
+
+The project is deployable from the root `Dockerfile`. Organizer servers provide
+the ArenaGo sandbox key through `SANDBOX_API_KEY`; local fallback variables
+`ARENA_GO_API_KEY` and `ARENA_GO_TOKEN` are disabled in production unless
+`ALLOW_ARENA_GO_TOKEN_FALLBACK=true` is explicitly set.
+
+Safe image defaults:
+
+```text
+SAFE_LIVE_SUBMIT=false
+LIVE_READINESS_PASSED=false
+ARENA_GO_SHORTS_ALLOWED=false
+DECISION_ALLOW_SHORT_SELLING=false
+DECISION_ALLOW_LONG_TO_SHORT_FLIP=false
+DATA_DIR=/data
+```
+
+`config/api_keys.local.env` is for local development only and must not be
+committed. Use GitLab CI/CD Variables or server env for `SANDBOX_API_KEY` and
+`POLZA_API_KEY`. Persistent runtime data is stored under `/data`.
+
+Build:
+
+```bash
+docker build -t holymoex-agent .
+```
+
+More deployment details: [`docs/deployment_gitlab.md`](docs/deployment_gitlab.md).
+
 **HolyMOEX** — модульный AI/quant-агент для анализа и автономного runtime-а на рынке акций MOEX. Проект соединяет классический quant-пайплайн, строгую PostgreSQL-модель данных, событийную обработку новостей, LLM-извлечение смысла из текста, риск-контроль и слой исполнения через broker/gateway-интерфейсы.
 
 Главная идея проекта: **LLM не торгует сам**. Модель помогает там, где действительно нужен язык и контекст: новости, раскрытия, отчётность, дивиденды, корпоративные события, макро-комментарии. Торговое решение принимает `Decision Engine Module` на базе нормализованных признаков, весов, состояния портфеля, рыночного режима и правил риска. Исполнение проходит только после `Risk Control Module`.

@@ -100,9 +100,10 @@ def _token_source() -> tuple[str, str]:
     sandbox_token = os.getenv("SANDBOX_API_KEY", "").strip()
     if sandbox_token:
         return "SANDBOX_API_KEY", sandbox_token
-    fallback_token = os.getenv("ARENA_GO_TOKEN", "").strip()
-    if fallback_token and _arena_go_token_fallback_allowed():
-        return "ARENA_GO_TOKEN_FALLBACK", fallback_token
+    for fallback_name in ("ARENA_GO_API_KEY", "ARENA_GO_TOKEN"):
+        fallback_token = os.getenv(fallback_name, "").strip()
+        if fallback_token and _arena_go_token_fallback_allowed():
+            return f"{fallback_name}_FALLBACK", fallback_token
     return "", ""
 
 
@@ -336,10 +337,12 @@ def run_startup_preflight(database_url: str, runtime_env_file: Path, *, skip_ext
     if not token and not skip_external:
         raise StartupPreflightError(
             "SANDBOX_API_KEY is required for ArenaGo sandbox in server mode; "
-            "ARENA_GO_TOKEN fallback requires APP_ENV=local/dev/test or ALLOW_ARENA_GO_TOKEN_FALLBACK=true"
+            "ARENA_GO_API_KEY/ARENA_GO_TOKEN fallback requires APP_ENV=local/dev/test or ALLOW_ARENA_GO_TOKEN_FALLBACK=true"
         )
     if token_env == "ARENA_GO_TOKEN_FALLBACK":
         print("warning: using ARENA_GO_TOKEN fallback; prefer SANDBOX_API_KEY for server deployment")
+    elif token_env == "ARENA_GO_API_KEY_FALLBACK":
+        print("warning: using ARENA_GO_API_KEY fallback; prefer SANDBOX_API_KEY for server deployment")
 
     bot_name = os.getenv("ARENA_GO_BOT_NAME", "").strip() or os.getenv("ARENA_GO_PORTFOLIO", "").strip()
     broker_sync_status = "skipped"

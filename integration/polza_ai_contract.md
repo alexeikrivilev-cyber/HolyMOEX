@@ -11,7 +11,7 @@
 ## Auth
 
 ```http
-Authorization: Bearer ${POLZA_API_KEY}
+Authorization: bearer-token auth using ${POLZA_API_KEY}
 ```
 
 Secrets must come from environment variables or server secrets. They must not be committed, copied into the Docker image, or written to audit/request logs.

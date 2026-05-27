@@ -971,7 +971,7 @@ def default_provider_configs() -> dict[str, ProviderConfig]:
                 "allowed_request_types": ["submit_order", "get_trades", "get_positions", "get_bots"],
                 "portfolio_source_of_truth": "bots[].name",
                 "quantity_mode": "shares",
-                "auth_fallback_value_sources": ["ARENA_GO_TOKEN"],
+                "auth_fallback_value_sources": ["ARENA_GO_API_KEY", "ARENA_GO_TOKEN"],
             },
             default_base_url="https://arenago.ru/api",
         ),

@@ -244,6 +244,21 @@ def test_scheduler_converts_db_schedule_payload_to_due_source_entry() -> None:
     assert entry.run_mode == "live_trading"
 
 
+def test_live_decision_timer_recovery_migration_restores_feature_store_schedule() -> None:
+    from pathlib import Path
+
+    migration = Path(
+        "agent_app/storage/postgres/migrations/037_restore_live_decision_timer_recovery.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "schedule:live_autonomous:decision:1m" in migration
+    assert "enabled = true" in migration
+    assert "'source', 'Feature Store'" in migration
+    assert "'interval_seconds', 60" in migration
+    assert "weights:live_autonomous:intraday:v1" in migration
+    assert "risk_execution_gates_unchanged" in migration
+
+
 def test_scheduler_skips_event_driven_risk_without_timer() -> None:
     from agent_app.scheduler import schedule_entry_from_payload
 
@@ -2360,6 +2375,24 @@ def test_batch_risk_limits_rank_and_cap_new_long_fanout() -> None:
     assert "new_long_cycle_order_limit_reached" in result.risk_check_result.risk_flags
 
 
+def test_risk_cycle_limit_env_overrides_db_limit(monkeypatch) -> None:
+    from agent_app.modules.risk_control.repository import PortfolioLimit, RiskPolicy
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    policy_id = "live_policy"
+    monkeypatch.setenv("RISK_MAX_NEW_LONG_ORDERS_PER_CYCLE", "1")
+
+    value = RiskControlService().cycle_limit_value(
+        RiskPolicy(policy_id, "live", "1", "active", ("live_trading",), {}),
+        (PortfolioLimit(policy_id, "max_new_long_order_intents_per_cycle", 3, {}),),
+        "max_new_long_order_intents_per_cycle",
+        "RISK_MAX_NEW_LONG_ORDERS_PER_CYCLE",
+        3,
+    )
+
+    assert value == 1
+
+
 def test_risk_prioritizes_strong_short_with_longs_by_abs_post_cost_edge() -> None:
     from agent_app.modules.risk_control.repository import PositionState
     from agent_app.modules.risk_control.service import RiskControlService
@@ -2394,8 +2427,10 @@ def test_risk_prioritizes_strong_short_with_longs_by_abs_post_cost_edge() -> Non
     ]
 
 
-def test_decision_engine_can_choose_short_opening_sell() -> None:
+def test_decision_engine_can_choose_short_opening_sell(monkeypatch) -> None:
     from agent_app.modules.decision_engine.service import DecisionEngineService, DecisionPolicy, DecisionRequest
+
+    monkeypatch.setenv("DECISION_ALLOW_SHORT_SELLING", "true")
 
     request = DecisionRequest(
         decision_request_id="decision_short",
@@ -2785,7 +2820,7 @@ def test_short_exit_policy_is_side_aware() -> None:
     assert stop is not None and stop[0] == "reduce" and stop[2] == 0.0
 
 
-def test_decision_engine_emits_negative_short_target_when_edge_is_negative() -> None:
+def test_decision_engine_emits_negative_short_target_when_edge_is_negative(monkeypatch) -> None:
     from agent_app.modules.decision_engine.repository import (
         FeatureVector,
         InMemoryDecisionEngineRepository,
@@ -2795,6 +2830,8 @@ def test_decision_engine_emits_negative_short_target_when_edge_is_negative() -> 
         WeightsProfile,
     )
     from agent_app.modules.decision_engine.service import DecisionEngineService
+
+    monkeypatch.setenv("DECISION_ALLOW_SHORT_SELLING", "true")
 
     repository = InMemoryDecisionEngineRepository(
         feature_vectors=(
@@ -3347,8 +3384,14 @@ def test_arena_go_auth_prefers_sandbox_api_key_and_falls_back_to_local_token(mon
     normalizer = ProviderRequestNormalizer(env={"SANDBOX_API_KEY": "sandbox-token", "ARENA_GO_TOKEN": "fallback-token"})
     assert normalizer.normalize(request, config).headers["Authorization"] == "sandbox-token"
 
-    normalizer = ProviderRequestNormalizer(env={"ARENA_GO_TOKEN": "fallback-token"})
+    normalizer = ProviderRequestNormalizer(env={"APP_ENV": "local", "ARENA_GO_TOKEN": "fallback-token"})
     assert normalizer.normalize(request, config).headers["Authorization"] == "fallback-token"
+
+    normalizer = ProviderRequestNormalizer(env={"APP_ENV": "local", "ARENA_GO_API_KEY": "api-key-fallback"})
+    assert normalizer.normalize(request, config).headers["Authorization"] == "api-key-fallback"
+
+    normalizer = ProviderRequestNormalizer(env={"APP_ENV": "production", "ARENA_GO_TOKEN": "fallback-token"})
+    assert "Authorization" not in normalizer.normalize(request, config).headers
 
 
 def test_startup_resolves_exact_arena_go_bot_from_env(monkeypatch) -> None:
@@ -3380,17 +3423,50 @@ def test_automatic_live_allowed_universe_migration_contains_all_sandbox_tickers(
     assert "auth_value_source = 'SANDBOX_API_KEY'" in migration
 
 
+def test_arena_go_api_key_fallback_contract_migration_is_local_fallback_only() -> None:
+    from pathlib import Path
+
+    migration = Path(
+        "agent_app/storage/postgres/migrations/038_arena_go_sandbox_api_key_fallback_contract.sql"
+    ).read_text(encoding="utf-8")
+    assert "auth_value_source = 'SANDBOX_API_KEY'" in migration
+    assert "'ARENA_GO_API_KEY'" in migration
+    assert "'ARENA_GO_TOKEN'" in migration
+    assert "local/dev fallback" in migration or "local/dev" in migration
+
+
 def test_root_dockerfile_uses_autonomous_startup_and_data_volume() -> None:
     from pathlib import Path
 
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     startup = Path("scripts/start_autonomous.sh").read_text(encoding="utf-8")
     assert "SYSTEM_MODE=automatic_live_trading" in dockerfile
+    assert "SAFE_LIVE_SUBMIT=false" in dockerfile
+    assert "LIVE_READINESS_PASSED=false" in dockerfile
+    assert "ARENA_GO_SHORTS_ALLOWED=false" in dockerfile
+    assert "DECISION_ALLOW_SHORT_SELLING=false" in dockerfile
+    assert "ALLOW_ARENA_GO_TOKEN_FALLBACK=false" in dockerfile
     assert "VOLUME [\"/data\"]" in dockerfile
     assert "scripts/start_autonomous.sh" in dockerfile
+    assert 'ARENA_GO_SHORTS_ALLOWED="${ARENA_GO_SHORTS_ALLOWED:-false}"' in startup
+    assert 'DECISION_ALLOW_SHORT_SELLING="${DECISION_ALLOW_SHORT_SELLING:-false}"' in startup
+    assert 'SAFE_LIVE_SUBMIT="${SAFE_LIVE_SUBMIT:-false}"' in startup
     assert "agent_app.storage.postgres.apply_migrations" in startup
     assert "agent_app.server_startup" in startup
     assert "agent_app.scheduler" in startup
+
+
+def test_prod_compose_scheduler_runs_startup_preflight_before_scheduler() -> None:
+    from pathlib import Path
+
+    compose = Path("docker/docker-compose.prod.yml").read_text(encoding="utf-8")
+    scheduler_section = compose.split("  scheduler_worker:", 1)[1].split("  staging_runner:", 1)[0]
+
+    assert "agent_app.server_startup" in scheduler_section
+    assert "--runtime-env-file" in scheduler_section
+    assert ". \"$$RUNTIME_ENV_FILE\"" in scheduler_section
+    assert "LIVE_READINESS_PASSED" not in scheduler_section
+    assert "agent_app.scheduler" in scheduler_section
 
 
 def test_deploy_check_uses_dev_requirements_for_pytest() -> None:

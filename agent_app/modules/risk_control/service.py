@@ -639,7 +639,7 @@ class RiskControlService:
         return _env_bool("ARENA_GO_SHORTS_ALLOWED", False)
 
     def short_selling_allowed(self, risk_policy: RiskPolicy | None) -> bool:
-        decision_allowed = _env_bool("DECISION_ALLOW_SHORT_SELLING", True)
+        decision_allowed = _env_bool("DECISION_ALLOW_SHORT_SELLING", False)
         if risk_policy is not None:
             configured = _rule_value(risk_policy.rules, "decision_allow_short_selling")
             if configured is not None:
@@ -693,14 +693,15 @@ class RiskControlService:
         env_name: str,
         default: int,
     ) -> int:
-        configured = self.portfolio_limit_value(portfolio_limits, risk_policy, limit_name)
+        configured: float | None = None
+        env_value = os.getenv(env_name)
+        if env_value not in (None, ""):
+            try:
+                configured = float(env_value)
+            except ValueError:
+                configured = None
         if configured is None:
-            env_value = os.getenv(env_name)
-            if env_value not in (None, ""):
-                try:
-                    configured = float(env_value)
-                except ValueError:
-                    configured = None
+            configured = self.portfolio_limit_value(portfolio_limits, risk_policy, limit_name)
         if configured is None:
             configured = default
         return max(0, int(configured))

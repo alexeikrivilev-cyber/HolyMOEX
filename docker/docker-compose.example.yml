@@ -1,4 +1,8 @@
 services:
+  # Local development compose only.
+  # Copy config/api_keys.example.env to config/api_keys.local.env locally and
+  # never commit real keys. GitLab/server deployment uses the root Dockerfile
+  # plus environment variables, especially SANDBOX_API_KEY.
   postgres_local:
     image: postgres:16
     env_file:

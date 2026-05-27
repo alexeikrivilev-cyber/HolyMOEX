@@ -235,7 +235,7 @@ class DecisionPolicy:
         default_factory=lambda: _env_float("DECISION_MACRO_BREADTH_WEAK_THRESHOLD", 0.55)
     )
     allow_short_selling: bool = field(
-        default_factory=lambda: _env_bool("DECISION_ALLOW_SHORT_SELLING", True)
+        default_factory=lambda: _env_bool("DECISION_ALLOW_SHORT_SELLING", False)
     )
     exit_overlay_enabled: bool = field(
         default_factory=lambda: _env_bool("DECISION_EXIT_OVERLAY_ENABLED", True)

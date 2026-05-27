@@ -1,24 +1,42 @@
 # Local secrets
+.env
+.env.*
+*.env
+*.local.env
 config/api_keys.env
 config/api_keys.local.env
 config/*.local.env
-.env
-.env.local
+!.env.example
+!config/api_keys.example.env
 *.secret.*
 *.secrets.*
 *secret*
 *credentials*
 *token*
 
-# Runtime data
+# Runtime data and local reports
 data/
+tmp/
+logs/
+postgres_data/
+redis_data/
 *.db
+*.dump
 *.sqlite
 *.sqlite3
 *.log
+live_smoke_report*.txt
+dry_run_summary*.txt
+preflight_before_smoke*.txt
 
 # Python caches
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local/editor noise
+.DS_Store
+.idea/

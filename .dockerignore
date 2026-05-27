@@ -1,13 +1,18 @@
 # Git and local metadata
 .git
-.gitignore
 .pytest_cache
 __pycache__
+.venv
+.mypy_cache
+.ruff_cache
 *.py[cod]
 
 # Local secrets and credentials
 .env
+.env.*
 .env.local
+*.env
+*.local.env
 config/api_keys.local.env
 config/*.local.env
 *.secret.*
@@ -21,13 +26,22 @@ config/*.local.env
 # Runtime state
 data
 data/
+tmp/
+logs/
+postgres_data/
+redis_data/
 *.db
+*.dump
 *.sqlite
 *.sqlite3
 *.log
+live_smoke_report*.txt
+dry_run_summary*.txt
+preflight_before_smoke*.txt
 
 # Local/editor noise
 .idea
 .vscode
+.DS_Store
 *.tmp
 *.bak
