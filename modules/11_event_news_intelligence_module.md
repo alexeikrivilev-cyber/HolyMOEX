@@ -29,7 +29,7 @@
 
 ### Trigger policy
 
-Запускается по `routing_message` от Data Intake, по important event trigger или по scheduled news scan.
+Запускается по `routing_message` от Data Intake, по important event trigger или по scheduled news scan. В live runtime fast-news scan может идти каждые ~2 минуты, но только capped по свежим/необработанным `raw_text` items.
 
 ## 4. Input classification
 
@@ -208,6 +208,10 @@ Corporate-event confirmation policy:
 | `underreaction_score` | positive event score with weak price reaction: `positive_event_strength * max(0, 1 - abs(event_reaction_z))` |
 | `overreaction_score` | `abs(event_reaction_z) * (1 - materiality_score)` clipped `0..1` |
 | `event_pressure_score` | `WAvg([news_sentiment_score, news_materiality_score, news_novelty_score, event_decay_score], active_weights)` |
+
+### LLM Cost And Escalation
+
+Simple news/event extraction uses `POLZA_FAST_MODEL=deepseek/deepseek-v4-flash`. If the fast pass finds material/high-impact news (`EVENT_NEWS_ESCALATE_MATERIALITY_THRESHOLD`) or strong sentiment from a credible source (`EVENT_NEWS_ESCALATE_SENTIMENT_ABS_THRESHOLD`), EventNews may run a second strict-JSON extraction with `POLZA_REASONING_MODEL=qwen/qwen3.6-35b-a3b`. The qwen pass is only an event/feature validation layer; it must not output buy/sell advice, target positions, risk-policy changes, or order intents.
 
 ## 16. Forbidden actions
 

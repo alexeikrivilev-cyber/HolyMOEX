@@ -1356,9 +1356,18 @@ def test_polza_task_model_routing_and_llm_cache_key(monkeypatch) -> None:
 
     news_request = service.create_llm_request(news, event_input, job)
     report_request = service.create_llm_request(report, event_input, job)
+    escalation_request = service.create_llm_request(
+        report,
+        event_input,
+        job,
+        forced_task_type="multi_source_event_synthesis",
+        prompt_version="prompt:v2:reasoning_escalation:v1",
+    )
 
     assert news_request.payload["model"] == "deepseek/deepseek-v4-flash"
-    assert report_request.payload["model"] == "qwen/qwen3.6-35b-a3b"
+    assert report_request.payload["task_type"] == "event_extraction"
+    assert report_request.payload["model"] == "deepseek/deepseek-v4-flash"
+    assert escalation_request.payload["model"] == "qwen/qwen3.6-35b-a3b"
     assert "No buy/sell advice" in news_request.payload["messages"][0]["content"]
     assert news_request.payload["prompt_version"] == "prompt:v2"
     assert news_request.payload["content_hash"] == "hash_news"
@@ -1429,8 +1438,18 @@ def test_russian_event_news_routing_uses_reasoning_model() -> None:
     )
     request = service.create_llm_request(item, event_input, _job(module_name="Event & News Intelligence Module", run_mode="live_trading"))
 
-    assert request.payload["task_type"] == "report_extraction"
-    assert request.payload["model"] == "qwen/qwen3.6-35b-a3b"
+    assert service.llm_task_type(item) == "report_extraction"
+    assert request.payload["task_type"] == "event_extraction"
+    assert request.payload["model"] == "deepseek/deepseek-v4-flash"
+
+    escalation = service.create_llm_request(
+        item,
+        event_input,
+        _job(module_name="Event & News Intelligence Module", run_mode="live_trading"),
+        forced_task_type="multi_source_event_synthesis",
+        prompt_version="prompt:v2:reasoning_escalation:v1",
+    )
+    assert escalation.payload["model"] == "qwen/qwen3.6-35b-a3b"
 
 
 def test_earnings_russian_text_routes_to_dividend_or_report_model() -> None:

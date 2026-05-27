@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -169,9 +170,10 @@ SOURCE_CREDIBILITY_DEFAULTS = {
     "macro_api": 0.75,
 }
 EVENT_EXTRACTION_SYSTEM_PROMPT = (
-    "Extract MOEX event JSON only. Fill instrument_ids, event_type/subtype, relevance, "
-    "materiality, sentiment, novelty, confidence, evidence, reason_codes. No buy/sell advice, "
-    "no weights, no risk-policy changes, no orders, no markdown."
+    "Strict JSON only. Quickly classify/extract MOEX news events. Return instrument_ids, "
+    "event_type/subtype, relevance_score, materiality_score, novelty_score, surprise_score, "
+    "sentiment_score, confidence_score, evidence, reason_codes. If no material event, items=[]. "
+    "No buy/sell advice, weights, risk-policy changes, orders, markdown, or free text."
 )
 REASONING_SYSTEM_PROMPT = (
     "Extract structured MOEX report, disclosure or macro intelligence as strict JSON only. "
@@ -439,7 +441,7 @@ class EventNewsIntelligenceService:
             if not raw_text_items:
                 warnings.append("raw_text_items_missing")
                 return self._empty_result(job, started_at, "skipped", tuple(warnings), ())
-            max_items = _env_int("LLM_MAX_ITEMS_PER_RUN", 20)
+            max_items = _env_int("EVENT_NEWS_MAX_ITEMS_PER_RUN", _env_int("LLM_MAX_ITEMS_PER_RUN", 20))
             if max_items > 0 and len(raw_text_items) > max_items:
                 warnings.append("llm_items_per_run_capped")
                 raw_text_items = raw_text_items[:max_items]
@@ -528,8 +530,22 @@ class EventNewsIntelligenceService:
         event_input: EventNewsInput,
         job: ModuleJob,
     ) -> tuple[tuple[RawTextItem, ...], tuple[EventRoutingMessage, ...], tuple[InstrumentProfile, ...]]:
-        routing_refs = tuple(dict.fromkeys((*event_input.routing_message_refs, *_refs_with_prefix(job.input_refs, "raw_text.event_routing_message"))))
-        raw_text_refs = tuple(dict.fromkeys((*event_input.raw_text_refs, *_refs_with_prefix(job.input_refs, "raw_text.raw_text_item"))))
+        routing_refs = tuple(
+            dict.fromkeys(
+                (
+                    *_concrete_refs(event_input.routing_message_refs),
+                    *_refs_with_prefix(job.input_refs, "raw_text.event_routing_message"),
+                )
+            )
+        )
+        raw_text_refs = tuple(
+            dict.fromkeys(
+                (
+                    *_concrete_refs(event_input.raw_text_refs),
+                    *_refs_with_prefix(job.input_refs, "raw_text.raw_text_item"),
+                )
+            )
+        )
         routing_messages = self.repository.list_routing_messages(
             routing_refs,
             job.universe_id,
@@ -716,6 +732,7 @@ class EventNewsIntelligenceService:
         if self.gateway is None:
             return None, ("llm_gateway_unavailable",)
         response = self._gateway_process(request)
+        request_warnings: list[str] = [f"external_request_created:{request.request_id}"]
         response_status = getattr(response, "status", "")
         response_errors = tuple(getattr(response, "errors", ()) or ())
         if response_status == "rate_limited" or "llm_throttled" in response_errors:
@@ -740,7 +757,113 @@ class EventNewsIntelligenceService:
         payload = _llm_payload_from_response(response)
         if payload is None:
             return None, (f"external_request_created:{request.request_id}", "llm_response_empty")
-        return self.validate_llm_output(payload), (f"external_request_created:{request.request_id}",)
+        payload = self.normalize_llm_envelope_payload(payload, request, event_input)
+        envelope = self.validate_llm_output(payload)
+        if self.should_escalate_to_reasoning(envelope, raw_item):
+            escalation_request = self.create_llm_request(
+                raw_item,
+                event_input,
+                job,
+                forced_task_type="multi_source_event_synthesis",
+                prompt_version=f"{event_input.llm_prompt_version}:reasoning_escalation:v1",
+                prior_envelope=envelope,
+            )
+            escalation_response = self._gateway_process(escalation_request)
+            request_warnings.append(f"external_request_created:{escalation_request.request_id}")
+            escalation_status = getattr(escalation_response, "status", "")
+            escalation_errors = tuple(getattr(escalation_response, "errors", ()) or ())
+            if escalation_status == "rate_limited" or "llm_throttled" in escalation_errors:
+                request_warnings.append("llm_reasoning_escalation_throttled")
+                return envelope, tuple(request_warnings)
+            escalation_payload = _llm_payload_from_response(escalation_response)
+            if escalation_payload is None:
+                request_warnings.append("llm_reasoning_escalation_empty")
+                return envelope, tuple(request_warnings)
+            try:
+                escalation_payload = self.normalize_llm_envelope_payload(escalation_payload, escalation_request, event_input)
+                escalated = self.validate_llm_output(escalation_payload)
+            except EventNewsIntelligenceError as error:
+                request_warnings.append(f"llm_reasoning_escalation_invalid:{error}")
+                return envelope, tuple(request_warnings)
+            if escalated.items:
+                request_warnings.append("llm_reasoning_escalation_used")
+                return escalated, tuple(request_warnings)
+            request_warnings.append("llm_reasoning_escalation_no_event_fallback_to_fast")
+        return envelope, tuple(request_warnings)
+
+    def normalize_llm_envelope_payload(
+        self,
+        payload: Mapping[str, Any] | str,
+        request: ExternalRequest,
+        event_input: EventNewsInput,
+    ) -> Mapping[str, Any] | str:
+        parsed = _parse_json_payload(payload) if isinstance(payload, str) else dict(payload)
+        if not isinstance(parsed.get("items"), list):
+            return payload
+        original_keys = set(parsed)
+
+        items = tuple(item for item in parsed.get("items", ()) if isinstance(item, Mapping))
+        evidence = tuple(
+            dict.fromkeys(
+                str(evidence_item)
+                for item in items
+                for evidence_item in _string_tuple(item.get("evidence"))
+                if str(evidence_item).strip()
+            )
+        )
+        reason_codes = tuple(
+            dict.fromkeys(
+                str(reason_code)
+                for item in items
+                for reason_code in _string_tuple(item.get("reason_codes"))
+                if str(reason_code).strip()
+            )
+        )
+        explicit_instrument_ids = tuple(
+            dict.fromkeys(
+                str(instrument_id)
+                for instrument_id in (
+                    *_string_tuple(parsed.get("instrument_ids")),
+                    *(
+                        instrument_id
+                        for item in items
+                        for instrument_id in _string_tuple(item.get("instrument_ids"))
+                    ),
+                )
+                if str(instrument_id).strip()
+            )
+        )
+        instrument_ids = explicit_instrument_ids or event_input.instrument_ids
+        confidence_values = [
+            value
+            for value in (_optional_float(item.get("confidence_score")) for item in items)
+            if value is not None
+        ]
+        existing_model_id = str(parsed.get("model_id") or "")
+        request_model_id = str(request.payload.get("model") or request.payload.get("model_id") or self.model_id or "")
+        if request_model_id and (not existing_model_id or "/" not in existing_model_id):
+            parsed["model_id"] = request_model_id
+        parsed.setdefault("schema_version", event_input.llm_prompt_version)
+        parsed.setdefault("model_version", "provider_response")
+        parsed.setdefault("task_type", str(request.payload.get("task_type") or "event_extraction"))
+        parsed.setdefault("instrument_ids", list(instrument_ids))
+        parsed.setdefault(
+            "confidence_score",
+            max(confidence_values) if confidence_values else (1.0 if not items else 0.5),
+        )
+        parsed.setdefault("evidence", list(evidence))
+        parsed.setdefault("reason_codes", list(reason_codes or ("normalized_llm_envelope",)))
+        warnings = list(_string_tuple(parsed.get("warnings")))
+        if (
+            "instrument_ids" not in original_keys
+            or "confidence_score" not in original_keys
+            or "evidence" not in original_keys
+            or "reason_codes" not in original_keys
+            or (existing_model_id and request_model_id and existing_model_id != request_model_id)
+        ):
+            warnings.append("llm_envelope_normalized")
+        parsed["warnings"] = list(dict.fromkeys(warnings))
+        return parsed
 
     def validate_llm_output(self, payload: Mapping[str, Any] | str) -> LlmEnvelope:
         parsed = _parse_json_payload(payload)
@@ -879,14 +1002,22 @@ class EventNewsIntelligenceService:
     ) -> tuple[str, ...]:
         requested = set(requested_instrument_ids)
         profile_ids = {profile.instrument_id for profile in profiles}
-        candidates: list[str] = []
+        explicit_candidates: list[str] = []
         for source in (
             _string_tuple(item.get("instrument_ids")),
             envelope.instrument_ids,
             raw_item.instrument_ids,
             *(message.instrument_ids for message in routing_messages),
         ):
-            candidates.extend(str(instrument_id) for instrument_id in source)
+            explicit_candidates.extend(str(instrument_id) for instrument_id in source)
+        explicit_in_universe = tuple(dict.fromkeys(instrument_id for instrument_id in explicit_candidates if instrument_id in requested))
+        explicit_out_of_universe = tuple(instrument_id for instrument_id in explicit_candidates if instrument_id and instrument_id not in requested)
+        if explicit_out_of_universe and event_type not in MACRO_SECTOR_EVENT_TYPES:
+            raise EventNewsIntelligenceError("news_outside_universe_without_macro_sector_classification")
+        if explicit_in_universe and event_type not in MACRO_SECTOR_EVENT_TYPES:
+            return explicit_in_universe
+
+        candidates: list[str] = [*explicit_candidates]
         candidates.extend(self._alias_matched_instruments(raw_item, profiles))
         in_universe = tuple(dict.fromkeys(instrument_id for instrument_id in candidates if instrument_id in requested))
         out_of_universe = tuple(instrument_id for instrument_id in candidates if instrument_id and instrument_id not in requested)
@@ -1128,6 +1259,10 @@ class EventNewsIntelligenceService:
         raw_item: RawTextItem,
         event_input: EventNewsInput,
         job: ModuleJob,
+        *,
+        forced_task_type: str | None = None,
+        prompt_version: str | None = None,
+        prior_envelope: LlmEnvelope | None = None,
     ) -> ExternalRequest:
         text_payload = {
             "raw_text_item_id": raw_item.raw_text_item_id,
@@ -1140,7 +1275,14 @@ class EventNewsIntelligenceService:
             "instrument_ids": list(raw_item.instrument_ids or event_input.instrument_ids),
             "event_ontology_version": event_input.event_ontology_version,
         }
-        task_type = self.llm_task_type(raw_item)
+        task_type = (
+            forced_task_type
+            if forced_task_type in VALID_TASK_TYPES
+            else "event_extraction"
+            if _env_bool("EVENT_NEWS_FAST_FIRST", True)
+            else self.llm_task_type(raw_item)
+        )
+        selected_prompt_version = prompt_version or event_input.llm_prompt_version
         content_hash = raw_item.content_hash or stable_record_id(
             "raw_text_content",
             {
@@ -1154,11 +1296,11 @@ class EventNewsIntelligenceService:
         system_prompt = REASONING_SYSTEM_PROMPT if task_type in REASONING_LLM_TASK_TYPES else EVENT_EXTRACTION_SYSTEM_PROMPT
         prompt_payload = {
             "task": task_type,
-            "prompt_version": event_input.llm_prompt_version,
+            "prompt_version": selected_prompt_version,
             "module_contract": {
                 "module_name": self.module_name,
                 "event_ontology_version": event_input.event_ontology_version,
-                "llm_prompt_version": event_input.llm_prompt_version,
+                "llm_prompt_version": selected_prompt_version,
                 "allowed_event_types": sorted(VALID_EVENT_TYPES),
                 "requested_instrument_ids": list(event_input.instrument_ids),
                 "market_reaction_is_separate": True,
@@ -1176,14 +1318,24 @@ class EventNewsIntelligenceService:
             ],
             "input": text_payload,
         }
+        if prior_envelope is not None:
+            prompt_payload["prior_fast_extraction"] = {
+                "schema_version": prior_envelope.schema_version,
+                "model_id": prior_envelope.model_id,
+                "model_version": prior_envelope.model_version,
+                "task_type": prior_envelope.task_type,
+                "instrument_ids": list(prior_envelope.instrument_ids),
+                "items": [dict(item) for item in prior_envelope.items],
+                "confidence_score": prior_envelope.confidence_score,
+                "reason_codes": list(prior_envelope.reason_codes),
+                "warnings": list(prior_envelope.warnings),
+            }
         idempotency_key = ":".join(
             (
-                job.idempotency_key,
                 "llm_completion",
-                raw_item.raw_text_item_id,
                 content_hash,
                 task_type,
-                event_input.llm_prompt_version,
+                selected_prompt_version,
                 event_input.event_ontology_version,
                 model_id,
             )
@@ -1199,8 +1351,8 @@ class EventNewsIntelligenceService:
                 "model": model_id,
                 "model_id": model_id,
                 "task_type": task_type,
-                "prompt_version": event_input.llm_prompt_version,
-                "llm_prompt_version": event_input.llm_prompt_version,
+                "prompt_version": selected_prompt_version,
+                "llm_prompt_version": selected_prompt_version,
                 "event_ontology_version": event_input.event_ontology_version,
                 "content_hash": content_hash,
                 "messages": [
@@ -1223,6 +1375,39 @@ class EventNewsIntelligenceService:
             retry_policy=RetryPolicy(max_retries=2, backoff_ms=500),
             idempotency_key=idempotency_key,
         )
+
+    def should_escalate_to_reasoning(self, envelope: LlmEnvelope, raw_item: RawTextItem) -> bool:
+        if not _env_bool("EVENT_NEWS_REASONING_ESCALATION_ENABLED", True):
+            return False
+        if envelope.task_type not in FAST_LLM_TASK_TYPES:
+            return False
+        if not envelope.items:
+            return False
+        materiality_threshold = _env_float("EVENT_NEWS_ESCALATE_MATERIALITY_THRESHOLD", 0.70)
+        sentiment_threshold = abs(_env_float("EVENT_NEWS_ESCALATE_SENTIMENT_ABS_THRESHOLD", 0.65))
+        important_event_types = {
+            "earnings",
+            "dividend",
+            "corporate_action",
+            "regulation",
+            "sanctions",
+            "macro",
+            "management",
+        }
+        official_or_high_trust = (raw_item.source_type or raw_item.source or "").lower() in (
+            OFFICIAL_CONFIRMATION_SOURCE_TYPES | {"rbc_news", "tass_news", "interfax_news", "prime_news"}
+        )
+        for item in envelope.items:
+            materiality = clip(_optional_float(item.get("materiality_score")))
+            sentiment = _optional_float(item.get("sentiment_score"))
+            event_type = str(item.get("event_type") or "")
+            if materiality is not None and materiality >= materiality_threshold:
+                return True
+            if sentiment is not None and abs(sentiment) >= sentiment_threshold and official_or_high_trust:
+                return True
+            if event_type in important_event_types and official_or_high_trust and materiality is not None and materiality >= 0.50:
+                return True
+        return False
 
     def llm_task_type(self, raw_item: RawTextItem) -> str:
         explicit = str(raw_item.source_payload.get("llm_task_type") or raw_item.source_payload.get("task_type") or "").strip()
@@ -1458,7 +1643,7 @@ class EventNewsIntelligenceService:
                 *profile.aliases,
                 *profile.related_entities,
             )
-            if any(alias and str(alias).lower() in text for alias in aliases):
+            if any(alias and _alias_matches_text(str(alias), text) for alias in aliases):
                 matches.append(profile.instrument_id)
         return tuple(dict.fromkeys(matches))
 
@@ -1742,6 +1927,17 @@ def _refs_with_prefix(refs: tuple[str, ...], prefix: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _concrete_refs(refs: tuple[str, ...]) -> tuple[str, ...]:
+    result: list[str] = []
+    for ref in refs:
+        text = str(ref)
+        tail = text.rsplit(":", 1)[-1]
+        if tail in {"", "scheduled", "latest"}:
+            continue
+        result.append(text)
+    return tuple(result)
+
+
 def _coerce_timestamp(value: Any, fallback: str) -> str:
     if value in (None, ""):
         return fallback
@@ -1764,6 +1960,15 @@ def _combined_text(raw_item: RawTextItem) -> str:
         )
         if value
     )
+
+
+def _alias_matches_text(alias: str, text: str) -> bool:
+    normalized_alias = alias.strip().lower()
+    if not normalized_alias:
+        return False
+    if len(normalized_alias) <= 2:
+        return re.search(rf"(?<![0-9a-zа-яё]){re.escape(normalized_alias)}(?![0-9a-zа-яё])", text) is not None
+    return normalized_alias in text
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:
@@ -1805,6 +2010,13 @@ def _first_float(payload: Any, *keys: str) -> float | None:
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
     except ValueError:
         return default
 

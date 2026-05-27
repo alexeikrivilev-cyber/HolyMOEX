@@ -31,7 +31,9 @@ MOEX_DEFAULT_PATHS = {
     "instruments": "/engines/stock/markets/shares/boards/{board}/securities.json",
     "market_data": "/engines/stock/markets/shares/boards/{board}/securities/{secid}/candles.json",
     "trades": "/engines/stock/markets/shares/boards/{board}/securities/{secid}/trades.json",
-    "orderbook": "/engines/stock/markets/shares/boards/{board}/securities/{secid}/orderbook.json",
+    # Public ISS does not expose a stable full orderbook endpoint for equities.
+    # Use the security marketdata table as a top-of-book quote proxy.
+    "orderbook": "/engines/stock/markets/shares/boards/{board}/securities/{secid}.json",
 }
 TEXT_PROVIDER_DEFAULT_PATHS = {
     "text_search": "/search",
@@ -217,6 +219,12 @@ class ProviderRequestNormalizer:
             timeframe = str(request.payload.get("timeframe") or _first(request.payload.get("timeframes")) or "")
             if timeframe:
                 query.setdefault("interval", _moex_interval(timeframe))
+        if request.request_type == "orderbook":
+            query.setdefault("iss.only", "marketdata")
+            query.setdefault(
+                "marketdata.columns",
+                "SECID,BID,OFFER,BIDDEPTHT,OFFERDEPTHT,BIDDEPTH,OFFERDEPTH,UPDATETIME,SYSTIME",
+            )
         return ProviderHttpRequest(
             provider=request.provider,
             request_type=request.request_type,
@@ -292,6 +300,8 @@ class ProviderRequestNormalizer:
         return "arena_go_default"
 
     def _url(self, config: ProviderConfig, path: str) -> str:
+        if path.startswith(("https://", "http://")):
+            return path
         base_url = ""
         if config.base_url_env:
             base_url = self.env.get(config.base_url_env, "")
@@ -635,7 +645,7 @@ def _extract_items(body: Mapping[str, Any], request_type: str) -> list[Mapping[s
     table_keys_by_type = {
         "market_data": ("candles", "marketdata", "securities"),
         "trades": ("trades",),
-        "orderbook": ("orderbook", "orderbooks", "marketdepth"),
+        "orderbook": ("orderbook", "orderbooks", "marketdepth", "marketdata"),
         "instruments": ("securities", "boards", "marketdata"),
         "macro_series": ("series", "points", "data"),
         "text_search": ("items", "documents", "results", "news"),
@@ -937,12 +947,29 @@ def _parse_html_numeric_points(body: str) -> list[Mapping[str, Any]]:
         zcyc_points = _parse_cbr_zcyc_points(body)
         if zcyc_points:
             return zcyc_points
+    if "Ключевая ставка Банка России" in body or "Дата Ставка" in body:
+        key_rate_points = _parse_cbr_key_rate_points(body)
+        if key_rate_points:
+            return key_rate_points
     points = []
     pattern = re.compile(r"(\d{2}\.\d{2}\.\d{4})\D{0,80}([+-]?\d+(?:[\s\u00a0]\d{3})*(?:[,.]\d+)?)")
     for match in pattern.finditer(body):
         value = _numeric_text(match.group(2))
         if value is not None:
             points.append({"point_ts": _iso_date_from_ddmmyyyy(match.group(1)), "value": value})
+    return points[:500]
+
+
+def _parse_cbr_key_rate_points(body: str) -> list[Mapping[str, Any]]:
+    marker_index = body.find("Дата Ставка")
+    searchable = body[marker_index:] if marker_index >= 0 else body
+    points: list[Mapping[str, Any]] = []
+    pattern = re.compile(r"(\d{2}\.\d{2}\.\d{4})\s+([+-]?\d+(?:[,.]\d+)?)")
+    for match in pattern.finditer(searchable):
+        value = _numeric_text(match.group(2))
+        if value is None or value <= 0 or value > 100:
+            continue
+        points.append({"point_ts": _iso_date_from_ddmmyyyy(match.group(1)), "value": value})
     return points[:500]
 
 

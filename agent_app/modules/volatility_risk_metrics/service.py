@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from statistics import pstdev
 from typing import Any, Mapping
 
@@ -221,26 +222,27 @@ class VolatilityRiskMetricsService:
         try:
             self.validate_module_job(job)
             metrics_input = VolatilityRiskMetricsInput.from_dict(payload, job)
+            history_from_ts = _history_from_ts(job.time_range.to_ts)
             candles = self.repository.list_candles(
                 candles_ref=metrics_input.candles_ref,
                 universe_id=job.universe_id,
                 instrument_ids=metrics_input.instrument_ids,
-                from_ts=job.time_range.from_ts,
+                from_ts=history_from_ts,
                 to_ts=job.time_range.to_ts,
             )
             market_index_values = self.repository.list_index_values(
                 metrics_input.market_index_ref,
-                job.time_range.from_ts,
+                history_from_ts,
                 job.time_range.to_ts,
             )
             sector_index_values = self.repository.list_index_values(
                 metrics_input.sector_index_ref,
-                job.time_range.from_ts,
+                history_from_ts,
                 job.time_range.to_ts,
             )
             macro_points = self.repository.list_macro_points(
                 metrics_input.macro_refs,
-                job.time_range.from_ts,
+                history_from_ts,
                 job.time_range.to_ts,
             )
 
@@ -257,6 +259,29 @@ class VolatilityRiskMetricsService:
                 if self.gateway is not None:
                     self.gateway.process(request)
             warnings.extend(f"external_request_created:{request.request_id}" for request in external_requests)
+            if external_requests and self.gateway is not None:
+                candles = self.repository.list_candles(
+                    candles_ref=metrics_input.candles_ref,
+                    universe_id=job.universe_id,
+                    instrument_ids=metrics_input.instrument_ids,
+                    from_ts=history_from_ts,
+                    to_ts=job.time_range.to_ts,
+                )
+                market_index_values = self.repository.list_index_values(
+                    metrics_input.market_index_ref,
+                    history_from_ts,
+                    job.time_range.to_ts,
+                )
+                sector_index_values = self.repository.list_index_values(
+                    metrics_input.sector_index_ref,
+                    history_from_ts,
+                    job.time_range.to_ts,
+                )
+                macro_points = self.repository.list_macro_points(
+                    metrics_input.macro_refs,
+                    history_from_ts,
+                    job.time_range.to_ts,
+                )
 
             feature_records, risk_context_records, compute_warnings = self.compute_outputs(
                 metrics_input=metrics_input,
@@ -407,6 +432,7 @@ class VolatilityRiskMetricsService:
         adjusted_returns_by_date = _returns_by_date_from_price_points(adjusted_close_points)
         adjustment_sources = tuple(sorted({candle.adjustment_source for candle in daily_candles}))
         adjusted_proxy_used = "close_price_as_adjusted_proxy" in adjustment_sources
+        timeframes = tuple(sorted({str(candle.timeframe or "") for candle in daily_candles if candle.timeframe}))
 
         context_payload: dict[str, Any] = {
             "calculation_version": CALCULATION_VERSION,
@@ -415,11 +441,16 @@ class VolatilityRiskMetricsService:
             "observed_return_count": len(log_returns),
             "return_basis": "adjusted_close_price" if adjusted_close_points else "close_price",
             "adjustment_sources": list(adjustment_sources),
+            "timeframes": list(timeframes),
             "stale_correlations": stale_correlations,
             "macro_factors_available": sorted(macro_factor_returns),
         }
         if stale_correlations:
             warnings.append(f"stale_correlations:{instrument_id}")
+        daily_history_count = sum(1 for candle in daily_candles if candle.timeframe == "1d")
+        if daily_candles and daily_history_count < min(REALIZED_VOL_WINDOWS):
+            warnings.append(f"intraday_candle_volatility_proxy:{instrument_id}")
+            context_payload["volatility_history_proxy"] = "intraday_candles"
         if len(log_returns) < min(metrics_input.windows):
             warnings.append(f"insufficient_history:{instrument_id}")
             context_payload["insufficient_history"] = True
@@ -937,7 +968,7 @@ class VolatilityRiskMetricsService:
             "board_id": "TQBR",
             "timeframe": timeframe,
             "timeframes": [timeframe],
-            "time_range": job.time_range.to_dict(),
+            "time_range": _history_time_range(job, days=HISTORY_WINDOW + 10) if timeframe in {"1d", "daily"} else job.time_range.to_dict(),
         }
         idempotency_key = f"{job.idempotency_key}:market_data:{instrument_id}:TQBR:{timeframe}"
         return ExternalRequest(
@@ -963,7 +994,7 @@ class VolatilityRiskMetricsService:
             "timeframe": "1d",
             "timeframes": ["1d"],
             "endpoint": "/engines/stock/markets/index/boards/SNDX/securities/{secid}/candles.json",
-            "time_range": job.time_range.to_dict(),
+            "time_range": _history_time_range(job, days=HISTORY_WINDOW + 10),
         }
         idempotency_key = f"{job.idempotency_key}:market_data:{index_id}:SNDX:1d"
         return ExternalRequest(
@@ -1049,8 +1080,9 @@ def _group_daily_candles(candles: tuple[RawCandle, ...]) -> dict[str, tuple[RawC
         grouped.setdefault(candle.instrument_id, []).append(candle)
     result: dict[str, tuple[RawCandle, ...]] = {}
     for instrument_id, items in grouped.items():
-        daily_items = [item for item in items if item.timeframe == "1d"] or items
-        result[instrument_id] = tuple(sorted(daily_items, key=lambda item: item.close_ts or ""))
+        daily_items = [item for item in items if item.timeframe == "1d"]
+        selected = daily_items if len(daily_items) >= min(REALIZED_VOL_WINDOWS) else items
+        result[instrument_id] = tuple(sorted(selected, key=lambda item: item.close_ts or ""))
     return result
 
 
@@ -1271,6 +1303,23 @@ def _macro_points_stale(points: tuple[RawMacroPoint, ...], job: ModuleJob) -> bo
     if not point_times:
         return True
     return (parse_utc_iso(job.time_range.to_ts) - max(point_times)).total_seconds() > CORRELATION_TTL_SECONDS
+
+
+def _history_from_ts(to_ts: str, days: int = HISTORY_WINDOW + 10) -> str:
+    return _iso_utc(parse_utc_iso(to_ts) - timedelta(days=days))
+
+
+def _history_time_range(job: ModuleJob, days: int) -> Mapping[str, str]:
+    payload = dict(job.time_range.to_dict())
+    payload["from_ts"] = _history_from_ts(job.time_range.to_ts, days=days)
+    payload["to_ts"] = job.time_range.to_ts
+    return payload
+
+
+def _iso_utc(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat().replace("+00:00", "Z")
+    return str(value)
 
 
 def _date_key(timestamp: str) -> str:

@@ -491,6 +491,7 @@ class NormalizationFeatureVectorService:
         ttl_status = check_ttl_status(source_record, as_of_ts)
         data_quality_score = _data_quality_score_for_feature(source_record, data_quality_by_ref)
         data_quality_flags = list(_data_quality_flags_for_feature(source_record, data_quality_by_ref))
+        data_quality_score = min(data_quality_score, _quality_score_from_flags(data_quality_flags))
         if _extended_session_market_data_grace_applies(source_record, as_of_ts):
             data_quality_flags.append("arena_go_extended_session_market_data_grace")
         if "future_timestamp" in data_quality_flags:
@@ -670,6 +671,7 @@ class NormalizationFeatureVectorService:
                 for flag in candidate.normalized_record.quality_flags
             )
         )
+        data_quality_score = min(_clip01(data_quality_score), _quality_score_from_flags(quality_flags))
         meta_ttl_status = "invalid" if "future_timestamp" in quality_flags else (
             "expired" if any(candidate.ttl_status == "expired" for candidate in candidates) else (
                 "stale" if any(candidate.ttl_status == "stale" for candidate in candidates) else "fresh"
@@ -902,7 +904,8 @@ def _data_quality_score_for_feature(
         record = data_quality_by_ref.get(key)
         if record is not None and record.quality_score is not None:
             scores.append(_clip01(record.quality_score))
-    return min(scores) if scores else 1.0
+    record_score = min(scores) if scores else 1.0
+    return min(record_score, _quality_score_from_flags(feature_record.quality_flags))
 
 
 def _data_quality_flags_for_feature(
@@ -931,6 +934,44 @@ def _clip01(value: float | None) -> float:
     if value is None:
         return 0.0
     return min(1.0, max(0.0, float(value)))
+
+
+def _quality_score_from_flags(flags: tuple[str, ...] | list[str]) -> float:
+    score = 1.0
+    for raw_flag in flags:
+        flag = str(raw_flag or "").strip()
+        lowered = flag.lower()
+        if not lowered:
+            continue
+        if lowered in {"normalized_feature_record", "ttl_status:fresh"}:
+            continue
+        if "future_timestamp" in lowered:
+            score = min(score, 0.0)
+        elif "expired" in lowered or "invalid" in lowered:
+            score = min(score, 0.25)
+        elif "stale" in lowered:
+            score = min(score, 0.65)
+        elif "missing_orderbook_using_candle_liquidity_proxy" in lowered:
+            score = min(score, 0.72)
+        elif "quote_proxy_orderbook" in lowered or "top_of_book_only" in lowered:
+            score = min(score, 0.82)
+        elif "low_trade_coverage" in lowered:
+            score = min(score, 0.82)
+        elif "low_context_coverage" in lowered:
+            score = min(score, 0.80)
+        elif "macro_points_missing" in lowered or "raw_macro_missing" in lowered:
+            score = min(score, 0.70)
+        elif "degraded_macro_context" in lowered or "missing_macro_series" in lowered:
+            score = min(score, 0.78)
+        elif "market_breadth_missing" in lowered or "sector_mapping_missing" in lowered:
+            score = min(score, 0.85)
+        elif "insufficient_history" in lowered or "insufficient_correlation_history" in lowered:
+            score = min(score, 0.78)
+        elif "missing_data" in lowered or "low_coverage" in lowered:
+            score = min(score, 0.65)
+        elif "source_missing_endpoint" in lowered or "source_unavailable" in lowered:
+            score = min(score, 0.75)
+    return _clip01(score)
 
 
 def _env_bool(name: str, default: bool) -> bool:

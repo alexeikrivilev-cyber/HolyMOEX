@@ -517,6 +517,8 @@ class LiquidityMicrostructureService:
         values: list[MetricValue] = []
         warnings: list[str] = []
         source_refs = _context_refs(liquidity_input)
+        orderbook_proxy_flags = _orderbook_proxy_flags(latest_raw, profile.instrument_id)
+        warnings.extend(orderbook_proxy_flags)
         spread_bps = compute_bid_ask_spread(latest_snapshot.best_bid, latest_snapshot.best_ask)
         self._append_metric(values, "bid_ask_spread_bps", "raw_metric", spread_bps, None, "bps", ORDERBOOK_TTL_SECONDS, source_refs)
         self._append_metric(values, "spread_bps", "raw_metric", spread_bps, None, "bps", ORDERBOOK_TTL_SECONDS, source_refs)
@@ -695,6 +697,8 @@ class LiquidityMicrostructureService:
             reason_codes.append("insufficient_depth_for_100k")
         if slippage_by_notional.get(1000000.0) is None:
             reason_codes.append("insufficient_depth_for_1m")
+        if orderbook_proxy_flags:
+            reason_codes.append("quote_proxy_orderbook")
         if not reason_codes:
             reason_codes.append("fresh_orderbook")
         else:
@@ -1117,6 +1121,19 @@ def _group_trades(trades: tuple[RawTrade, ...]) -> dict[str, tuple[RawTrade, ...
         instrument_id: tuple(sorted(items, key=lambda item: item.trade_ts))
         for instrument_id, items in grouped.items()
     }
+
+
+def _orderbook_proxy_flags(orderbook: RawOrderBook, instrument_id: str) -> tuple[str, ...]:
+    source_payload = orderbook.source_payload if isinstance(orderbook.source_payload, Mapping) else {}
+    proxy_payload = source_payload.get("orderbook_proxy")
+    if isinstance(proxy_payload, Mapping):
+        source = str(proxy_payload.get("source") or "quote_proxy")
+        return (
+            f"quote_proxy_orderbook:{instrument_id}",
+            f"top_of_book_only:{instrument_id}",
+            f"orderbook_proxy_source:{source}:{instrument_id}",
+        )
+    return ()
 
 
 def _group_candles(candles: tuple[RawCandle, ...]) -> dict[str, tuple[RawCandle, ...]]:

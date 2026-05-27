@@ -729,9 +729,13 @@ POLZA_FAST_MODEL=deepseek/deepseek-v4-flash
 POLZA_REASONING_MODEL=qwen/qwen3.6-35b-a3b
 POLZA_DEFAULT_MODEL=qwen/qwen3.6-35b-a3b
 POLZA_LLM_MODEL=
-LLM_MAX_ITEMS_PER_RUN=3
-LLM_MAX_CALLS_PER_MINUTE=2
-LLM_MAX_CALLS_PER_HOUR=30
+LLM_MAX_ITEMS_PER_RUN=5
+LLM_MAX_CALLS_PER_MINUTE=6
+LLM_MAX_CALLS_PER_HOUR=120
+EVENT_NEWS_FAST_INTERVAL_SECONDS=120
+EVENT_NEWS_MAX_ITEMS_PER_RUN=5
+EVENT_NEWS_FAST_FIRST=true
+EVENT_NEWS_REASONING_ESCALATION_ENABLED=true
 LLM_MIN_SECONDS_BETWEEN_CALLS=2
 ENABLE_LLM_TEXT_SCHEDULES=true
 MARKET_DATA_FETCH_RAW_TRADES=false
@@ -1483,7 +1487,7 @@ The LLM cache key includes `content_hash`, `task_type`, `prompt_version`, `model
 
 Validated EventNews envelopes with `"items": []` are treated as a successful `no_event_found` result for irrelevant text. They are audited and are not retried as schema failures.
 
-In the autonomous live loop, MOEX candle/index data and ArenaGo portfolio sync are the primary realtime inputs. The default realtime lookback is `PIPELINE_LOOKBACK_MINUTES=240`; during the ArenaGo sandbox evening session it is automatically raised to at least `ARENA_GO_EXTENDED_LOOKBACK_MINUTES=480` so the agent can still use the latest MOEX cash-session candles without treating them as fake-fresh. MOEX raw trade tape fetch is opt-in via `MARKET_DATA_FETCH_RAW_TRADES=true` and `LIQUIDITY_FETCH_RAW_TRADES=true`; by default it is disabled so the scheduler can reach feature vector, decision, risk and execution instead of blocking on heavy `/trades` backfill. Scheduled LLM text jobs are enabled with `ENABLE_LLM_TEXT_SCHEDULES=true`, but schedule intervals and call caps keep them at 30-60 minute cadence rather than every minute.
+In the autonomous live loop, MOEX candle/index data and ArenaGo portfolio sync are the primary realtime inputs. The default realtime lookback is `PIPELINE_LOOKBACK_MINUTES=240`; during the ArenaGo sandbox evening session it is automatically raised to at least `ARENA_GO_EXTENDED_LOOKBACK_MINUTES=480` so the agent can still use the latest MOEX cash-session candles without treating them as fake-fresh. MOEX raw trade tape fetch is opt-in via `MARKET_DATA_FETCH_RAW_TRADES=true` and `LIQUIDITY_FETCH_RAW_TRADES=true`; by default it is disabled so the scheduler can reach feature vector, decision, risk and execution instead of blocking on heavy `/trades` backfill. Scheduled text jobs are enabled with `ENABLE_LLM_TEXT_SCHEDULES=true`: the fast news contour runs a cheap flash extraction pass about every 2 minutes over fresh/unprocessed `raw_text`, while expensive qwen reasoning is used only when the fast pass finds material, high-impact, or strongly negative/positive news.
 
 Russian routing markers are supported for reports/dividends/disclosures, including `отчет`, `отчёт`, `дивиденды`, `совет директоров`, `МСФО`, `РСБУ`, `финансовые результаты`, `операционные результаты`, `собрание акционеров` and `существенный факт`.
 
@@ -1500,7 +1504,7 @@ SELECT date_trunc('minute', received_at) AS minute,
  LIMIT 60;
 ```
 
-Steady-state Raw Text discovery and EventNews extraction must not run every minute. `schedule:data_intake:scheduled_external_news_discovery` and `schedule:event_news:intake` are throttled to 30 minutes by migration `015_runtime_scheduling_llm_cost_patch.sql`; earnings/fundamental text-heavy paths use 60 minutes or event-driven triggers. Initial backfill may be more active only when explicitly configured.
+Steady-state Raw Text discovery and EventNews extraction are split by cost. `schedule:data_intake:scheduled_external_news_discovery` and `schedule:event_news:intake` run a capped fast-news pass every 2 minutes after migration `032_fast_news_llm_reactivity.sql`; EventNews uses `deepseek/deepseek-v4-flash` for ordinary classification/extraction and escalates only material/high-impact items to `qwen/qwen3.6-35b-a3b`. Earnings/fundamental long-report paths remain slower and reasoning-oriented. The LLM still writes structured events/features only; it does not generate orders, weights, or risk policy.
 
 ## Market-hours gating
 

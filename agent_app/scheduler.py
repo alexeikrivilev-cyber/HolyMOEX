@@ -619,7 +619,6 @@ def acquire_scheduler_tick_lock(
           )
           AND (
                 %s = false
-             OR audit.scheduler_tick_lock.owner_id = EXCLUDED.owner_id
              OR audit.scheduler_tick_lock.last_tick_at <= now() - (%s::text || ' seconds')::interval
           )
         RETURNING schedule_config_id

@@ -623,6 +623,7 @@ class PostgresExternalRequestGatewayRepository:
                                 ("trade_ts", "timestamp", "ts", "systime"),
                                 date_keys=("date", "tradedate", "trade_date"),
                                 time_keys=("time", "tradetime", "trade_time"),
+                                default_utc_offset=_market_time_default_offset(request.provider),
                             ),
                             price,
                             quantity,
@@ -654,6 +655,13 @@ class PostgresExternalRequestGatewayRepository:
         instrument_id = _instrument_id(request, first_item)
         if not instrument_id:
             return []
+        source_payload = dict(payload)
+        if _is_moex_marketdata_quote_proxy(payload, first_item):
+            source_payload["orderbook_proxy"] = {
+                "source": "moex_iss_marketdata",
+                "scope": "top_of_book",
+                "reason": "public_full_orderbook_endpoint_unavailable",
+            }
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -672,15 +680,18 @@ class PostgresExternalRequestGatewayRepository:
                     (
                         instrument_id,
                         request.universe_id,
-                        _timestamp_or(
-                            _lookup(first_item, "snapshot_ts", "timestamp", "ts", "systime", "date", "tradedate")
-                            or _lookup(payload, "snapshot_ts", "timestamp", "ts"),
+                        _timestamp_from_item(
+                            first_item,
                             received_at,
+                            ("snapshot_ts", "timestamp", "ts", "systime"),
+                            date_keys=("date", "tradedate"),
+                            time_keys=("time", "updatetime"),
+                            default_utc_offset=_market_time_default_offset(request.provider),
                         ),
                         jsonb_type(bids),
                         jsonb_type(asks),
                         request.provider,
-                        jsonb_type(payload),
+                        jsonb_type(source_payload),
                         received_at,
                     ),
                 )
@@ -1381,6 +1392,16 @@ def _orderbook_sides(
         bids.extend(_side_list(raw.get("bids")))
         asks.extend(_side_list(raw.get("asks")))
     for item in items:
+        bid_price = _numeric(_lookup(item, "bid", "best_bid", "bestbid", "bid_price"))
+        ask_price = _numeric(_lookup(item, "offer", "ask", "best_ask", "bestask", "offer_price", "ask_price"))
+        bid_quantity = _numeric(_lookup(item, "biddeptht", "bid_depth_t", "biddepth", "bid_qty", "bidquantity"))
+        ask_quantity = _numeric(_lookup(item, "offerdeptht", "offer_depth_t", "offerdepth", "ask_qty", "askquantity"))
+        if bid_price is not None:
+            bids.append({"price": bid_price, "quantity": bid_quantity if bid_quantity is not None else 1.0})
+        if ask_price is not None:
+            asks.append({"price": ask_price, "quantity": ask_quantity if ask_quantity is not None else 1.0})
+        if bid_price is not None or ask_price is not None:
+            continue
         side = _text(_lookup(item, "side", "buysell", "direction")).lower()
         price = _numeric(_lookup(item, "price", "bid", "ask"))
         quantity = _numeric(_lookup(item, "quantity", "qty", "volume", "vol"))
@@ -1392,6 +1413,15 @@ def _orderbook_sides(
         elif side in {"s", "sell", "ask", "offer", "2"}:
             asks.append(level)
     return bids, asks
+
+
+def _is_moex_marketdata_quote_proxy(payload: Mapping[str, Any], first_item: Mapping[str, Any]) -> bool:
+    raw = payload.get("raw")
+    if isinstance(raw, Mapping) and "marketdata" in raw:
+        return True
+    if str(payload.get("format") or "").lower() == "moex_marketdata_quote_proxy":
+        return True
+    return _lookup(first_item, "bid", "offer", "biddeptht", "offerdeptht") is not None
 
 
 def _side_list(value: Any) -> list[Mapping[str, Any]]:

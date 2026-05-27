@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
@@ -320,7 +321,7 @@ class InMemoryEventNewsIntelligenceRepository:
         from_ts: str,
         to_ts: str,
     ) -> tuple[RawTextItem, ...]:
-        requested_refs = {_ref_tail(ref) for ref in raw_text_refs}
+        requested_refs = {_ref_tail(ref) for ref in raw_text_refs if _is_concrete_ref(ref)}
         requested_instruments = set(instrument_ids)
         items = []
         for item in self.raw_text_items:
@@ -335,7 +336,13 @@ class InMemoryEventNewsIntelligenceRepository:
                 if timestamp and not _timestamp_in_range(timestamp, from_ts, to_ts):
                     continue
             items.append(item)
-        return tuple(sorted(items, key=lambda item: item.published_at or item.fetched_at or item.raw_text_item_id))
+        return tuple(
+            sorted(
+                items,
+                key=lambda item: item.published_at or item.fetched_at or item.raw_text_item_id,
+                reverse=True,
+            )
+        )
 
     def list_routing_messages(
         self,
@@ -345,7 +352,7 @@ class InMemoryEventNewsIntelligenceRepository:
         from_ts: str,
         to_ts: str,
     ) -> tuple[EventRoutingMessage, ...]:
-        requested_refs = {_ref_tail(ref) for ref in routing_message_refs}
+        requested_refs = {_ref_tail(ref) for ref in routing_message_refs if _is_concrete_ref(ref)}
         requested_instruments = set(instrument_ids)
         messages = []
         for message in self.routing_messages:
@@ -361,7 +368,13 @@ class InMemoryEventNewsIntelligenceRepository:
                 if message.created_at and not _timestamp_in_range(message.created_at, from_ts, to_ts):
                     continue
             messages.append(message)
-        return tuple(sorted(messages, key=lambda item: item.created_at or item.routing_message_id))
+        return tuple(
+            sorted(
+                messages,
+                key=lambda item: item.created_at or item.routing_message_id,
+                reverse=True,
+            )
+        )
 
     def list_instrument_profiles(
         self,
@@ -418,7 +431,7 @@ class PostgresEventNewsIntelligenceRepository:
         from_ts: str,
         to_ts: str,
     ) -> tuple[RawTextItem, ...]:
-        ref_ids = [_ref_tail(ref) for ref in raw_text_refs]
+        ref_ids = [_ref_tail(ref) for ref in raw_text_refs if _is_concrete_ref(ref)]
         with self._connect() as conn:
             with conn.cursor() as cur:
                 if ref_ids:
@@ -431,11 +444,16 @@ class PostgresEventNewsIntelligenceRepository:
                                discovery_item_id, discovery_mode, external_request_id
                           FROM raw_text.raw_text_item
                          WHERE raw_text_item_id::text = ANY(%s)
-                         ORDER BY COALESCE(published_at, fetched_at)
+                           AND (
+                                NULLIF(BTRIM(COALESCE(title, '')), '') IS NOT NULL
+                             OR NULLIF(BTRIM(COALESCE(body, '')), '') IS NOT NULL
+                           )
+                         ORDER BY COALESCE(published_at, fetched_at) DESC
                         """,
                         (ref_ids,),
                     )
                 else:
+                    only_unprocessed = _env_bool("EVENT_NEWS_ONLY_UNPROCESSED_RAW_TEXT", True)
                     cur.execute(
                         """
                         SELECT raw_text_item_id, universe_id, instrument_ids, source,
@@ -447,9 +465,37 @@ class PostgresEventNewsIntelligenceRepository:
                          WHERE universe_id = %s
                            AND (cardinality(instrument_ids) = 0 OR instrument_ids && %s)
                            AND COALESCE(published_at, fetched_at) BETWEEN %s AND %s
-                         ORDER BY COALESCE(published_at, fetched_at)
+                           AND (
+                                NULLIF(BTRIM(COALESCE(title, '')), '') IS NOT NULL
+                             OR NULLIF(BTRIM(COALESCE(body, '')), '') IS NOT NULL
+                           )
+                           AND (
+                                %s = false
+                             OR (
+                                NOT EXISTS (
+                                  SELECT 1
+                                    FROM events.structured_event event
+                                   WHERE event.source_refs @> ARRAY['raw_text.raw_text_item:' || raw_text.raw_text_item.raw_text_item_id::text]
+                                )
+                                AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM audit.audit_record audit
+                                   WHERE audit.module_name = 'Event & News Intelligence Module'
+                                     AND audit.object_type = 'raw_text_item'
+                                     AND audit.object_ref = 'raw_text.raw_text_item:' || raw_text.raw_text_item.raw_text_item_id::text
+                                     AND audit.event_type IN ('llm_no_event_found', 'llm_output_schema_validation_failed')
+                                )
+                             )
+                           )
+                         ORDER BY COALESCE(published_at, fetched_at) DESC
                         """,
-                        (universe_id, list(instrument_ids), parse_utc_iso(from_ts), parse_utc_iso(to_ts)),
+                        (
+                            universe_id,
+                            list(instrument_ids),
+                            parse_utc_iso(from_ts),
+                            parse_utc_iso(to_ts),
+                            only_unprocessed,
+                        ),
                     )
                 rows = cur.fetchall()
         return tuple(_raw_text_item_from_row(row) for row in rows)
@@ -462,7 +508,7 @@ class PostgresEventNewsIntelligenceRepository:
         from_ts: str,
         to_ts: str,
     ) -> tuple[EventRoutingMessage, ...]:
-        ref_ids = [_ref_tail(ref) for ref in routing_message_refs]
+        ref_ids = [_ref_tail(ref) for ref in routing_message_refs if _is_concrete_ref(ref)]
         with self._connect() as conn:
             with conn.cursor() as cur:
                 if ref_ids:
@@ -474,7 +520,7 @@ class PostgresEventNewsIntelligenceRepository:
                                discovery_mode, discovery_run_id
                           FROM raw_text.event_routing_message
                          WHERE routing_message_id::text = ANY(%s)
-                         ORDER BY created_at
+                         ORDER BY created_at DESC
                         """,
                         (ref_ids,),
                     )
@@ -490,7 +536,7 @@ class PostgresEventNewsIntelligenceRepository:
                            AND universe_id = %s
                            AND (cardinality(instrument_ids) = 0 OR instrument_ids && %s)
                            AND created_at BETWEEN %s AND %s
-                         ORDER BY created_at
+                         ORDER BY created_at DESC
                         """,
                         (universe_id, list(instrument_ids), parse_utc_iso(from_ts), parse_utc_iso(to_ts)),
                     )
@@ -736,6 +782,11 @@ def _ref_tail(ref: str) -> str:
     return str(ref).rsplit(":", 1)[-1] if ":" in str(ref) else str(ref)
 
 
+def _is_concrete_ref(ref: str) -> bool:
+    tail = _ref_tail(str(ref)).strip()
+    return bool(tail) and tail not in {"scheduled", "latest"}
+
+
 def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -747,6 +798,13 @@ def _optional_int(value: Any) -> int | None:
     if value in (None, ""):
         return None
     return int(value)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _iso(value: Any) -> str:

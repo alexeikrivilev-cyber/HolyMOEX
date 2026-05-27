@@ -479,8 +479,11 @@ def _feature_ids_from_refs(feature_refs: tuple[str, ...]) -> tuple[str, ...]:
         text = str(ref).strip()
         if not text:
             continue
+        tail = _ref_tail(text)
+        if tail in {"latest", "scheduled", "*"}:
+            continue
         values.append(text)
-        values.append(_ref_tail(text))
+        values.append(tail)
     return tuple(dict.fromkeys(values))
 
 
