@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, Mapping, Protocol
 
 from agent_app.contracts.unified_objects.module_job import parse_utc_iso
@@ -350,18 +352,26 @@ class InMemoryDecisionEngineRepository:
         requested_refs = {_ref_tail(ref) for ref in feature_vector_refs if _ref_tail(ref) not in {"latest", "scheduled"}}
         requested_ids = set(instrument_ids)
         as_of = parse_utc_iso(as_of_ts)
+        fallback_from = as_of - timedelta(seconds=_env_float("DECISION_FEATURE_VECTOR_FALLBACK_LOOKBACK_SECONDS", 3600.0))
         records = [
             vector
             for vector in self.feature_vectors
             if vector.horizon == horizon
             and vector.instrument_id in requested_ids
             and parse_utc_iso(vector.as_of_ts) <= as_of
-            and (not requested_refs or vector.feature_vector_id in requested_refs)
+            and (
+                not requested_refs
+                or vector.feature_vector_id in requested_refs
+                or (
+                    parse_utc_iso(vector.as_of_ts) >= fallback_from
+                    and _feature_vector_is_usable(vector)
+                )
+            )
         ]
         latest: dict[str, FeatureVector] = {}
         for vector in records:
             current = latest.get(vector.instrument_id)
-            if current is None or (vector.as_of_ts, vector.feature_vector_id) > (current.as_of_ts, current.feature_vector_id):
+            if current is None or _feature_vector_sort_key(vector, requested_refs) > _feature_vector_sort_key(current, requested_refs):
                 latest[vector.instrument_id] = vector
         return tuple(sorted(latest.values(), key=lambda item: item.instrument_id))
 
@@ -490,22 +500,72 @@ class PostgresDecisionEngineRepository:
         as_of_ts: str,
     ) -> tuple[FeatureVector, ...]:
         requested_refs = tuple(dict.fromkeys(_ref_tail(ref) for ref in feature_vector_refs if ref and _ref_tail(ref) not in {"latest", "scheduled"}))
+        requested = bool(requested_refs)
+        as_of = parse_utc_iso(as_of_ts)
+        fallback_from = as_of - timedelta(seconds=_env_float("DECISION_FEATURE_VECTOR_FALLBACK_LOOKBACK_SECONDS", 3600.0))
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
+                    WITH candidates AS (
+                        SELECT feature_vector_id, instrument_id, horizon, as_of_ts,
+                               features, coverage_ratio, data_quality_score,
+                               build_version, created_at,
+                               feature_vector_id = ANY(%s) AS is_requested,
+                               (
+                                   COALESCE(coverage_ratio, 0) > 0
+                                   AND COALESCE((
+                                       SELECT count(*)
+                                         FROM jsonb_object_keys(COALESCE(features, '{}'::jsonb) - '_meta')
+                                   ), 0) > 0
+                               ) AS is_usable
+                          FROM features.feature_vector
+                         WHERE instrument_id = ANY(%s)
+                           AND horizon = %s
+                           AND as_of_ts <= %s
+                           AND (
+                               NOT %s
+                               OR feature_vector_id = ANY(%s)
+                               OR (
+                                   as_of_ts >= %s
+                                   AND COALESCE(coverage_ratio, 0) > 0
+                                   AND COALESCE((
+                                       SELECT count(*)
+                                         FROM jsonb_object_keys(COALESCE(features, '{}'::jsonb) - '_meta')
+                                   ), 0) > 0
+                               )
+                           )
+                    )
                     SELECT DISTINCT ON (instrument_id)
                            feature_vector_id, instrument_id, horizon, as_of_ts,
                            features, coverage_ratio, data_quality_score,
                            build_version, created_at
-                      FROM features.feature_vector
-                     WHERE instrument_id = ANY(%s)
-                       AND horizon = %s
-                       AND as_of_ts <= %s
-                       AND (%s OR feature_vector_id = ANY(%s))
-                     ORDER BY instrument_id, as_of_ts DESC, feature_vector_id DESC
+                      FROM candidates
+                     ORDER BY instrument_id,
+                              CASE
+                                  WHEN %s AND is_requested AND is_usable THEN 4
+                                  WHEN %s AND is_usable THEN 3
+                                  WHEN %s AND is_requested THEN 2
+                                  WHEN NOT %s AND is_usable THEN 4
+                                  ELSE 1
+                              END DESC,
+                              as_of_ts DESC,
+                              created_at DESC NULLS LAST,
+                              feature_vector_id DESC
                     """,
-                    (list(instrument_ids), horizon, parse_utc_iso(as_of_ts), not requested_refs, list(requested_refs)),
+                    (
+                        list(requested_refs),
+                        list(instrument_ids),
+                        horizon,
+                        as_of,
+                        requested,
+                        list(requested_refs),
+                        fallback_from,
+                        requested,
+                        requested,
+                        requested,
+                        requested,
+                    ),
                 )
                 rows = cur.fetchall()
         return tuple(_feature_vector_from_row(row) for row in rows)
@@ -809,6 +869,23 @@ def _feature_vector_from_row(row: tuple[Any, ...]) -> FeatureVector:
     )
 
 
+def _feature_vector_is_usable(vector: FeatureVector) -> bool:
+    return (
+        float(vector.coverage_ratio or 0.0) > 0.0
+        and any(str(name) and not str(name).startswith("_") for name in vector.features)
+    )
+
+
+def _feature_vector_sort_key(vector: FeatureVector, requested_refs: set[str]) -> tuple[int, str, str]:
+    is_requested = vector.feature_vector_id in requested_refs
+    is_usable = _feature_vector_is_usable(vector)
+    if requested_refs:
+        rank = 4 if is_requested and is_usable else 3 if is_usable else 2 if is_requested else 1
+    else:
+        rank = 4 if is_usable else 1
+    return (rank, vector.as_of_ts, vector.feature_vector_id)
+
+
 def _weights_profile_from_row(row: tuple[Any, ...]) -> WeightsProfile:
     return WeightsProfile(
         weights_profile_id=row[0] or "",
@@ -907,6 +984,16 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

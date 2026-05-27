@@ -28,7 +28,10 @@ from .repository import (
     DecisionSet,
     FeatureVector,
     InMemoryRiskControlRepository,
+    InstrumentGuardrailState,
     InstrumentLimit,
+    InstrumentLiveStats,
+    InstrumentTradeHistoryRecord,
     OrderIntentRecord,
     PortfolioLimit,
     PortfolioSnapshot,
@@ -150,6 +153,362 @@ class RiskDecisionAssessment:
 
 
 @dataclass(frozen=True)
+class ProfitabilityGuardrailsConfig:
+    opposite_action_cooldown_seconds: int = 900
+    reentry_after_close_cooldown_seconds: int = 1200
+    max_trades_per_instrument_per_hour: int = 2
+    max_trades_per_instrument_per_day: int = 6
+    base_min_edge_after_cost_bps: float = 30.0
+    reversal_min_edge_after_cost_bps: float = 50.0
+    quarantine_min_edge_after_cost_bps: float = 70.0
+    watchlist_edge_threshold_add_bps: float = 10.0
+    min_edge_to_cost_ratio: float = 1.5
+    conservative_cost_proxy_bps: float = 8.0
+    daily_soft_loss_pct: float = -0.10
+    daily_hard_loss_pct: float = -0.15
+    leaderboard_smoke_mode: bool = False
+    leaderboard_min_edge_after_cost_bps: float = -1.0
+    leaderboard_min_edge_to_cost_ratio: float = 0.0
+
+    @classmethod
+    def from_env(cls) -> "ProfitabilityGuardrailsConfig":
+        return cls(
+            daily_soft_loss_pct=_env_float("RISK_DAILY_SOFT_LOSS_PCT", -0.10),
+            daily_hard_loss_pct=_env_float("RISK_DAILY_HARD_LOSS_PCT", -0.15),
+            leaderboard_smoke_mode=_env_bool("RISK_LEADERBOARD_SMOKE_MODE", False),
+            leaderboard_min_edge_after_cost_bps=_env_float("RISK_LEADERBOARD_MIN_EDGE_AFTER_COST_BPS", -1.0),
+            leaderboard_min_edge_to_cost_ratio=_env_float("RISK_LEADERBOARD_MIN_EDGE_TO_COST_RATIO", 0.0),
+        )
+
+
+@dataclass(frozen=True)
+class ProfitabilityGuardrailsContext:
+    request: RiskCheckRequest
+    decision_set_id: str
+    decision: Mapping[str, Any]
+    portfolio_snapshot: PortfolioSnapshot
+    position: PositionState | None
+    feature_vector: FeatureVector
+    position_effect: str
+    side: str
+    expected_edge_score: float
+    expected_edge_after_cost_score: float
+    risk_policy: RiskPolicy
+    portfolio_limits: tuple[PortfolioLimit, ...]
+    as_of_ts: str
+
+
+@dataclass(frozen=True)
+class ProfitabilityGuardrailsResult:
+    approved: bool
+    flags: tuple[str, ...] = ()
+    reason_codes: tuple[str, ...] = ()
+    adjustments: tuple[Mapping[str, Any], ...] = ()
+    metrics: Mapping[str, float] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.metrics is None:
+            object.__setattr__(self, "metrics", {})
+
+
+class ProfitabilityGuardrails:
+    protective_reason_codes = {
+        "hard_stop_loss",
+        "position_stop_loss_triggered",
+        "kill_switch",
+        "forced_reduce",
+        "liquidity_collapse",
+        "global_kill_switch",
+        "manual_override",
+    }
+    reduce_effects = {"reduce_long", "close_long", "reduce_short", "close_short"}
+    risk_increasing_effects = {"open_long", "increase_long", "open_short", "increase_short"}
+
+    def __init__(self, repository: RiskControlRepository, config: ProfitabilityGuardrailsConfig | None = None) -> None:
+        self.repository = repository
+        self.config = config or ProfitabilityGuardrailsConfig.from_env()
+
+    def evaluate(self, context: ProfitabilityGuardrailsContext) -> ProfitabilityGuardrailsResult:
+        flags: list[str] = []
+        reasons: list[str] = []
+        adjustments: list[Mapping[str, Any]] = []
+        metrics: dict[str, float] = {}
+
+        decision_reasons = self.reason_codes(context.decision)
+        risk_increasing = context.position_effect in self.risk_increasing_effects
+        risk_reducing = context.position_effect in self.reduce_effects
+        protective_exit = risk_reducing and bool(decision_reasons & self.protective_reason_codes)
+
+        daily_flags = self.daily_loss_flags(context, risk_increasing=risk_increasing)
+        flags.extend(daily_flags)
+        reasons.extend(daily_flags)
+
+        state = self.guardrail_state(context)
+        state_status = (state.status if state else "normal").strip().lower()
+        if state_status == "watchlist":
+            flags.append("watchlist_edge_threshold_increased")
+            reasons.append("watchlist_edge_threshold_increased")
+        elif state_status == "quarantine":
+            if context.position_effect in {"open_long", "increase_long"}:
+                flags.append("rejected_instrument_quarantine")
+                reasons.append("rejected_instrument_quarantine")
+            metrics["instrument_quarantine_active"] = 1.0
+        elif state_status == "blocked":
+            if not risk_reducing:
+                flags.append("rejected_instrument_blocked")
+                reasons.append("rejected_instrument_blocked")
+            metrics["instrument_blocked_active"] = 1.0
+
+        stats = self.live_stats(context)
+        if state_status == "normal" and stats is not None and self.stats_trigger_quarantine(stats):
+            # TODO: persist a 60-minute quarantine state when a durable
+            # instrument_guardrail_state store exists; runtime stats stay
+            # read-only here to avoid schema churn in this hotfix.
+            if context.position_effect in {"open_long", "increase_long"}:
+                flags.append("rejected_instrument_quarantine")
+                reasons.append("rejected_instrument_quarantine")
+            metrics["instrument_live_stats_quarantine_triggered"] = 1.0
+
+        history = self.trade_history(context, self.config.max_trades_per_instrument_per_day * 24 * 3600)
+        if not history:
+            flags.append("guardrail_trade_history_missing")
+            metrics["guardrail_trade_history_missing"] = 1.0
+        hourly_count = self.history_count_since(history, context.as_of_ts, 3600)
+        daily_count = self.history_count_since(history, context.as_of_ts, 24 * 3600)
+        metrics["instrument_trades_last_hour"] = float(hourly_count)
+        metrics["instrument_trades_last_day"] = float(daily_count)
+        if risk_increasing and hourly_count >= self.config.max_trades_per_instrument_per_hour:
+            flags.append("rejected_trade_frequency_hourly")
+            reasons.append("rejected_trade_frequency_hourly")
+        if risk_increasing and daily_count >= self.config.max_trades_per_instrument_per_day:
+            flags.append("rejected_trade_frequency_daily")
+            reasons.append("rejected_trade_frequency_daily")
+
+        last_trade = history[-1] if history else None
+        if risk_increasing and last_trade is not None:
+            last_side = str(last_trade.side or "").lower()
+            age_seconds = self.trade_age_seconds(last_trade, context.as_of_ts)
+            if (
+                last_side
+                and context.side
+                and last_side != context.side
+                and age_seconds <= self.config.opposite_action_cooldown_seconds
+                and not protective_exit
+            ):
+                flags.append("rejected_anti_churn_opposite_action")
+                reasons.append("rejected_anti_churn_opposite_action")
+                metrics["anti_churn_last_trade_age_seconds"] = age_seconds
+            if (
+                str(last_trade.position_effect or "") in self.reduce_effects
+                and age_seconds <= self.config.reentry_after_close_cooldown_seconds
+                and not protective_exit
+            ):
+                flags.append("rejected_reentry_cooldown")
+                reasons.append("rejected_reentry_cooldown")
+                metrics["reentry_last_close_age_seconds"] = age_seconds
+
+        edge_metrics = self.edge_metrics(context, state_status)
+        metrics.update(edge_metrics)
+        weak_edge = bool(edge_metrics.get("edge_after_cost_below_guardrail"))
+        if risk_increasing and weak_edge:
+            if self.leaderboard_smoke_edge_pass(context, edge_metrics):
+                flags.append("leaderboard_smoke_edge_gate_relaxed")
+                reasons.append("leaderboard_smoke_edge_gate_relaxed")
+                metrics["leaderboard_smoke_edge_gate_relaxed"] = 1.0
+            else:
+                flags.append("rejected_low_expected_edge_after_cost")
+                reasons.append("rejected_low_expected_edge_after_cost")
+                if "turnover_mandate_urgency" in decision_reasons:
+                    flags.append("rejected_turnover_without_edge")
+                    reasons.append("rejected_turnover_without_edge")
+                    flags.append("turnover_churn_guard_triggered")
+
+        approved = not any(flag.startswith("rejected_") or flag.startswith("daily_") for flag in flags)
+        if protective_exit:
+            flags = [flag for flag in flags if flag not in {"rejected_anti_churn_opposite_action", "rejected_reentry_cooldown"}]
+            reasons = [reason for reason in reasons if reason not in {"rejected_anti_churn_opposite_action", "rejected_reentry_cooldown"}]
+            approved = not any(flag.startswith("rejected_") or flag.startswith("daily_") for flag in flags)
+
+        for reason in dict.fromkeys(reasons):
+            adjustments.append(
+                {
+                    "instrument_id": context.decision.get("instrument_id"),
+                    "field": "profitability_guardrail",
+                    "old_value": context.decision.get("action"),
+                    "new_value": "rejected" if reason.startswith("rejected_") or reason.startswith("daily_") else "flagged",
+                    "reason_code": reason,
+                }
+            )
+        return ProfitabilityGuardrailsResult(
+            approved=approved,
+            flags=tuple(dict.fromkeys(flags)),
+            reason_codes=tuple(dict.fromkeys(reasons)),
+            adjustments=tuple(adjustments),
+            metrics=metrics,
+        )
+
+    def edge_metrics(self, context: ProfitabilityGuardrailsContext, state_status: str) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        explicit_bps = _payload_float(context.decision, "expected_edge_after_cost_bps")
+        cost_bps = self.cost_proxy_bps(context)
+        if explicit_bps is None:
+            edge_bps = context.expected_edge_after_cost_score * 10_000.0
+            metrics["expected_edge_after_cost_from_score"] = 1.0
+        else:
+            edge_bps = explicit_bps
+        edge_to_cost_ratio = _payload_float(context.decision, "edge_to_cost_ratio")
+        if edge_to_cost_ratio is None:
+            edge_to_cost_ratio = abs(edge_bps) / max(cost_bps, 0.01)
+        threshold = self.edge_threshold_bps(context, state_status)
+        metrics["guardrail_expected_edge_after_cost_bps"] = edge_bps
+        metrics["guardrail_execution_cost_bps"] = cost_bps
+        metrics["guardrail_min_edge_after_cost_bps"] = threshold
+        metrics["guardrail_edge_to_cost_ratio"] = edge_to_cost_ratio
+        if context.position_effect in {"open_short", "increase_short"}:
+            weak = edge_bps > -threshold or edge_to_cost_ratio < self.config.min_edge_to_cost_ratio
+        elif context.position_effect in {"open_long", "increase_long"}:
+            weak = edge_bps < threshold or edge_to_cost_ratio < self.config.min_edge_to_cost_ratio
+        else:
+            weak = False
+        metrics["edge_after_cost_below_guardrail"] = 1.0 if weak else 0.0
+        return metrics
+
+    def leaderboard_smoke_edge_pass(self, context: ProfitabilityGuardrailsContext, metrics: Mapping[str, float]) -> bool:
+        if not self.config.leaderboard_smoke_mode:
+            return False
+        reasons = self.reason_codes(context.decision)
+        if "competitive_leaderboard_candidate" not in reasons:
+            return False
+        if context.position_effect not in self.risk_increasing_effects:
+            return False
+        if reasons & {"data_quality_block", "liquidity_block", "kill_switch", "global_kill_switch", "stale_data_block", "trading_session_closed", "instrument_blocked"}:
+            return False
+        edge_bps = float(metrics.get("guardrail_expected_edge_after_cost_bps", -1e9))
+        edge_to_cost_ratio = float(metrics.get("guardrail_edge_to_cost_ratio", 0.0))
+        return (
+            edge_bps >= self.config.leaderboard_min_edge_after_cost_bps
+            and edge_to_cost_ratio >= self.config.leaderboard_min_edge_to_cost_ratio
+        )
+
+    def edge_threshold_bps(self, context: ProfitabilityGuardrailsContext, state_status: str) -> float:
+        threshold = self.config.base_min_edge_after_cost_bps
+        if state_status == "watchlist":
+            threshold += self.config.watchlist_edge_threshold_add_bps
+        if state_status == "quarantine":
+            threshold = max(threshold, self.config.quarantine_min_edge_after_cost_bps)
+        if self.is_reversal(context):
+            threshold = max(threshold, self.config.reversal_min_edge_after_cost_bps)
+        return threshold
+
+    def is_reversal(self, context: ProfitabilityGuardrailsContext) -> bool:
+        quantity = context.position.quantity if context.position else 0.0
+        return (quantity > 0 and context.side == "sell") or (quantity < 0 and context.side == "buy")
+
+    def cost_proxy_bps(self, context: ProfitabilityGuardrailsContext) -> float:
+        explicit = _payload_float(context.decision, "execution_cost_estimate_bps")
+        if explicit is not None and explicit > 0:
+            return explicit
+        total = 0.0
+        for metric_name in ("spread_bps", "estimated_slippage_bps", "estimated_order_slippage_bps", "commission_bps", "execution_cost_estimate_bps"):
+            value = _feature_numeric(context.feature_vector.features, metric_name)
+            if value is not None and value > 0:
+                total += value
+        return total if total > 0 else self.config.conservative_cost_proxy_bps
+
+    def daily_loss_flags(self, context: ProfitabilityGuardrailsContext, *, risk_increasing: bool) -> tuple[str, ...]:
+        if not risk_increasing:
+            return ()
+        base = context.portfolio_snapshot.initial_capital_rub or context.portfolio_snapshot.equity or context.portfolio_snapshot.cash
+        if not base or base <= 0:
+            return ()
+        daily_pnl = _rule_float(context.portfolio_snapshot.payload, "daily_pnl")
+        if daily_pnl is None:
+            daily_pnl = float(context.portfolio_snapshot.realized_pnl or 0.0) + float(context.portfolio_snapshot.unrealized_pnl or 0.0)
+        daily_ratio = daily_pnl / float(base)
+        soft = self.loss_threshold_ratio(_rule_float(context.risk_policy.rules, "daily_soft_loss_pct"), self.config.daily_soft_loss_pct)
+        hard = self.loss_threshold_ratio(_rule_float(context.risk_policy.rules, "daily_hard_loss_pct"), self.config.daily_hard_loss_pct)
+        if daily_ratio <= hard:
+            return ("daily_hard_loss_observation_only",)
+        if daily_ratio <= soft:
+            return ("daily_soft_loss_reduce_only",)
+        return ()
+
+    def loss_threshold_ratio(self, configured: float | None, default_pct: float) -> float:
+        value = configured if configured is not None else default_pct
+        magnitude = abs(value)
+        ratio = magnitude / 100.0 if magnitude > 0.01 else magnitude
+        return -ratio
+
+    def stats_trigger_quarantine(self, stats: InstrumentLiveStats) -> bool:
+        if stats.trades_count < 5:
+            return False
+        if stats.buy_accuracy_30m is not None and stats.buy_accuracy_30m < 0.35:
+            return True
+        if stats.realized_pnl_bps is not None and stats.realized_pnl_bps <= -50:
+            return True
+        return stats.consecutive_losing_round_trips >= 3
+
+    def reason_codes(self, decision: Mapping[str, Any]) -> set[str]:
+        codes = set(_string_tuple(decision.get("primary_reason_codes")))
+        codes.update(_string_tuple(decision.get("reason_codes")))
+        payload = decision.get("payload")
+        if isinstance(payload, Mapping):
+            codes.update(_string_tuple(payload.get("reason_codes")))
+        return codes
+
+    def guardrail_state(self, context: ProfitabilityGuardrailsContext) -> InstrumentGuardrailState | None:
+        try:
+            return self.repository.get_instrument_guardrail_state(
+                context.portfolio_snapshot.portfolio_id,
+                str(context.decision.get("instrument_id") or ""),
+                context.as_of_ts,
+            )
+        except Exception:
+            return None
+
+    def live_stats(self, context: ProfitabilityGuardrailsContext) -> InstrumentLiveStats | None:
+        try:
+            return self.repository.get_instrument_live_stats(
+                context.portfolio_snapshot.portfolio_id,
+                str(context.decision.get("instrument_id") or ""),
+                context.as_of_ts,
+            )
+        except Exception:
+            return None
+
+    def trade_history(self, context: ProfitabilityGuardrailsContext, lookback_seconds: int) -> tuple[InstrumentTradeHistoryRecord, ...]:
+        try:
+            return self.repository.list_recent_instrument_trades(
+                context.portfolio_snapshot.portfolio_id,
+                str(context.decision.get("instrument_id") or ""),
+                context.as_of_ts,
+                lookback_seconds,
+            )
+        except Exception:
+            return ()
+
+    def history_count_since(
+        self,
+        history: tuple[InstrumentTradeHistoryRecord, ...],
+        as_of_ts: str,
+        lookback_seconds: int,
+    ) -> int:
+        as_of = parse_utc_iso(as_of_ts)
+        earliest = as_of.timestamp() - lookback_seconds
+        return sum(1 for item in history if self.trade_timestamp(item) is not None and earliest <= self.trade_timestamp(item).timestamp() <= as_of.timestamp())
+
+    def trade_age_seconds(self, trade: InstrumentTradeHistoryRecord, as_of_ts: str) -> float:
+        timestamp = self.trade_timestamp(trade)
+        if timestamp is None:
+            return 0.0
+        return max(0.0, (parse_utc_iso(as_of_ts) - timestamp).total_seconds())
+
+    def trade_timestamp(self, trade: InstrumentTradeHistoryRecord):
+        timestamp = trade.trade_ts or trade.last_update_at or trade.submitted_at
+        return parse_utc_iso(timestamp) if timestamp else None
+
+
+@dataclass(frozen=True)
 class RiskControlExecutionResult:
     module_job_result: ModuleJobResult
     risk_check_result: RiskCheckResultRecord | None
@@ -178,6 +537,7 @@ class RiskControlService:
 
     def __init__(self, repository: RiskControlRepository | None = None) -> None:
         self.repository = repository or InMemoryRiskControlRepository()
+        self.profitability_guardrails = ProfitabilityGuardrails(self.repository)
 
     def run(self, payload: Mapping[str, Any], job: ModuleJob) -> RiskControlExecutionResult:
         return self.execute(payload, job)
@@ -822,7 +1182,6 @@ class RiskControlService:
         existing_order_count: int,
         pending_order_count: int,
     ) -> RiskDecisionAssessment:
-        del as_of_ts
         instrument_id = str(decision.get("instrument_id") or "")
         action = str(decision.get("action") or "hold")
         flags: list[str] = []
@@ -957,7 +1316,19 @@ class RiskControlService:
         risk_reducing_order = position_effect in {"reduce_long", "close_long", "reduce_short", "close_short"}
         new_or_add_short = position_effect in {"open_short", "increase_short"}
         new_or_add_long = position_effect in {"open_long", "increase_long"}
-        if new_or_add_long and min_expected_edge is not None and expected_edge_after_cost < min_expected_edge:
+        leaderboard_smoke_edge_relaxed = self.leaderboard_smoke_edge_relaxed(
+            decision=decision,
+            position_effect=position_effect,
+        )
+        if leaderboard_smoke_edge_relaxed:
+            metrics["leaderboard_smoke_core_edge_gate_relaxed"] = 1.0
+            flags.append("leaderboard_smoke_core_edge_gate_relaxed")
+        if (
+            new_or_add_long
+            and min_expected_edge is not None
+            and expected_edge_after_cost < min_expected_edge
+            and not leaderboard_smoke_edge_relaxed
+        ):
             flags.append("expected_edge_after_cost_below_threshold")
         if new_or_add_short:
             min_short_edge = abs(min_expected_edge or 0.0)
@@ -967,10 +1338,47 @@ class RiskControlService:
                 flags.append("short_expected_edge_after_cost_above_threshold")
         if (new_or_add_long or new_or_add_short) and "turnover_mandate_urgency" in tuple(decision.get("primary_reason_codes") or ()):
             metrics["turnover_driven_expected_edge_after_cost"] = expected_edge_after_cost
-            if new_or_add_long and expected_edge_after_cost <= 0:
+            if new_or_add_long and expected_edge_after_cost <= 0 and not leaderboard_smoke_edge_relaxed:
                 flags.append("turnover_trade_without_positive_edge")
-            if new_or_add_short and expected_edge_after_cost >= 0:
+            if new_or_add_short and expected_edge_after_cost >= 0 and not leaderboard_smoke_edge_relaxed:
                 flags.append("turnover_trade_without_negative_short_edge")
+
+        guardrail_result = self.profitability_guardrails.evaluate(
+            ProfitabilityGuardrailsContext(
+                request=request,
+                decision_set_id=decision_set.decision_set_id,
+                decision=decision,
+                portfolio_snapshot=portfolio_snapshot,
+                position=position,
+                feature_vector=feature_vector,
+                position_effect=position_effect,
+                side=side,
+                expected_edge_score=expected_edge,
+                expected_edge_after_cost_score=expected_edge_after_cost,
+                risk_policy=risk_policy,
+                portfolio_limits=portfolio_limits,
+                as_of_ts=as_of_ts,
+            )
+        )
+        flags.extend(guardrail_result.flags)
+        adjustments.extend(guardrail_result.adjustments)
+        metrics.update(dict(guardrail_result.metrics))
+
+        requested_quantity = self.lot_aware_order_quantity(
+            requested_quantity=requested_quantity,
+            price=price,
+            position_effect=position_effect,
+            expected_edge_after_cost=expected_edge_after_cost,
+            min_expected_edge=min_expected_edge,
+            instrument_limit=instrument_limit,
+            feature_vector=feature_vector,
+            risk_policy=risk_policy,
+            metrics=metrics,
+            adjustments=adjustments,
+            flags=flags,
+            final_pass=False,
+        )
+        proposed_trade_value = requested_quantity * price
 
         if side == "buy" and new_or_add_long and proposed_trade_value > available_cash:
             adjusted_quantity = floor_quantity(available_cash / price)
@@ -1147,7 +1555,9 @@ class RiskControlService:
         reject_flags = tuple(
             flag
             for flag in flags
-            if flag.endswith("_exceeded")
+            if flag.startswith("rejected_")
+            or flag.startswith("daily_")
+            or flag.endswith("_exceeded")
             or flag.endswith("_failed")
             or flag
             in {
@@ -1158,6 +1568,8 @@ class RiskControlService:
                 "turnover_trade_without_positive_edge",
                 "turnover_trade_without_negative_short_edge",
                 "short_selling_not_supported",
+                "risk_increasing_order_value_below_minimum",
+                "turnover_churn_guard_triggered",
             }
         )
         if reject_flags:
@@ -1579,6 +1991,42 @@ class RiskControlService:
         if raw_edge < 0:
             return raw_edge + cost_score
         return 0.0
+
+    def leaderboard_smoke_edge_relaxed(self, *, decision: Mapping[str, Any], position_effect: str) -> bool:
+        if not _env_bool("RISK_LEADERBOARD_SMOKE_MODE", False):
+            return False
+        if position_effect not in ProfitabilityGuardrails.risk_increasing_effects:
+            return False
+        reasons = set(_string_tuple(decision.get("primary_reason_codes")))
+        reasons.update(_string_tuple(decision.get("reason_codes")))
+        payload = decision.get("payload")
+        if isinstance(payload, Mapping):
+            reasons.update(_string_tuple(payload.get("reason_codes")))
+        if "competitive_leaderboard_candidate" not in reasons:
+            return False
+        if reasons & {
+            "data_quality_block",
+            "liquidity_block",
+            "kill_switch",
+            "global_kill_switch",
+            "stale_data_block",
+            "trading_session_closed",
+            "instrument_blocked",
+        }:
+            return False
+        edge_bps = _payload_float(decision, "expected_edge_after_cost_bps")
+        if edge_bps is None:
+            edge_score = _payload_float(decision, "expected_edge_after_cost_score")
+            edge_bps = edge_score * 100.0 if edge_score is not None else None
+        if edge_bps is None:
+            return False
+        edge_ratio = _payload_float(decision, "edge_to_cost_ratio")
+        if edge_ratio is None:
+            edge_ratio = 0.0
+        return (
+            edge_bps >= _env_float("RISK_LEADERBOARD_MIN_EDGE_AFTER_COST_BPS", -1.0)
+            and edge_ratio >= _env_float("RISK_LEADERBOARD_MIN_EDGE_TO_COST_RATIO", 0.0)
+        )
 
     def portfolio_limit_value(
         self,

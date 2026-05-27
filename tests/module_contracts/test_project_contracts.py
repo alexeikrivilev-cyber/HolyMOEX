@@ -47,6 +47,26 @@ EXPECTED_SCHEMAS = (
     "audit",
 )
 
+ANALYTICS_VIEWS = (
+    "analytics.trade_fact",
+    "analytics.performance_daily",
+    "analytics.decision_outcome",
+    "analytics.feature_contribution",
+    "analytics.llm_quality",
+    "analytics.risk_gate_effectiveness",
+    "analytics.decision_fact",
+    "analytics.decision_outcome_30m",
+    "analytics.decision_outcome_60m",
+    "analytics.instrument_live_stats",
+    "analytics.churn_round_trips",
+    "analytics.guardrail_rejections",
+    "analytics.edge_calibration",
+    "analytics.pnl_by_reason_code",
+    "analytics.execution_cost_realized",
+    "analytics.feature_outcome_attribution",
+    "analytics.live_dashboard_summary",
+)
+
 CORE_STORE_TABLES = (
     "registry.instrument_profile",
     "registry.instrument_alias",
@@ -105,6 +125,10 @@ DATA_INTAKE_DISCOVERY_TABLES = (
     "raw_text.scheduled_external_news_discovery_item",
     "raw_text.external_text_search_request",
 )
+
+CONTROLLED_VALIDATION_REPORT_SQL = PROJECT_ROOT / "sql" / "analytics" / "034_controlled_paper_validation_report.sql"
+LIVE_SMOKE_PREFLIGHT_REPORT_SQL = PROJECT_ROOT / "sql" / "analytics" / "035_live_smoke_preflight_report.sql"
+GUARDED_LIVE_SMOKE_DOC = PROJECT_ROOT / "docs" / "guarded_live_smoke_test.md"
 
 EXPECTED_TICKERS = (
     "LKOH",
@@ -188,6 +212,190 @@ class ProjectDocumentationContractTests(unittest.TestCase):
         for path in checked_files:
             with self.subTest(path=path.name):
                 self.assertIsNone(secret_pattern.search(read_text(path)))
+
+    def test_analytics_views_are_read_only_and_cover_live_learning_loop(self) -> None:
+        migration = "\n".join(
+            read_text(MIGRATIONS_DIR / migration_name)
+            for migration_name in (
+                "032_analytics_performance_views.sql",
+                "033_live_validation_analytics_views.sql",
+            )
+        )
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS analytics;", migration)
+        for view_name in ANALYTICS_VIEWS:
+            with self.subTest(view=view_name):
+                self.assertIn(f"CREATE OR REPLACE VIEW {view_name} AS", migration)
+        self.assertIn("orders.execution_result", migration)
+        self.assertIn("decisions.decision_record", migration)
+        self.assertIn("portfolio.portfolio_snapshot", migration)
+        self.assertIn("request_logs.external_request_log", migration)
+        self.assertIn("raw_market.raw_candle", migration)
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS analytics.", migration)
+        self.assertNotIn("UPDATE decisions.", migration)
+        self.assertNotIn("UPDATE orders.", migration)
+        self.assertNotIn("UPDATE weights.", migration)
+        self.assertNotIn("UPDATE risk.", migration)
+
+    def test_live_validation_analytics_cover_guardrail_and_edge_diagnostics(self) -> None:
+        migration = read_text(MIGRATIONS_DIR / "033_live_validation_analytics_views.sql")
+        required_tokens = (
+            "expected_edge_after_cost_bps",
+            "execution_cost_estimate_bps",
+            "edge_to_cost_ratio",
+            "cost_model_quality",
+            "candle.close_ts <= decision.decision_ts",
+            "candle.close_ts >= decision.decision_ts + interval '30 minutes'",
+            "candle.close_ts >= decision.decision_ts + interval '60 minutes'",
+            "action_aligned_forward_return_30m_bps",
+            "calibration_error_30m_bps",
+            "quarantine_candidate",
+            "watchlist_candidate",
+            "guardrail_rejection_rate",
+            "portfolio_scope_warning",
+            "second_trade.order_intent_id <> first_trade.order_intent_id",
+            "second_trade.run_mode IS NOT DISTINCT FROM first_trade.run_mode",
+            "second_trade.portfolio_id IS NOT DISTINCT FROM first_trade.portfolio_id",
+            "GROUP BY outcome.instrument_id, outcome.run_mode, outcome.portfolio_id",
+            "GROUP BY run_mode, portfolio_id, account_id, strategy_id, portfolio_scope_warning, reason_code",
+            "rejected_anti_churn_opposite_action",
+            "rejected_reentry_cooldown",
+            "rejected_trade_frequency_hourly",
+            "rejected_trade_frequency_daily",
+            "rejected_low_expected_edge_after_cost",
+            "rejected_turnover_without_edge",
+            "daily_soft_loss_reduce_only",
+            "daily_hard_loss_observation_only",
+            "rejected_instrument_quarantine",
+            "rejected_instrument_blocked",
+            "watchlist_edge_threshold_increased",
+            "guardrail_trade_history_missing",
+        )
+        for token in required_tokens:
+            with self.subTest(token=token):
+                self.assertIn(token, migration)
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS analytics.", migration)
+        self.assertNotIn("INSERT INTO orders.", migration)
+        self.assertNotIn("INSERT INTO decisions.", migration)
+        self.assertNotIn("UPDATE decisions.", migration)
+        self.assertNotIn("UPDATE orders.", migration)
+        self.assertNotIn("UPDATE weights.", migration)
+        self.assertNotIn("UPDATE risk.", migration)
+
+    def test_controlled_paper_validation_report_is_read_only(self) -> None:
+        report = read_text(CONTROLLED_VALIDATION_REPORT_SQL)
+        self.assertIn("SELECT *\n  FROM analytics.live_dashboard_summary", report)
+        for view_name in (
+            "analytics.live_dashboard_summary",
+            "analytics.churn_round_trips",
+            "analytics.instrument_live_stats",
+            "analytics.guardrail_rejections",
+            "analytics.edge_calibration",
+            "analytics.pnl_by_reason_code",
+            "analytics.execution_cost_realized",
+            "analytics.feature_outcome_attribution",
+        ):
+            with self.subTest(view=view_name):
+                self.assertIn(view_name, report)
+
+        sql_without_comments = "\n".join(
+            line for line in report.splitlines()
+            if not line.lstrip().startswith("--")
+        )
+        forbidden = re.compile(
+            r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|CALL)\b",
+            re.IGNORECASE,
+        )
+        self.assertIsNone(forbidden.search(sql_without_comments))
+
+        statements = [
+            statement.strip()
+            for statement in sql_without_comments.split(";")
+            if statement.strip()
+        ]
+        self.assertTrue(statements)
+        for statement in statements:
+            with self.subTest(statement=statement[:40]):
+                self.assertRegex(statement, r"^(SELECT|WITH)\b")
+
+    def test_live_smoke_preflight_report_is_read_only_and_checks_risk_scope(self) -> None:
+        report = read_text(LIVE_SMOKE_PREFLIGHT_REPORT_SQL)
+        for token in (
+            "risk.risk_policy",
+            "risk.portfolio_limit",
+            "risk.instrument_limit",
+            "portfolio.portfolio_snapshot",
+            "portfolio.position_state",
+            "registry.instrument_profile",
+            "analytics.instrument_live_stats",
+            "daily_hard_loss_missing",
+            "daily_hard_loss_too_wide",
+            "max_position_pct_missing",
+            "max_position_pct_too_wide",
+            "universe_too_large",
+            "toxic_instrument_in_universe",
+            "open_positions_exist",
+            "portfolio_snapshot_stale",
+            "kill_switch_status_unknown",
+            "slippage_limit_missing",
+            "liquidity_limit_missing",
+            "opposite_action_cooldown_seconds",
+            "reentry_after_close_cooldown_seconds",
+            "base_min_edge_after_cost_bps",
+            "reversal_min_edge_after_cost_bps",
+            "quarantine_min_edge_after_cost_bps",
+            "max_trades_per_instrument_per_hour",
+            "max_trades_per_instrument_per_day",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, report)
+
+        sql_without_comments = "\n".join(
+            line for line in report.splitlines()
+            if not line.lstrip().startswith("--")
+        )
+        forbidden = re.compile(
+            r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|CALL)\b",
+            re.IGNORECASE,
+        )
+        self.assertIsNone(forbidden.search(sql_without_comments))
+
+        statements = [
+            statement.strip()
+            for statement in sql_without_comments.split(";")
+            if statement.strip()
+        ]
+        self.assertTrue(statements)
+        for statement in statements:
+            with self.subTest(statement=statement[:40]):
+                self.assertRegex(statement, r"^(SELECT|WITH)\b")
+
+    def test_guarded_live_smoke_runbook_is_bounded_and_observable(self) -> None:
+        doc = read_text(GUARDED_LIVE_SMOKE_DOC)
+        required_tokens = (
+            "30-60 minutes",
+            "Preflight: Check Active DB Risk Limits",
+            "Get-Content -Raw .\\sql\\analytics\\035_live_smoke_preflight_report.sql",
+            "daily hard loss is set and not wider than `-0.10%`",
+            "`max_position_pct <= 0.02`",
+            "kill switch state is unknown",
+            "`SAFE_LIVE_SUBMIT=true` only for the actual guarded smoke",
+            "SCHEDULER_ONCE",
+            "SCHEDULER_SCHEDULE_IDS",
+            "max_position_pct = 0.01-0.02",
+            "daily_pnl_pct <= -0.001",
+            "flip-flop within 15 minutes",
+            "guardrail_rejection_rate = 0",
+            "docker compose -f docker/docker-compose.prod.yml stop scheduler_worker",
+            "Get-Content -Raw .\\sql\\analytics\\034_controlled_paper_validation_report.sql",
+            "analytics.live_dashboard_summary",
+            "analytics.guardrail_rejections",
+            "analytics.churn_round_trips",
+            "analytics.instrument_live_stats",
+            "Do not move to weights:v3",
+        )
+        for token in required_tokens:
+            with self.subTest(token=token):
+                self.assertIn(token, doc)
 
 
 if __name__ == "__main__":

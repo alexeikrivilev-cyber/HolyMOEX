@@ -270,6 +270,37 @@ class OrderIntentRecord:
 
 
 @dataclass(frozen=True)
+class InstrumentTradeHistoryRecord:
+    instrument_id: str
+    side: str
+    position_effect: str | None
+    status: str
+    submitted_at: str | None
+    last_update_at: str | None
+    trade_ts: str | None
+    payload: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class InstrumentGuardrailState:
+    instrument_id: str
+    status: str = "normal"
+    expires_at: str | None = None
+    reason_codes: tuple[str, ...] = ()
+    payload: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class InstrumentLiveStats:
+    instrument_id: str
+    trades_count: int = 0
+    buy_accuracy_30m: float | None = None
+    realized_pnl_bps: float | None = None
+    consecutive_losing_round_trips: int = 0
+    payload: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class AuditRecord:
     audit_record_id: str
     module_name: str
@@ -317,6 +348,31 @@ class RiskControlRepository(Protocol):
     def save_audit_record(self, audit_record: AuditRecord) -> str:
         ...
 
+    def list_recent_instrument_trades(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        as_of_ts: str,
+        lookback_seconds: int,
+    ) -> tuple[InstrumentTradeHistoryRecord, ...]:
+        ...
+
+    def get_instrument_guardrail_state(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        as_of_ts: str,
+    ) -> InstrumentGuardrailState | None:
+        ...
+
+    def get_instrument_live_stats(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        as_of_ts: str,
+    ) -> InstrumentLiveStats | None:
+        ...
+
 
 class InMemoryRiskControlRepository:
     def __init__(
@@ -328,6 +384,9 @@ class InMemoryRiskControlRepository:
         portfolio_snapshots: tuple[Mapping[str, Any] | PortfolioSnapshot, ...] = (),
         position_states: tuple[Mapping[str, Any] | PositionState, ...] = (),
         feature_vectors: tuple[Mapping[str, Any] | FeatureVector, ...] = (),
+        trade_history: tuple[Mapping[str, Any] | InstrumentTradeHistoryRecord, ...] = (),
+        guardrail_states: tuple[Mapping[str, Any] | InstrumentGuardrailState, ...] = (),
+        live_stats: tuple[Mapping[str, Any] | InstrumentLiveStats, ...] = (),
     ) -> None:
         self.decision_sets = tuple(item if isinstance(item, DecisionSet) else DecisionSet.from_mapping(item) for item in decision_sets)
         self.risk_policies = tuple(item if isinstance(item, RiskPolicy) else RiskPolicy.from_mapping(item) for item in risk_policies)
@@ -336,6 +395,18 @@ class InMemoryRiskControlRepository:
         self.portfolio_snapshots = tuple(item if isinstance(item, PortfolioSnapshot) else PortfolioSnapshot.from_mapping(item) for item in portfolio_snapshots)
         self.position_states = tuple(item if isinstance(item, PositionState) else PositionState.from_mapping(item) for item in position_states)
         self.feature_vectors = tuple(item if isinstance(item, FeatureVector) else FeatureVector.from_mapping(item) for item in feature_vectors)
+        self.trade_history = tuple(
+            item if isinstance(item, InstrumentTradeHistoryRecord) else _trade_history_from_mapping(item)
+            for item in trade_history
+        )
+        self.guardrail_states = tuple(
+            item if isinstance(item, InstrumentGuardrailState) else _guardrail_state_from_mapping(item)
+            for item in guardrail_states
+        )
+        self.live_stats = tuple(
+            item if isinstance(item, InstrumentLiveStats) else _live_stats_from_mapping(item)
+            for item in live_stats
+        )
         self.saved_risk_check_results: list[RiskCheckResultRecord] = []
         self.saved_order_intents: list[OrderIntentRecord] = []
         self.saved_risk_events: list[RiskEventRecord] = []
@@ -452,6 +523,61 @@ class InMemoryRiskControlRepository:
     def save_audit_record(self, audit_record: AuditRecord) -> str:
         self.saved_audit_records.append(audit_record)
         return f"audit.audit_record:{audit_record.audit_record_id}"
+
+    def list_recent_instrument_trades(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        as_of_ts: str,
+        lookback_seconds: int,
+    ) -> tuple[InstrumentTradeHistoryRecord, ...]:
+        if not str(portfolio_id or "").strip():
+            return ()
+        as_of = parse_utc_iso(as_of_ts)
+        earliest_ts = as_of.timestamp() - max(0, int(lookback_seconds or 0))
+        records: list[InstrumentTradeHistoryRecord] = []
+        for record in self.trade_history:
+            if record.instrument_id != instrument_id:
+                continue
+            record_portfolio_id = str(record.payload.get("portfolio_id") or "").strip()
+            if record_portfolio_id and record_portfolio_id != portfolio_id:
+                continue
+            timestamp = record.trade_ts or record.last_update_at or record.submitted_at
+            if not timestamp:
+                continue
+            parsed = parse_utc_iso(timestamp)
+            if earliest_ts <= parsed.timestamp() <= as_of.timestamp():
+                records.append(record)
+        return tuple(sorted(records, key=lambda item: item.trade_ts or item.last_update_at or item.submitted_at or ""))
+
+    def get_instrument_guardrail_state(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        as_of_ts: str,
+    ) -> InstrumentGuardrailState | None:
+        del portfolio_id
+        as_of = parse_utc_iso(as_of_ts)
+        candidates: list[InstrumentGuardrailState] = []
+        for state in self.guardrail_states:
+            if state.instrument_id != instrument_id:
+                continue
+            if state.expires_at and parse_utc_iso(state.expires_at) <= as_of:
+                continue
+            candidates.append(state)
+        return candidates[-1] if candidates else None
+
+    def get_instrument_live_stats(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        as_of_ts: str,
+    ) -> InstrumentLiveStats | None:
+        del portfolio_id, as_of_ts
+        for stats in reversed(self.live_stats):
+            if stats.instrument_id == instrument_id:
+                return stats
+        return None
 
 
 class PostgresRiskControlRepository:
@@ -723,6 +849,107 @@ class PostgresRiskControlRepository:
                 row = cur.fetchone()
         return f"audit.audit_record:{row[0]}"
 
+    def list_recent_instrument_trades(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        as_of_ts: str,
+        lookback_seconds: int,
+    ) -> tuple[InstrumentTradeHistoryRecord, ...]:
+        if not str(portfolio_id or "").strip():
+            return ()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT oi.instrument_id,
+                           oi.side,
+                           oi.payload->>'position_effect',
+                           er.status,
+                           er.submitted_at,
+                           er.last_update_at,
+                           COALESCE(er.last_update_at, er.submitted_at, oi.created_at) AS trade_ts,
+                           oi.payload
+                      FROM orders.execution_result er
+                      JOIN orders.order_intent oi
+                        ON oi.order_intent_id = er.order_intent_id
+                     WHERE oi.instrument_id = %s
+                       AND er.status IN ('filled', 'partially_filled')
+                       AND COALESCE(er.last_update_at, er.submitted_at, oi.created_at) <= %s
+                       AND COALESCE(er.last_update_at, er.submitted_at, oi.created_at)
+                           >= %s::timestamptz - (%s || ' seconds')::interval
+                       AND oi.payload->>'portfolio_id' = %s
+                     ORDER BY COALESCE(er.last_update_at, er.submitted_at, oi.created_at)
+                    """,
+                    (
+                        instrument_id,
+                        parse_utc_iso(as_of_ts),
+                        parse_utc_iso(as_of_ts),
+                        int(lookback_seconds or 0),
+                        portfolio_id,
+                    ),
+                )
+                rows = cur.fetchall()
+        return tuple(_trade_history_from_row(row) for row in rows)
+
+    def get_instrument_guardrail_state(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        as_of_ts: str,
+    ) -> InstrumentGuardrailState | None:
+        del portfolio_id, instrument_id, as_of_ts
+        # Optional integration point for a future durable
+        # risk.instrument_guardrail_state table.  Missing storage keeps the
+        # production path backward compatible.
+        return None
+
+    def get_instrument_live_stats(
+        self,
+        portfolio_id: str,
+        instrument_id: str,
+        as_of_ts: str,
+    ) -> InstrumentLiveStats | None:
+        del portfolio_id
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT %s AS instrument_id,
+                               COUNT(*) FILTER (
+                                 WHERE tf.execution_status IN ('filled', 'partially_filled')
+                               ) AS trades_count,
+                               AVG(CASE
+                                     WHEN outcome.action = 'buy'
+                                      AND outcome.direction_correct_30m IS NOT NULL
+                                     THEN CASE WHEN outcome.direction_correct_30m THEN 1.0 ELSE 0.0 END
+                                   END) AS buy_accuracy_30m,
+                               AVG(COALESCE(tf.slippage_bps, 0)) AS realized_pnl_bps
+                          FROM analytics.trade_fact tf
+                          LEFT JOIN analytics.decision_outcome outcome
+                            ON outcome.decision_record_id = tf.decision_record_id
+                         WHERE tf.instrument_id = %s
+                           AND COALESCE(tf.trade_ts, tf.submitted_at, tf.last_update_at) <= %s
+                           AND COALESCE(tf.trade_ts, tf.submitted_at, tf.last_update_at)
+                               >= %s::timestamptz - interval '4 hours'
+                        """,
+                        (instrument_id, instrument_id, parse_utc_iso(as_of_ts), parse_utc_iso(as_of_ts)),
+                    )
+                    row = cur.fetchone()
+        except Exception:
+            return None
+        if row is None:
+            return None
+        return InstrumentLiveStats(
+            instrument_id=row[0] or instrument_id,
+            trades_count=int(row[1] or 0),
+            buy_accuracy_30m=_optional_float(row[2]),
+            realized_pnl_bps=_optional_float(row[3]),
+            consecutive_losing_round_trips=0,
+            payload={"source": "analytics.trade_fact"},
+        )
+
 
 def stable_record_id(prefix: str, payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
@@ -816,6 +1043,59 @@ def _feature_vector_from_row(row: tuple[Any, ...]) -> FeatureVector:
         coverage_ratio=_optional_float(row[5]) or 0.0,
         data_quality_score=_optional_float(row[6]) or 0.0,
         build_version=row[7] or "",
+    )
+
+
+def _trade_history_from_row(row: tuple[Any, ...]) -> InstrumentTradeHistoryRecord:
+    return InstrumentTradeHistoryRecord(
+        instrument_id=row[0] or "",
+        side=row[1] or "",
+        position_effect=_optional_text(row[2]),
+        status=row[3] or "",
+        submitted_at=_iso(row[4]) if row[4] is not None else None,
+        last_update_at=_iso(row[5]) if row[5] is not None else None,
+        trade_ts=_iso(row[6]) if row[6] is not None else None,
+        payload=row[7] or {},
+    )
+
+
+def _trade_history_from_mapping(payload: Mapping[str, Any]) -> InstrumentTradeHistoryRecord:
+    return InstrumentTradeHistoryRecord(
+        instrument_id=str(payload.get("instrument_id") or ""),
+        side=str(payload.get("side") or ""),
+        position_effect=_optional_text(payload.get("position_effect")),
+        status=str(payload.get("status") or "filled"),
+        submitted_at=_optional_text(payload.get("submitted_at")),
+        last_update_at=_optional_text(payload.get("last_update_at")),
+        trade_ts=_optional_text(payload.get("trade_ts")),
+        payload=dict(payload.get("payload") or {}),
+    )
+
+
+def _guardrail_state_from_mapping(payload: Mapping[str, Any]) -> InstrumentGuardrailState:
+    source_payload = payload.get("payload") or {}
+    if not isinstance(source_payload, Mapping):
+        source_payload = {}
+    return InstrumentGuardrailState(
+        instrument_id=str(payload.get("instrument_id") or ""),
+        status=str(payload.get("status") or "normal"),
+        expires_at=_optional_text(payload.get("expires_at")),
+        reason_codes=_string_tuple(payload.get("reason_codes")),
+        payload=dict(source_payload),
+    )
+
+
+def _live_stats_from_mapping(payload: Mapping[str, Any]) -> InstrumentLiveStats:
+    source_payload = payload.get("payload") or {}
+    if not isinstance(source_payload, Mapping):
+        source_payload = {}
+    return InstrumentLiveStats(
+        instrument_id=str(payload.get("instrument_id") or ""),
+        trades_count=int(_optional_float(payload.get("trades_count")) or 0),
+        buy_accuracy_30m=_optional_float(payload.get("buy_accuracy_30m")),
+        realized_pnl_bps=_optional_float(payload.get("realized_pnl_bps")),
+        consecutive_losing_round_trips=int(_optional_float(payload.get("consecutive_losing_round_trips")) or 0),
+        payload=dict(source_payload),
     )
 
 

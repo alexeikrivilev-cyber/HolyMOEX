@@ -1548,6 +1548,17 @@ def _risk_payload(
     target_quantity: float = 1.0,
     expected_edge_score: float = 0.02,
     shorts_allowed: bool = True,
+    lot_size: int | None = None,
+    arena_go_submit_quantity_units: str | None = None,
+    min_risk_increasing_order_value: float | None = None,
+    daily_pnl: float = 0.0,
+    primary_reason_codes: tuple[str, ...] = ("turnover_mandate_urgency",),
+    decision_extra: dict | None = None,
+    trade_history: tuple[dict, ...] = (),
+    guardrail_states: tuple[dict, ...] = (),
+    live_stats: tuple[dict, ...] = (),
+    policy_extra: dict | None = None,
+    portfolio_id: str = "arena_go_default",
 ):
     from agent_app.modules.risk_control.repository import (
         DecisionSet,
@@ -1570,6 +1581,10 @@ def _risk_payload(
     if daily_turnover_mode is not None:
         policy_rules["daily_turnover_limit_mode"] = daily_turnover_mode
         policy_rules["max_daily_turnover_hard_block_enabled"] = daily_turnover_mode != "monitor_only"
+    if arena_go_submit_quantity_units is not None:
+        policy_rules["arena_go_submit_quantity_units"] = arena_go_submit_quantity_units
+    if policy_extra:
+        policy_rules.update(policy_extra)
     portfolio_limits = [
         PortfolioLimit(policy_id, "min_expected_edge_after_cost_score", 0.01, {}),
         PortfolioLimit(policy_id, "max_portfolio_exposure_pct", 1.0, {}),
@@ -1606,7 +1621,8 @@ def _risk_payload(
                         "target_quantity": target_quantity,
                         "expected_edge_score": expected_edge_score,
                         "expected_edge_after_cost_score": edge_after_cost,
-                        "primary_reason_codes": ["turnover_mandate_urgency"],
+                        "primary_reason_codes": list(primary_reason_codes),
+                        **(decision_extra or {}),
                     },
                 ),
                 calculation_version="test",
@@ -1619,7 +1635,7 @@ def _risk_payload(
         portfolio_snapshots=(
             PortfolioSnapshot(
                 "snapshot_edge",
-                "arena_go_default",
+                portfolio_id,
                 "moex_top20_manual",
                 "2026-05-24T09:00:00Z",
                 1_000_000,
@@ -1633,13 +1649,14 @@ def _risk_payload(
                     "market_session_status": "open",
                     "market_regime": "normal",
                     "gross_turnover_rub_1d": current_daily_turnover,
+                    "daily_pnl": daily_pnl,
                 },
             ),
         ),
         position_states=(
             PositionState(
                 "position_edge",
-                "arena_go_default",
+                portfolio_id,
                 "moex:SBER",
                 "2026-05-24T09:00:00Z",
                 current_quantity,
@@ -1677,6 +1694,9 @@ def _risk_payload(
                 "test",
             ),
         ),
+        trade_history=trade_history,
+        guardrail_states=guardrail_states,
+        live_stats=live_stats,
     )
     payload = {
         "risk_check_request": {
@@ -1718,6 +1738,348 @@ def test_turnover_behind_positive_edge_is_approved_when_risk_ok() -> None:
     assert result.order_intents[0].payload["decision_set_id"] == "decision_edge"
     assert result.order_intents[0].payload["risk_check_id"].startswith("risk_check_")
     assert result.order_intents[0].payload["run_mode"] == "live_trading"
+
+
+def test_profitability_guardrail_rejects_opposite_action_churn() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        target_quantity=10,
+        trade_history=(
+            {
+                "instrument_id": "moex:SBER",
+                "side": "sell",
+                "position_effect": "open_short",
+                "status": "filled",
+                "trade_ts": "2026-05-24T08:55:00Z",
+            },
+        ),
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "rejected_anti_churn_opposite_action" in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_rejects_reentry_after_close() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        target_quantity=10,
+        trade_history=(
+            {
+                "instrument_id": "moex:SBER",
+                "side": "buy",
+                "position_effect": "close_short",
+                "status": "filled",
+                "trade_ts": "2026-05-24T08:50:00Z",
+            },
+        ),
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "rejected_reentry_cooldown" in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_rejects_low_expected_edge_after_cost_bps() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        target_quantity=10,
+        decision_extra={"expected_edge_after_cost_bps": 10, "edge_to_cost_ratio": 3.0},
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "rejected_low_expected_edge_after_cost" in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_rejects_turnover_without_edge() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        target_quantity=10,
+        decision_extra={"expected_edge_after_cost_bps": 5, "edge_to_cost_ratio": 1.0},
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "rejected_turnover_without_edge" in result.risk_check_result.risk_flags
+    assert "turnover_churn_guard_triggered" in result.risk_check_result.risk_flags
+
+
+def test_leaderboard_smoke_allows_competitive_candidate_with_tiny_negative_edge(monkeypatch) -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    monkeypatch.setenv("RISK_LEADERBOARD_SMOKE_MODE", "true")
+    monkeypatch.setenv("RISK_LEADERBOARD_MIN_EDGE_AFTER_COST_BPS", "-1.0")
+    monkeypatch.setenv("RISK_LEADERBOARD_MIN_EDGE_TO_COST_RATIO", "0.0")
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.004,
+        expected_edge_score=0.001,
+        target_quantity=25,
+        decision_extra={
+            "expected_edge_after_cost_bps": -0.5,
+            "execution_cost_estimate_bps": 0.5,
+            "edge_to_cost_ratio": 0.1,
+            "reason_codes": [
+                "competitive_leaderboard_candidate",
+                "competitive_cost_cap_applied",
+                "competitive_fallback_action",
+            ],
+        },
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert len(result.order_intents) == 1
+    assert "leaderboard_smoke_edge_gate_relaxed" in result.risk_check_result.risk_flags
+    assert "rejected_low_expected_edge_after_cost" not in result.risk_check_result.risk_flags
+    assert "turnover_trade_without_positive_edge" not in result.risk_check_result.risk_flags
+
+
+def test_leaderboard_smoke_does_not_relax_regular_negative_edge(monkeypatch) -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    monkeypatch.setenv("RISK_LEADERBOARD_SMOKE_MODE", "true")
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.004,
+        expected_edge_score=0.001,
+        target_quantity=25,
+        decision_extra={
+            "expected_edge_after_cost_bps": -0.5,
+            "execution_cost_estimate_bps": 0.5,
+            "edge_to_cost_ratio": 0.1,
+        },
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "rejected_low_expected_edge_after_cost" in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_allows_hard_stop_reduce_despite_cooldown() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.02,
+        current_quantity=10,
+        action="sell",
+        target_quantity=0,
+        primary_reason_codes=("hard_stop_loss",),
+        trade_history=(
+            {
+                "instrument_id": "moex:SBER",
+                "side": "buy",
+                "position_effect": "open_long",
+                "status": "filled",
+                "trade_ts": "2026-05-24T08:55:00Z",
+            },
+        ),
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert len(result.order_intents) == 1
+    assert "rejected_anti_churn_opposite_action" not in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_daily_soft_loss_blocks_new_entries_not_reduce() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(edge_after_cost=0.02, target_quantity=10, daily_pnl=-1_200)
+    buy_result = RiskControlService(repo).process(payload, _risk_request_job())
+    assert buy_result.risk_check_result is not None
+    assert buy_result.order_intents == ()
+    assert "daily_soft_loss_reduce_only" in buy_result.risk_check_result.risk_flags
+
+    repo, payload = _risk_payload(
+        edge_after_cost=-0.02,
+        current_quantity=10,
+        action="sell",
+        target_quantity=0,
+        daily_pnl=-1_200,
+        primary_reason_codes=("hard_stop_loss",),
+    )
+    reduce_result = RiskControlService(repo).process(payload, _risk_request_job())
+    assert reduce_result.risk_check_result is not None
+    assert len(reduce_result.order_intents) == 1
+
+
+def test_profitability_guardrail_daily_soft_loss_can_be_env_tuned_for_smoke(monkeypatch) -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    monkeypatch.setenv("RISK_DAILY_SOFT_LOSS_PCT", "-0.20")
+    monkeypatch.setenv("RISK_DAILY_HARD_LOSS_PCT", "-0.30")
+    repo, payload = _risk_payload(edge_after_cost=0.02, target_quantity=10, daily_pnl=-1_200)
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert "daily_soft_loss_reduce_only" not in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_daily_hard_loss_observation_only() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(edge_after_cost=0.02, target_quantity=10, daily_pnl=-1_600)
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "daily_hard_loss_observation_only" in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_normalizes_positive_daily_loss_thresholds() -> None:
+    from agent_app.modules.risk_control.service import ProfitabilityGuardrails
+
+    guardrails = ProfitabilityGuardrails(repository=None)  # type: ignore[arg-type]
+
+    assert guardrails.loss_threshold_ratio(-0.10, -0.10) == -0.001
+    assert guardrails.loss_threshold_ratio(0.10, -0.10) == -0.001
+    assert guardrails.loss_threshold_ratio(-0.15, -0.15) == -0.0015
+    assert guardrails.loss_threshold_ratio(0.15, -0.15) == -0.0015
+    assert guardrails.loss_threshold_ratio(10, -0.10) == -0.10
+
+
+def test_profitability_guardrail_positive_policy_daily_loss_threshold_blocks_at_expected_ratio() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        target_quantity=10,
+        daily_pnl=-1_200,
+        policy_extra={"daily_soft_loss_pct": 0.10, "daily_hard_loss_pct": 0.15},
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "daily_soft_loss_reduce_only" in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_missing_trade_history_is_visible_warning() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(edge_after_cost=0.02, target_quantity=10)
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert "guardrail_trade_history_missing" in result.risk_check_result.risk_flags
+    assert result.risk_events
+    assert "guardrail_trade_history_missing" in result.risk_events[0].payload["risk_flags"]
+
+
+def test_profitability_guardrail_history_scoped_by_portfolio() -> None:
+    from agent_app.modules.risk_control.repository import InMemoryRiskControlRepository
+
+    repo = InMemoryRiskControlRepository(
+        trade_history=(
+            {
+                "instrument_id": "moex:SBER",
+                "side": "buy",
+                "position_effect": "open_long",
+                "status": "filled",
+                "trade_ts": "2026-05-24T08:50:00Z",
+                "payload": {"portfolio_id": "portfolio_a"},
+            },
+            {
+                "instrument_id": "moex:SBER",
+                "side": "sell",
+                "position_effect": "open_short",
+                "status": "filled",
+                "trade_ts": "2026-05-24T08:55:00Z",
+                "payload": {"portfolio_id": "portfolio_b"},
+            },
+        )
+    )
+
+    history = repo.list_recent_instrument_trades("portfolio_a", "moex:SBER", "2026-05-24T09:00:00Z", 3600)
+
+    assert len(history) == 1
+    assert history[0].payload["portfolio_id"] == "portfolio_a"
+
+
+def test_profitability_guardrail_history_without_scope_returns_empty() -> None:
+    from agent_app.modules.risk_control.repository import InMemoryRiskControlRepository
+
+    repo = InMemoryRiskControlRepository(
+        trade_history=(
+            {
+                "instrument_id": "moex:SBER",
+                "side": "buy",
+                "position_effect": "open_long",
+                "status": "filled",
+                "trade_ts": "2026-05-24T08:50:00Z",
+                "payload": {"portfolio_id": "portfolio_a"},
+            },
+        )
+    )
+
+    assert repo.list_recent_instrument_trades("", "moex:SBER", "2026-05-24T09:00:00Z", 3600) == ()
+
+
+def test_profitability_guardrail_quarantine_blocks_new_buy() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        target_quantity=10,
+        guardrail_states=(
+            {"instrument_id": "moex:SBER", "status": "quarantine", "expires_at": "2026-05-24T10:00:00Z"},
+        ),
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "rejected_instrument_quarantine" in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_watchlist_raises_edge_threshold() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        target_quantity=10,
+        decision_extra={"expected_edge_after_cost_bps": 35, "edge_to_cost_ratio": 5.0},
+        guardrail_states=(
+            {"instrument_id": "moex:SBER", "status": "watchlist", "expires_at": "2026-05-24T10:00:00Z"},
+        ),
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "watchlist_edge_threshold_increased" in result.risk_check_result.risk_flags
+    assert "rejected_low_expected_edge_after_cost" in result.risk_check_result.risk_flags
+
+
+def test_profitability_guardrail_max_trades_per_hour_blocks_third_trade() -> None:
+    from agent_app.modules.risk_control.service import RiskControlService
+
+    repo, payload = _risk_payload(
+        edge_after_cost=0.02,
+        target_quantity=10,
+        trade_history=(
+            {"instrument_id": "moex:SBER", "side": "buy", "position_effect": "open_long", "status": "filled", "trade_ts": "2026-05-24T08:20:00Z"},
+            {"instrument_id": "moex:SBER", "side": "buy", "position_effect": "increase_long", "status": "filled", "trade_ts": "2026-05-24T08:40:00Z"},
+        ),
+    )
+    result = RiskControlService(repo).process(payload, _risk_request_job())
+
+    assert result.risk_check_result is not None
+    assert result.order_intents == ()
+    assert "rejected_trade_frequency_hourly" in result.risk_check_result.risk_flags
 
 
 def test_daily_turnover_soft_limit_does_not_block_positive_edge_order() -> None:
